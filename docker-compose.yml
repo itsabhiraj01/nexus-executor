@@ -29,6 +29,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    ports:
+      - "127.0.0.1:5555:5432"
 
 volumes:
   executor-workspaces:
