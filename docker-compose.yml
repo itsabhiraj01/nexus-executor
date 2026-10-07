@@ -1,0 +1,35 @@
+# nexus-executor + its own Postgres. The executor applies its migrations at
+# boot (main.ts), so `docker compose up --build` is the whole upgrade story.
+services:
+  executor:
+    build: .
+    env_file: .env
+    ports:
+      - "4099:4099"
+    environment:
+      # The compose network's database; .env's DATABASE_URL is overridden.
+      DATABASE_URL: postgres://nexus_executor:nexus_executor@db:5432/nexus_executor
+      EXECUTOR_WORKSPACE_ROOT: /data/workspaces
+    volumes:
+      - executor-workspaces:/data/workspaces
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: nexus_executor
+      POSTGRES_PASSWORD: nexus_executor
+      POSTGRES_DB: nexus_executor
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus_executor -d nexus_executor"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  executor-workspaces:
+  pgdata:
