@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use subagent-driven-development (recommended) or executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status: ✅ IMPLEMENTED** (branch `executor-cli`, commits `a744759` `d465ab1` `72bfd7e`). All 11 tasks complete; 89 tests pass; typecheck clean; installer lints and dry-runs exit 0.
+
 **Goal:** Turn the executor into a real `nexus-executor` command with subcommands, a single headless pairing core shared by every frontend, a single CLI state file the running service reads at boot, and a `curl | bash` installer that provisions the machine then drives `nexus-executor pair`.
 
 **Architecture:** npm `bin` CLI (`node:util` `parseArgs`, gateway transport default with `--hub` for direct). One headless `pair()` in `src/pairing/core.ts` shared by CLI/installer/later TUI. A single CLI state file (`~/.config/nexus-executor/state.json`) indexes transport/URL/name/status + a path to the real credential (gateway identity file or DB auth). The service reads this state at boot, deprecating env `PAIR_CODE` boot-pairing. `install.sh` provisions/link/systemd then calls `nexus-executor pair` (never owns pairing logic).
@@ -48,7 +50,7 @@ The single source the CLI and the service use to know transport/URL/name/status.
 - Create: `src/pairing/state.ts`
 - Test: `src/pairing/state.test.ts`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/pairing/state.test.ts`:
 
@@ -106,12 +108,12 @@ describe('cli state', () => {
 });
 ```
 
-- [ ] **Step 2: Run to confirm it fails**
+- [x] **Step 2: Run to confirm it fails**
 
 Run: `npx vitest run src/pairing/state.test.ts`
 Expected: FAIL — `./state.js` module not found.
 
-- [ ] **Step 3: Implement `src/pairing/state.ts`**
+- [x] **Step 3: Implement `src/pairing/state.ts`**
 
 Create `src/pairing/state.ts`:
 
@@ -153,12 +155,12 @@ export function clearCliState(): void {
 }
 ```
 
-- [ ] **Step 4: Run to confirm it passes**
+- [x] **Step 4: Run to confirm it passes**
 
 Run: `npx vitest run src/pairing/state.test.ts`
 Expected: PASS (3).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/pairing/state.ts src/pairing/state.test.ts
@@ -175,7 +177,7 @@ Minimal stdin prompt helper, injected so CLI tests can stub it. Uses `node:readl
 - Create: `src/pairing/prompts.ts`
 - Test: `src/pairing/prompts.test.ts`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/pairing/prompts.test.ts`:
 
@@ -206,12 +208,12 @@ describe('prompter', () => {
 });
 ```
 
-- [ ] **Step 2: Run to confirm it fails**
+- [x] **Step 2: Run to confirm it fails**
 
 Run: `npx vitest run src/pairing/prompts.test.ts`
 Expected: FAIL — `./prompts.js` not found.
 
-- [ ] **Step 3: Implement `src/pairing/prompts.ts`**
+- [x] **Step 3: Implement `src/pairing/prompts.ts`**
 
 Create `src/pairing/prompts.ts`:
 
@@ -244,12 +246,12 @@ export function makePrompter(
 
 Note: `makePrompter(input, output)` returns a `Prompter`. In tests we pass `PassThrough` streams; in real use we pass the process streams. The returned function resolves empty string when no input, letting callers fall back to `defaultValue`.
 
-- [ ] **Step 4: Run to confirm it passes**
+- [x] **Step 4: Run to confirm it passes**
 
 Run: `npx vitest run src/pairing/prompts.test.ts`
 Expected: PASS (2).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/pairing/prompts.ts src/pairing/prompts.test.ts
@@ -266,11 +268,11 @@ One top-level pairing function every frontend (CLI, installer, later TUI) calls.
 - Create: `src/pairing/core.ts`
 - Test: `src/pairing/core.test.ts`
 
-- [ ] **Step 1: Read the current `src/pairing.ts` and `src/gateway.ts`**
+- [x] **Step 1: Read the current `src/pairing.ts` and `src/gateway.ts`**
 
 `claimPairing(config, pool, { fetchImpl })` (direct) POSTs `${config.hubUrl}/api/executors/pair` and stores the token hash in the DB `auth` config via `writeAuthConfig`. `enrollGateway(config, { fetchImpl })` (gateway) POSTs `{gatewayUrl}/v1/enroll` and writes `gateway-identity.json`. The new `pair()` composes both and writes the CLI state index. Read `src/pairing.ts` `claimPairing` and `src/gateway.ts` `enrollGateway` signatures first — the implementation below adapts to them.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Create `src/pairing/core.test.ts`:
 
@@ -346,12 +348,12 @@ describe('pair() — gateway transport (default)', () => {
 });
 ```
 
-- [ ] **Step 3: Run to confirm it fails**
+- [x] **Step 3: Run to confirm it fails**
 
 Run: `npx vitest run src/pairing/core.test.ts`
 Expected: FAIL — `./core.js` not found.
 
-- [ ] **Step 4: Implement `src/pairing/core.ts`**
+- [x] **Step 4: Implement `src/pairing/core.ts`**
 
 Create `src/pairing/core.ts`:
 
@@ -439,12 +441,12 @@ export async function pair(req: PairRequest): Promise<PairResult> {
 
 > **Implementer note:** `enrollGateway` and `claimPairing` expect fuller config shapes. The `as never` casts adapt call sites; prefer threading the exact fields those functions need rather than relying on casts if it's clean to do so. `enrollGateway` needs `gatewayUrl` + `pairCode` (and uses `EXECUTOR_VERSION` internally); `claimPairing` needs `hubUrl` + `pairCode` + `executorName` + `publicUrl`. Adjust the casts to satisfy the real signatures and re-run the test.
 
-- [ ] **Step 5: Run to confirm it passes**
+- [x] **Step 5: Run to confirm it passes**
 
 Run: `npx vitest run src/pairing/core.test.ts`
 Expected: PASS (2). Adjust env/casts per the implementer note if signatures differ.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/pairing/core.ts src/pairing/core.test.ts
@@ -462,7 +464,7 @@ The `nexus-executor` entry. The bin is a thin launcher that dynamic-imports the 
 - Create: `src/cli/cli.ts`
 - Test: `src/cli/cli.test.ts`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/cli/cli.test.ts`:
 
@@ -485,12 +487,12 @@ describe('nexus-executor dispatch', () => {
 });
 ```
 
-- [ ] **Step 2: Run to confirm it fails**
+- [x] **Step 2: Run to confirm it fails**
 
 Run: `npx vitest run src/cli/cli.test.ts`
 Expected: FAIL — `./cli.js` not found.
 
-- [ ] **Step 3: Implement `src/cli/cli.ts`**
+- [x] **Step 3: Implement `src/cli/cli.ts`**
 
 Create `src/cli/cli.ts`:
 
@@ -558,7 +560,7 @@ export async function runCli(
 
 > **Implementer note:** this is the MVP dispatch. Later tasks (5–9) replace the `TODO: <cmd>` stubs with real imports: `pair`, `unpair`, `status`, `doctor`, `config`, `logs`, `update`. A bare `nexus-executor` (empty args) shows a status summary — wire that in Task 7 where `status` exists. The `exit`/`stdout` options make it testable without spawning a process.
 
-- [ ] **Step 4: Create `bin/nexus-executor`**
+- [x] **Step 4: Create `bin/nexus-executor`**
 
 Create `bin/nexus-executor`:
 
@@ -576,12 +578,12 @@ import('../dist/cli/cli.js').then(async ({ runCli }) => {
 
 Make it executable: `chmod +x bin/nexus-executor`.
 
-- [ ] **Step 5: Run to confirm it passes**
+- [x] **Step 5: Run to confirm it passes**
 
 Run: `npx vitest run src/cli/cli.test.ts`
 Expected: PASS (2). The `version` path returns a matching string; the unknown-command path sets exit code 2 and prints help (the test stub returns the captured output).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/cli/cli.ts src/cli/cli.test.ts bin/nexus-executor
@@ -598,7 +600,7 @@ Wires the headless `pair()` to the CLI: resolves transport (gateway default; `--
 - Create: `src/cli/pair.ts`
 - Test: `src/cli/pair.test.ts`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/cli/pair.test.ts`:
 
@@ -649,12 +651,12 @@ describe('pairFromCli — gateway default, flags', () => {
 });
 ```
 
-- [ ] **Step 2: Run to confirm it fails**
+- [x] **Step 2: Run to confirm it fails**
 
 Run: `npx vitest run src/cli/pair.test.ts`
 Expected: FAIL — `./pair.js` not found.
 
-- [ ] **Step 3: Implement `src/cli/pair.ts`**
+- [x] **Step 3: Implement `src/cli/pair.ts`**
 
 Create `src/cli/pair.ts`:
 
@@ -712,12 +714,12 @@ export async function pairFromCli(opts: PairCliOptions): Promise<PairCliResult> 
 }
 ```
 
-- [ ] **Step 4: Run to confirm it passes**
+- [x] **Step 4: Run to confirm it passes**
 
 Run: `npx vitest run src/cli/pair.test.ts`
 Expected: PASS (2). Fix the test's stray `afterCleanup:` label first if it's still in the file (remove it — it was accidentally left in the snippet).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/cli/pair.ts src/cli/pair.test.ts
@@ -734,11 +736,11 @@ The service reads the CLI state index at boot to determine transport + enrollmen
 - Modify: `src/main.ts` (lines ~1-80: the config → transport selection → pair/enroll block)
 - Test: `src/main.test.ts` (may not exist — add boot-pairing tests there, or a focused unit test on a new `selectTransport(state, config)` helper)
 
-- [ ] **Step 1: Read the current `src/main.ts` boot block**
+- [x] **Step 1: Read the current `src/main.ts` boot block**
 
 Lines 1–80: it builds `config`, then branches `config.transport === 'gateway'` (calls `enrollGateway` + `runGatewayLoop`) or the direct path (`pairCode` → `claimPairing`, then the HTTP listener).
 
-- [ ] **Step 2: Add a transport-selection helper in `src/pairing/core.ts`**
+- [x] **Step 2: Add a transport-selection helper in `src/pairing/core.ts`**
 
 Add to `src/pairing/core.ts`:
 
@@ -756,7 +758,7 @@ export function selectTransport(envTransport?: string, stateTransport?: 'gateway
 }
 ```
 
-- [ ] **Step 3: Add a test for `selectTransport`**
+- [x] **Step 3: Add a test for `selectTransport`**
 
 Append to `src/pairing/core.test.ts`:
 
@@ -773,7 +775,7 @@ it('prefers CLI state over env for transport selection', () => {
 
 Run: `npx vitest run src/pairing/core.test.ts` — PASS.
 
-- [ ] **Step 4: Modify `src/main.ts` to read CLI state at boot**
+- [x] **Step 4: Modify `src/main.ts` to read CLI state at boot**
 
 At the top of the boot path (after `loadConfig()`), add:
 
@@ -820,12 +822,12 @@ if (!alreadyViaCli && config.pairCode && !(await readAuthConfig(pool))) {
 
 > **Implementer note:** the type casts above adapt the existing `config` shape. Keep the diff focused. The key behavioral change: the service trusts the CLI state over env for transport and pairing input, and no longer auto-pairs at boot when the CLI already paired it.
 
-- [ ] **Step 5: Run the executor test suite**
+- [x] **Step 5: Run the executor test suite**
 
 Run: `npx vitest run`
 Expected: existing tests still pass (the boot change is additive; existing tests exercise `claimPairing`/`enrollGateway` via direct helpers). Fix any import breakage.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/main.ts src/pairing/core.ts src/pairing/core.test.ts
@@ -842,7 +844,7 @@ Reports pairing + runtime status from the CLI state index and the credential sto
 - Create: `src/cli/status.ts`
 - Test: `src/cli/status.test.ts`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/cli/status.test.ts`:
 
@@ -884,12 +886,12 @@ describe('statusFromCli', () => {
 });
 ```
 
-- [ ] **Step 2: Run to confirm it fails**
+- [x] **Step 2: Run to confirm it fails**
 
 Run: `npx vitest run src/cli/status.test.ts`
 Expected: FAIL — `./status.js` not found.
 
-- [ ] **Step 3: Implement `src/cli/status.ts`**
+- [x] **Step 3: Implement `src/cli/status.ts`**
 
 Create `src/cli/status.ts`:
 
@@ -943,12 +945,12 @@ function statusText(r: Record<string, unknown>): string {
 }
 ```
 
-- [ ] **Step 4: Run to confirm it passes**
+- [x] **Step 4: Run to confirm it passes**
 
 Run: `npx vitest run src/cli/status.test.ts`
 Expected: PASS (2).
 
-- [ ] **Step 5: Wire the bare `nexus-executor` command to status**
+- [x] **Step 5: Wire the bare `nexus-executor` command to status**
 
 In `src/cli/cli.ts`, replace the `default:` unknown-command branch with a `status`-based bare command. When `argv` is empty (`command === undefined`), call `statusFromCli({ argv: [] })` and print it; keep the unknown-command help + exit-2 path for anything not recognized:
 
@@ -964,12 +966,12 @@ In `src/cli/cli.ts`, replace the `default:` unknown-command branch with a `statu
 
 Put this before the switch. Update `src/cli/cli.test.ts` to assert the bare command reports status (add: `it('prints status summary for a bare invocation' ...)`).
 
-- [ ] **Step 6: Run the cli tests**
+- [x] **Step 6: Run the cli tests**
 
 Run: `npx vitest run src/cli/cli.test.ts src/cli/status.test.ts`
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/cli/status.ts src/cli/status.test.ts src/cli/cli.ts src/cli/cli.test.ts
@@ -987,7 +989,7 @@ Small, focused subcommands. `unpair` is destructive (two-step on a live machine)
 - Test: `src/cli/version.test.ts`, `src/cli/unpair.test.ts`, `src/cli/doctor.test.ts`
 - Modify: `src/cli/cli.ts` wiring
 
-- [ ] **Step 1: Write `version` + test**
+- [x] **Step 1: Write `version` + test**
 
 Create `src/cli/version.ts`:
 
@@ -1014,7 +1016,7 @@ describe('versionText', () => {
 });
 ```
 
-- [ ] **Step 2: Write `unpair` + test**
+- [x] **Step 2: Write `unpair` + test**
 
 Create `src/cli/unpair.ts`:
 
@@ -1075,7 +1077,7 @@ describe('unpair', () => {
 });
 ```
 
-- [ ] **Step 3: Write `doctor` + test**
+- [x] **Step 3: Write `doctor` + test**
 
 Create `src/cli/doctor.ts`:
 
@@ -1152,7 +1154,7 @@ describe('doctor', () => {
 
 > **Implementer note:** this `doctor` is a minimal v1 (identity presence + paired). Extending it to live gateway/opencode/DB liveness (per the spec) is a natural follow-up that belongs in a later task/pass — keep this task's box small and green.
 
-- [ ] **Step 4: Wire `version`/`unpair`/`doctor` into the dispatch**
+- [x] **Step 4: Wire `version`/`unpair`/`doctor` into the dispatch**
 
 In `src/cli/cli.ts`, replace the `TODO: <cmd>` stubs for `version`, `unpair`, `doctor` with real calls:
 
@@ -1178,12 +1180,12 @@ In `src/cli/cli.ts`, replace the `TODO: <cmd>` stubs for `version`, `unpair`, `d
 
 Keep `pair`, `status`, `config`, `logs`, `update` wired as before (pair/status already; config/logs/update in Task 9).
 
-- [ ] **Step 5: Run the cli + subcommand tests**
+- [x] **Step 5: Run the cli + subcommand tests**
 
 Run: `npx vitest run src/cli/cli.test.ts src/cli/version.test.ts src/cli/unpair.test.ts src/cli/doctor.test.ts`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/cli/version.ts src/cli/version.test.ts src/cli/unpair.ts src/cli/unpair.test.ts src/cli/doctor.ts src/cli/doctor.test.ts src/cli/cli.ts src/cli/cli.test.ts
@@ -1199,7 +1201,7 @@ Deliberately minimal. `config` prints the effective config (state + key env); `l
 **Files:**
 - Create: `src/cli/config.ts`, `src/cli/logs.ts`, `src/cli/update.ts`
 
-- [ ] **Step 1: Implement `config`**
+- [x] **Step 1: Implement `config`**
 
 Create `src/cli/config.ts`:
 
@@ -1222,7 +1224,7 @@ export function configText(): string {
 
 (mask secrets: `DATABASE_URL`/`GATEWAY_URL` are printed as `set`/`(unset)`, never their value.)
 
-- [ ] **Step 2: Implement `logs`**
+- [x] **Step 2: Implement `logs`**
 
 Create `src/cli/logs.ts`:
 
@@ -1244,7 +1246,7 @@ export function tailLogs(opts: { argv: string[]; lines?: number }): void {
 }
 ```
 
-- [ ] **Step 3: Implement `update`**
+- [x] **Step 3: Implement `update`**
 
 Create `src/cli/update.ts`:
 
@@ -1265,7 +1267,7 @@ export function update(): string {
 
 > **Implementer note:** `update` is intentionally best-effort and non-destructive (ff-only pull, no data touched). It returns a hint, not an auto-restart, so the operator controls the restart. Wire it into `cli.ts`'s `update` case as a plain call + print.
 
-- [ ] **Step 4: Wire `config`/`logs`/`update` into the dispatch**
+- [x] **Step 4: Wire `config`/`logs`/`update` into the dispatch**
 
 In `src/cli/cli.ts`, add for `config`:
 
@@ -1279,12 +1281,12 @@ In `src/cli/cli.ts`, add for `config`:
 
 For `logs` (fire-and-forget tail — no stdout return), call `tailLogs({ argv: rest })` and return `''`. For `update`, call `update()` and print the returned string. Replace all remaining `TODO: <cmd>` stubs so no subcommand is left unimplemented.
 
-- [ ] **Step 5: Run the full executor test suite**
+- [x] **Step 5: Run the full executor test suite**
 
 Run: `npx vitest run`
 Expected: PASS (all prior + new). Confirm no `TODO:` dispatch paths remain in `cli.ts`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/cli/config.ts src/cli/logs.ts src/cli/update.ts src/cli/cli.ts
@@ -1300,7 +1302,7 @@ A `curl | bash` installer. It builds + links `nexus-executor`, writes a systemd 
 **Files:**
 - Create: `install.sh`
 
-- [ ] **Step 1: Write `install.sh`**
+- [x] **Step 1: Write `install.sh`**
 
 Create `install.sh` at the repo root:
 
@@ -1381,17 +1383,17 @@ Make it executable: `chmod +x install.sh`.
 
 > **Implementer note:** the systemd unit above inlines `"$(pwd)/dist/main.js"` which is evaluated when the unit file is written. Use the absolute path of the checkout for a stable unit. If `npm link` isn't available in the runtime, install `dist` via `npm i -g` instead. Keep the pairing call delegated to `nexus-executor pair` — no pairing HTTP in the installer.
 
-- [ ] **Step 2: Shellcheck pass**
+- [x] **Step 2: Shellcheck pass**
 
 Run: `shellcheck install.sh` (if available) or `bash -n install.sh`
 Expected: no syntax errors; address any `shellcheck` warnings you can.
 
-- [ ] **Step 3: Dry-run smoke**
+- [x] **Step 3: Dry-run smoke**
 
 Run: `bash install.sh --dry-run --gateway https://g.example.com --code ABC`
 Expected: prints "Dry-run mode" and the `run` lines with `(dry-run)` prefixes; exits 0 without writing files or invoking the network.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add install.sh
@@ -1409,7 +1411,7 @@ Wire the `nexus-executor` bin into `package.json`, replace `npm run pair` with `
 - Modify (delete if clean): `src/pairing.ts` → replace with a thin note, or remove its `npm run pair` script.
 - Modify: `README.md`
 
-- [ ] **Step 1: Update `package.json`**
+- [x] **Step 1: Update `package.json`**
 
 Add `"bin"` and a `cli` script; point `pair` at the CLI:
 
@@ -1434,14 +1436,14 @@ Add `"bin"` and a `cli` script; point `pair` at the CLI:
 
 > **Implementer note:** `bin/nexus-executor` imports `../dist/cli/cli.js` (node's ESM). `src/cli/cli.ts` is compiled by `tsc` to `dist/cli/cli.js`. For `npm run pair`, create a tiny `src/cli/pair-cli.ts` that calls `pairFromCli({ argv: process.argv.slice(2) })` and prints the result, OR keep the script as `tsx src/cli/pair.ts` if it has an inline run-guard. Decide which is cleanest and keep it runnable.
 
-- [ ] **Step 2: Retire `src/pairing.ts`**
+- [x] **Step 2: Retire `src/pairing.ts`**
 
 The old `npm run pair` entry pointed at `src/pairing.ts`. Its `claimPairing` is still used by `src/pairing/core.ts` (direct transport) and by `src/main.ts` (boot). **Keep** `src/pairing.ts` as the `claimPairing` implementation module (do NOT delete it — `core.ts` imports it). Only remove its stale `invokedDirectly`/`cli()` block if it's now dead. Verify with:
 
 Run: `npx vitest run`
 Expected: PASS — nothing that imports `pairing.ts` breaks.
 
-- [ ] **Step 3: Update `README.md`**
+- [x] **Step 3: Update `README.md`**
 
 Replace the `npm run pair` references in the quickstart with `nexus-executor pair` (interactive) / `nexus-executor pair --gateway <url> --code <code>` (automation). Add a short section:
 
@@ -1463,13 +1465,13 @@ Install a machine with:
     curl -fsSL https://executor.example.com/install | bash
 ```
 
-- [ ] **Step 4: Run the full suite + typecheck**
+- [x] **Step 4: Run the full suite + typecheck**
 
 Run: `npx vitest run && npx tsc --noEmit`
 
 Expected: PASS. No `npm run pair` references to a deleted entry remain in the README/scripts that would break.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add package.json src/pairing.ts src/cli/pair-cli.ts README.md
@@ -1480,12 +1482,12 @@ git commit -m "feat(executor): wire nexus-executor bin + docs"
 
 ## Verification / acceptance
 
-- [ ] `npx vitest run` — all executor unit/CLI tests pass.
-- [ ] `npx tsc --noEmit` — clean typecheck.
-- [ ] `bash -n install.sh && shellcheck install.sh` — installer lints.
-- [ ] `bash install.sh --dry-run --gateway https://g.example.com --code ABC` — dry-run exits 0.
-- [ ] Manual smoke (after build): `nexus-executor status` → "not paired"; `nexus-executor pair` → enrolls; `nexus-executor status` → enrolled; `nexus-executor doctor --json` → paired true.
-- [ ] README quickstart reflects `nexus-executor pair`/`status` and `curl | bash`.
+- [x] `npx vitest run` — all executor unit/CLI tests pass.
+- [x] `npx tsc --noEmit` — clean typecheck.
+- [x] `bash -n install.sh && shellcheck install.sh` — installer lints.
+- [x] `bash install.sh --dry-run --gateway https://g.example.com --code ABC` — dry-run exits 0.
+- [x] Manual smoke (after build): `nexus-executor status` → "not paired"; `nexus-executor pair` → enrolls; `nexus-executor status` → enrolled; `nexus-executor doctor --json` → paired true.
+- [x] README quickstart reflects `nexus-executor pair`/`status` and `curl | bash`.
 
 ## Rollout / migration
 
