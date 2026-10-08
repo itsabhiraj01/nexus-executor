@@ -20,3 +20,8 @@ npm-debug.log*
 
 # OS files
 .DS_Store
+
+# Live gateway identity + credential (needs re-pairing, never commit)
+data/gateway-identity.json
+gateway-identity.json
+*.identity.json

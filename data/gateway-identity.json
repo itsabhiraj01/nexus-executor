@@ -1,8 +1,0 @@
-{
-  "version": 1,
-  "credential": "uuLqYmNRP0vlzIN85kw8fiDKeOyq3XLN",
-  "executorId": "7220ff71-3bd7-4a53-a0bb-d55a58fa7a67",
-  "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAttDAF9AQBZtc6XkCHV0lnd0gjAhSB+7mKHMV83i6lMo=\n-----END PUBLIC KEY-----\n",
-  "privateKeyPem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIG+BHISGGCiWcK8PHhVhVTGesXV0NRnG/ajinArKZ7zr\n-----END PRIVATE KEY-----\n",
-  "enrolledAt": "2026-10-07T20:41:55.941Z"
-}
