@@ -69,6 +69,13 @@ state at boot, so once you `nexus-executor pair`, the service picks up the
 enrollment on next start — you no longer need to edit `PAIR_CODE` into `.env`
 for the boot to consume it (see [Control CLI](#control-cli)).
 
+**New: executor-owned projects.** Register the working copies the hub
+dispatches to with `nexus-executor project add <name> --dir <abs-path>
+[--remote <url>]` (list/show/rm likewise). The executor is the authority on
+each project's directory and git remote (autodetected from `origin` when
+omitted; plain non-git dirs allowed) — see
+[Executor-owned projects](#executor-owned-projects-project-registry).
+
 ## Gateway transport and Podman on the office box
 
 For outbound-only operation behind NAT, use:
@@ -176,6 +183,10 @@ provisions a machine):
     nexus-executor status --json
     nexus-executor doctor --json
     nexus-executor unpair
+    nexus-executor project add <name> --dir <abs-path> [--remote <url>]
+    nexus-executor project list
+    nexus-executor project show <name>
+    nexus-executor project rm <name>
     nexus-executor version
     nexus-executor config
     nexus-executor logs
@@ -185,6 +196,68 @@ Install a fresh machine with:
 
     curl -fsSL https://executor.example.com/install | bash
     curl -fsSL https://executor.example.com/install | bash -s -- --gateway URL --code CODE
+
+## Executor-owned projects (project registry)
+
+A registered project is a durable, executor-local record that names a working
+copy the hub can dispatch jobs to. The **executor is the authority** on where
+a project lives and what git remote it tracks — the hub never ships a raw
+path, it references the project by name, so a wrong or attacker-supplied path
+on the network can't point the executor at an arbitrary directory.
+
+Each registered project carries:
+
+- **`dir_path`** *(mandatory)* — an absolute path on **this** executor machine.
+- **`git_remote`** *(optional)* — autodetected from the repo's `origin` when
+  omitted and the directory is under git. A plain non-git directory is allowed
+  (non-git "plain-dir work") **only** when no remote is set.
+- Optional `build` / `run` / `test` commands and a **custom prompt**.
+
+```bash
+# Register a project from a repo on this machine — the origin remote is
+# autodetected:
+nexus-executor project add myapp --dir /home/me/myapp
+# → Registered project "myapp" -> /home/me/myapp (remote https://github.com/me/myapp.git)
+
+# Explicit remote (no autodetect; useful for a bare/non-origin remote):
+nexus-executor project add myapp --dir /home/me/myapp --remote https://github.com/me/myapp.git
+
+# Plain (non-git) directory work — only valid with no remote:
+nexus-executor project add buildout --dir /opt/buildout
+
+# Manage & inspect:
+nexus-executor project list
+nexus-executor project show myapp
+nexus-executor project rm myapp
+```
+
+Commands:
+
+| Command | Behavior |
+| --- | --- |
+| `project add <name> --dir <abs>` `[--remote <url>]` `[--build <cmd>]` `[--run <cmd>]` `[--test <cmd>]` `[--prompt <txt>]` | Validate the dir, autodetect/record the git remote, upsert the record (re-registering an existing name repoints its dir). |
+| `project list` | All registered projects, sorted by name. |
+| `project show <name>` | One project's full record. |
+| `project rm <name>` | Delete the registration. |
+
+Rules enforced at registration:
+
+- The directory must **exist** (missing → rejected).
+- The name allows letters, digits, `_`, `.`, `-`; no spaces or path chars.
+- Setting `--remote` on a **non-git** directory is rejected ("not a git repo") —
+  a remote can only be recorded for a real repository.
+- Re-registering an existing **name** moves it to the new directory (upsert).
+
+The registry is backed by the `executor.projects` table (migration
+`003_executor_projects.sql`, applied by `make migrate` / boot auto-migrate).
+Executors advertise the registry to the hub in `GET /api/v1/status →
+capabilities.projectRegistry: true`, so the hub knows it can dispatch by
+executor-owned project name. When a dispatched job references a registered
+project (a `project.projectName` reference from a projectRegistry-capable
+hub), the executor resolves it to the registered directory here; a `localPath`
+that happens to be a registered dir is also best-effort `git fetch --all
+--prune`d first, so work runs against fresh state. Unknown names are rejected
+at dispatch, not silently re-cloned.
 
 ## Networking over Tailscale / ZeroTier
 
@@ -238,9 +311,9 @@ status.
 | Route | Behavior |
 | --- | --- |
 | `GET /health` | Public. `{ok, db:'up'\|'down', name, paired}`; 503 when the db is down. |
-| `GET /api/v1/status` | `{ok:true, name, version, paired:true, opencode:{configured,baseUrl}, jobs:{active,queued,total}, capabilities:{jobRetries,modelFallback}, uptimeSeconds}`. |
+| `GET /api/v1/status` | `{ok:true, name, version, paired:true, opencode:{configured,baseUrl}, jobs:{active,queued,total}, capabilities:{jobRetries,modelFallback,projectRegistry}, uptimeSeconds}`. |
 | `GET /api/v1/models?directory=` | `{items:[{id,name,provider}]}` from the OpenCode service; 503 when unconfigured. |
-| `POST /api/v1/jobs` | Create a job. Body `{jobId, title?, prompt, verificationCommand?, project:{name?, repoUrl?, localPath?, buildCommand?, runCommand?, testCommand?, customPrompt?}\|null, models?: string[], attachments?: [{name,mimeType,dataBase64}], retry?: {maxAttempts: 1..10, delayMinutes: 0..60}}`. Caps: prompt ≤ 200k chars, ≤ 10 attachments, ≤ 25 MB total attachment bytes. **Idempotent on `jobId`** (existing job → 200 `{job}`, no duplicate). New job → 201 `{job}`; admitted immediately when a slot is free, else `queued`. `retry` pins the in-job retry budget (absent = `EXECUTOR_RETRY_MAX`/`EXECUTOR_RETRY_DELAY_MINUTES`). |
+| `POST /api/v1/jobs` | Create a job. Body `{jobId, title?, prompt, verificationCommand?, project:{name?, repoUrl?, localPath?, buildCommand?, runCommand?, testCommand?, customPrompt?}\|null, models?: string[], attachments?: [{name,mimeType,dataBase64}], retry?: {maxAttempts: 1..10, delayMinutes: 0..60}}`. Caps: prompt ≤ 200k chars, ≤ 10 attachments, ≤ 25 MB total attachment bytes. **Idempotent on `jobId`** (existing job → 200 `{job}`, no duplicate). New job → 201 `{job}`; admitted immediately when a slot is free, else `queued`. `retry` pins the in-job retry budget (absent = `EXECUTOR_RETRY_MAX`/`EXECUTOR_RETRY_DELAY_MINUTES`). A `localPath` that points at a registered (executor-owned) project best-effort fetches that project's remote before the job runs. |
 | `GET /api/v1/jobs?status&limit&updatedSince` | `{jobs:[JobSummary]}` ordered by `updated_at` ascending. `limit` ≤ 500 (default 100); `updatedSince` is an ISO lower bound (exclusive). JobSummary: `{id, hubJobId, status, title, failureReason, errorCode, attemptCount, maxAttempts, mergedSha, createdAt, startedAt, finishedAt, updatedAt}`. |
 | `GET /api/v1/jobs/:jobId` | JobSummary + `{branch, worktreePath, opencodeSessionId, model, summary, verification:{attempts,lastExitCode,lastOutputTail}, eventCount}`. 404 unknown. |
 | `GET /api/v1/jobs/:jobId/events?sinceSeq=0&limit=200` | `{events:[{seq,type,source,summary,payload,createdAt}]}` ascending by `seq`, `seq > sinceSeq`, limit ≤ 500. |

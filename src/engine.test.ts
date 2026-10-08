@@ -162,6 +162,40 @@ describe('launch', () => {
     await ctx.engine.cancel('job-attach');
   });
 
+  it('resolves an executor-owned project reference (projectName) to its registered dir', async () => {
+    // Register a second git repo as an executor-owned project.
+    const owned = await makeRepo(join(root, 'owned-proj'));
+    await pool.query(
+      `INSERT INTO executor.projects (name, dir_path, git_remote) VALUES ($1, $2, $3) ON CONFLICT (name) DO UPDATE SET dir_path = EXCLUDED.dir_path, git_remote = EXCLUDED.git_remote`,
+      ['owned-proj', owned, null],
+    );
+    const ctx = makeEngine();
+    // No localPath/repoUrl — the executor must resolve the registered dir.
+    const job = await runningJob(ctx, spec({
+      jobId: 'job-owned-ref',
+      project: { name: 'owned-proj', projectName: 'owned-proj' },
+    }));
+    // The worktree belongs to the OWNED repo (its common git dir is inside
+    // the registered dir), proving the name resolved to that directory.
+    const commonDir = await execGit(['rev-parse', '--git-common-dir'], { cwd: job.worktreePath });
+    expect(commonDir.code).toBe(0);
+    expect(commonDir.stdout.trim()).toContain(`${owned}/.git`);
+    await ctx.engine.cancel('job-owned-ref');
+  });
+
+  it('fails cleanly when a projectName is not registered on this executor', async () => {
+    const ctx = makeEngine();
+    const { job } = await ctx.engine.createJob(spec({
+      jobId: 'job-unknown-ref',
+      project: { name: 'ghost', projectName: 'ghost' },
+    }));
+    const row = (await getJobByHubId(pool, 'job-unknown-ref'))!;
+    expect(row.status).toBe('failed');
+    expect(row.errorCode).toBe('session_setup_failed');
+    expect(row.failureReason).toContain('not registered');
+    void job;
+  });
+
   it('is idempotent on hub jobId', async () => {
     const ctx = makeEngine();
     const first = await ctx.engine.createJob(spec({ jobId: 'job-idem' }));

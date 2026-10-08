@@ -23,6 +23,10 @@ Usage:
   nexus-executor pair --gateway URL --code CODE   pair non-interactively
   nexus-executor pair --hub URL --code CODE       use direct transport
   nexus-executor unpair         remove pairing (two-step on a live machine)
+  nexus-executor project add <name> --dir <abs-path> [--remote <url>]
+  nexus-executor project list
+  nexus-executor project show <name>
+  nexus-executor project rm <name>
   nexus-executor status         show pairing + runtime status  (--json)
   nexus-executor version        print versions
   nexus-executor doctor         self-check pairing status      (--json)
@@ -101,6 +105,20 @@ export async function runCli(
       const text = update();
       print(text);
       return text;
+    }
+    case 'project': {
+      const { loadConfig } = await import('../config.js');
+      const { createPool } = await import('../db.js');
+      const { projectsFromCli } = await import('../projects.js');
+      const config = loadConfig();
+      const pool = createPool(config.databaseUrl);
+      try {
+        const text = await projectsFromCli({ pool }, rest);
+        print(text);
+        return text;
+      } finally {
+        await pool.end().catch(() => undefined);
+      }
     }
     case 'help': {
       print(HELP);

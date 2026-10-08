@@ -63,7 +63,7 @@ export interface ExecutorConfig {
  *  `jobRetries` (an executor that retries in-job must never also be
  *  retried by the hub: budgets would multiply). */
 export function executorCapabilities(): Record<string, unknown> {
-  return { jobRetries: true, modelFallback: true };
+  return { jobRetries: true, modelFallback: true, projectRegistry: true };
 }
 
 function required(name: string, env: NodeJS.ProcessEnv): string {

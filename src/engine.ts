@@ -71,6 +71,10 @@ export const SLOT_OCCUPYING_STATUSES: readonly JobStatus[] = ['created', 'runnin
 
 export interface ProjectSpec {
   name?: string;
+  /** Reference to an executor-registered project (`executor.projects`). When
+   *  present the executor resolves it to its own dir_path/git_remote — the
+   *  authority for the working copy. */
+  projectName?: string;
   repoUrl?: string;
   localPath?: string;
   buildCommand?: string;
@@ -545,9 +549,48 @@ export class JobEngine {
 
   private async resolveRepoRoot(spec: JobSpecInput): Promise<string> {
     const project = spec.project;
-    if (project?.localPath) return project.localPath;
+    // Executor-owned project reference: resolve to this machine's registered
+    // directory. The executor (not the hub) is the authority on the path.
+    if (project?.projectName) {
+      const dir = await this.resolveRegisteredProject(project.projectName);
+      await this.fetchRegisteredRemote(dir).catch(() => undefined);
+      return dir;
+    }
+    if (project?.localPath) {
+      // Best-effort fetch a registered dir's remote so the job runs against
+      // fresh state. Non-git / non-registered dirs are used as-is (plain dir
+      // work is an allowed mode when no remote is configured).
+      await this.fetchRegisteredRemote(project.localPath).catch(() => undefined);
+      return project.localPath;
+    }
     if (project?.repoUrl) return this.cloneRepo(project.repoUrl);
-    throw new Error('The job project must carry a localPath or a repoUrl — there is nowhere to work.');
+    throw new Error('The job project must carry a projectName, localPath or a repoUrl — there is nowhere to work.');
+  }
+
+  /** Look up an executor-registered project by name and answer its dir_path.
+   *  Throws when the name is unknown or the directory has since vanished. */
+  private async resolveRegisteredProject(name: string): Promise<string> {
+    const { rows } = await this.pool.query<{ dir_path: string }>(
+      `SELECT dir_path FROM executor.projects WHERE name = $1 LIMIT 1`,
+      [name],
+    );
+    const dir = rows[0]?.dir_path;
+    if (!dir) {
+      throw new Error(`Executor cannot accept this job: project "${name}" is not registered on this executor (run 'nexus-executor project add ${name} --dir <path>')).`);
+    }
+    if (!existsSync(dir)) {
+      throw new Error(`Executor cannot accept this job: registered project "${name}" points at a missing directory ${dir}`);
+    }
+    return dir;
+  }
+
+  /** If `dir` is a git repo, fetch `--all --prune` (no-op/ignored otherwise).
+   *  Never throws to the caller — best-effort. */
+  private async fetchRegisteredRemote(dir: string): Promise<void> {
+    if (!existsSync(join(dir, '.git'))) return;
+    const probe = await this.git(['rev-parse', '--is-inside-work-tree'], { cwd: dir });
+    if (probe.code !== 0) return;
+    await this.git(['fetch', '--all', '--prune'], { cwd: dir });
   }
 
   /** Clone (once) into `<workspaceRoot>/repos/<sha1(url)>` and fetch on
