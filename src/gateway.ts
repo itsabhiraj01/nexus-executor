@@ -88,6 +88,7 @@ export async function enrollGateway(
       executor_public_key: publicKeyPem,
       agent_version: EXECUTOR_VERSION,
       protocol_version: GATEWAY_PROTOCOL_VERSION,
+      name: config.executorName,
     }),
     signal: AbortSignal.timeout(15_000),
   });
