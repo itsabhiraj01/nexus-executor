@@ -13,7 +13,11 @@
     "dev": "tsx watch --env-file=.env src/main.ts",
     "start": "node --env-file=.env dist/main.js",
     "test": "vitest run",
-    "pair": "tsx --env-file=.env src/pairing.ts"
+    "cli": "tsx src/cli/cli.ts",
+    "pair": "tsx src/cli/cli.ts pair"
+  },
+  "bin": {
+    "nexus-executor": "bin/nexus-executor"
   },
   "dependencies": {
     "fastify": "^5.6.1",

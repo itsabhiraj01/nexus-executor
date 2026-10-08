@@ -1,3 +1,4 @@
+import { pathToFileURL } from 'node:url';
 import { EXECUTOR_VERSION } from '../config.js';
 
 /**
@@ -110,4 +111,15 @@ export async function runCli(
       exit(2);
       return HELP;
   }
+}
+
+// Direct invocation (`tsx src/cli/cli.ts pair ...`) runs the CLI without
+// needing a build — the path used by `npm run pair`. `pathToFileURL` mirrors
+// the standalone-check pattern in `src/pairing.ts`.
+const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) {
+  runCli(process.argv.slice(2)).catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
 }
