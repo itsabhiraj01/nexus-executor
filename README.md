@@ -174,7 +174,11 @@ is not automatically copied into the container.
 
 `nexus-executor` is the executor's control command (via `bin/nexus-executor`;
 `npm link` or `npm i -g` make it available on `PATH`, and `install.sh`
-provisions a machine):
+provisions a machine). When run from a checkout, it **loads `<cwd>/.env`
+automatically** (Node's built-in `--env-file` semantics via
+`process.loadEnvFile`), so `./bin/nexus-executor pair` works without manually
+exporting `DATABASE_URL` etc. — matching how `make start` gets its config. An
+explicitly exported variable is never overridden.
 
     nexus-executor                    → status summary
     nexus-executor pair               → interactive pairing (gateway by default)

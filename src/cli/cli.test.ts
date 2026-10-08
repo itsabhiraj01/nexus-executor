@@ -2,9 +2,22 @@ import { describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runCli } from './cli.js';
+import { runCli, loadEnvFileIfPresent } from './cli.js';
 
 describe('nexus-executor dispatch', () => {
+  it('loads the checkout .env so a bare CLI works without exported env', async () => {
+    const had = process.env.DATABASE_URL;
+    delete process.env.DATABASE_URL;
+    try {
+      // cli.ts module import already invoked the loader; re-run it against the
+      // cwd `.env` to assert the DATABASE_URL it requires is populated.
+      loadEnvFileIfPresent();
+      expect(process.env.DATABASE_URL).toBeTruthy();
+    } finally {
+      if (had) process.env.DATABASE_URL = had; else delete process.env.DATABASE_URL;
+    }
+  });
+
   it('prints help for an unknown subcommand and exits non-zero', async () => {
     let code = 0;
     const out = await runCli(['frobnicate'], { exit: (c) => { code = c; } });

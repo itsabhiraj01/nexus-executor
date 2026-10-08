@@ -1,4 +1,6 @@
 import { pathToFileURL } from 'node:url';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { EXECUTOR_VERSION } from '../config.js';
 
 /**
@@ -14,6 +16,33 @@ export interface CliRunOptions {
   exit?: (code: number) => void;
   stdout?: (text: string) => void;
 }
+
+/**
+ * Load the checkout's `.env` into `process.env` if present and not already
+ * there. The runtime (`node --env-file=.env dist/main.js`) and the tsx
+ * scripts (`tsx --env-file=.env …`) get their config from `--env-file`, but a
+ * bare `./bin/nexus-executor pair` (or `npm run cli`) doesn't — so pairing
+ * would fail with "DATABASE_URL is required". Using Node's own
+ * `process.loadEnvFile` matches `--env-file` semantics exactly (correct
+ * comments/quotes, never overrides an already-set variable) with no new
+ * dependency. Resolution mirrors `--env-file`: the file is looked up relative
+ * to the current working directory (the checkout).
+ */
+function loadEnvFileIfPresent(): void {
+  if (process.env.DATABASE_URL) return; // already configured (tests, service, exported env)
+  const envPath = resolve(process.cwd(), '.env');
+  if (!existsSync(envPath)) return;     // no checkout .env — let the command error helpfully
+  try {
+    process.loadEnvFile(envPath);
+  } catch {
+    // A malformed .env should not brick unrelated subcommands like `version`;
+    // the command that needs the var reports it clearly.
+  }
+}
+export { loadEnvFileIfPresent };
+
+// Load on module import (before any command runs).
+loadEnvFileIfPresent();
 
 const HELP = `nexus-executor — Nexus executor control
 
