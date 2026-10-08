@@ -6,6 +6,8 @@ import { createPool, defaultMigrationsDir, runModuleMigrations } from './db.js';
 import { JobEngine } from './engine.js';
 import { createOpenCodeClient } from './opencode.js';
 import { claimPairing } from './pairing.js';
+import { selectTransport } from './pairing/core.js';
+import { readCliState } from './pairing/state.js';
 import { registerRoutes } from './routes.js';
 import { startWorker } from './worker.js';
 
@@ -17,6 +19,8 @@ import { startWorker } from './worker.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  const cliState = readCliState();
+  const transport = selectTransport(config.transport, cliState?.transport ?? null);
   const logger = pino({ level: config.logLevel });
   const pool = createPool(config.databaseUrl);
   const startedAt = Date.now();
@@ -30,12 +34,18 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (config.transport === 'gateway') {
+  if (transport === 'gateway') {
     // Outbound-only transport: no HTTP listener, no pair token — enroll
     // with the pairing code ONCE (persisted identity), then serve the
-    // canonical operations over the dialed-out WebSocket.
+    // canonical operations over the dialed-out WebSocket. The CLI state
+    // (from `nexus-executor pair`) is authoritative for the gateway URL;
+    // env PAIR_CODE is only a fallback when not yet enrolled.
     const { enrollGateway, runGatewayLoop } = await import('./gateway.js');
-    const identity = await enrollGateway(config);
+    const enrollConfig = {
+      ...config,
+      gatewayUrl: (cliState && 'gatewayUrl' in cliState ? cliState.gatewayUrl : config.gatewayUrl),
+    };
+    const identity = await enrollGateway(enrollConfig);
     logger.info({ executorId: identity.executorId }, 'enrolled with gateway');
 
     const client = config.opencode.baseUrl
@@ -73,7 +83,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (config.pairCode && !(await readAuthConfig(pool))) {
+  const alreadyViaCli = cliState && cliState.transport === 'direct';
+  if (!alreadyViaCli && config.pairCode && !(await readAuthConfig(pool))) {
     const outcome = await claimPairing(config, pool);
     logger.info({ id: outcome.id, hubUrl: outcome.hubUrl }, `paired with hub as ${outcome.name}${outcome.id ? ` (id ${outcome.id})` : ''}`);
   }

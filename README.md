@@ -50,15 +50,24 @@ One-way trust:
 
 ```bash
 make install                 # npm ci
-cp .env.example .env         # then edit DATABASE_URL, OPENCODE_*, HUB_URL, PAIR_CODE, EXECUTOR_PUBLIC_URL
+cp .env.example .env         # then edit DATABASE_URL, OPENCODE_*, EXECUTOR_TRANSPORT/GATEWAY_URL or HUB_URL
 make migrate                 # apply src/migrations to DATABASE_URL
-make pair                    # one-shot pairing with the hub (needs HUB_URL + PAIR_CODE + EXECUTOR_PUBLIC_URL)
 make build
+# Pair interactively (gateway transport by default), or non-interactively:
+nexus-executor pair --gateway https://gateway.example.com --code <CODE>
+# See your pairing/runtime state:
+nexus-executor status
 make start                   # node --env-file=.env dist/main.js
 ```
 
 `make dev` runs the same server via tsx with watch mode. `make test` runs
 the suite (it needs a reachable Postgres; see Testing below).
+
+**New in this branch:** pairing is now a `nexus-executor` subcommand backed
+by a single headless pairing core. The running service reads the CLI pairing
+state at boot, so once you `nexus-executor pair`, the service picks up the
+enrollment on next start — you no longer need to edit `PAIR_CODE` into `.env`
+for the boot to consume it (see [Control CLI](#control-cli)).
 
 ## Gateway transport and Podman on the office box
 
@@ -99,10 +108,11 @@ Wait for Postgres to accept connections, then set the host `.env`:
 DATABASE_URL=postgres://nexus_executor:nexus_executor@127.0.0.1:5544/nexus_executor
 ```
 
-Run `make migrate`, set a fresh `PAIR_CODE`, then run `make pair`,
-`make build`, and `make start`. **Pairing exits after enrollment**; Nexus
-stays offline until the running executor logs `gateway session established`.
-Keep `make start` running, or supervise the host executor with systemd.
+Run `make migrate`, then pair with `nexus-executor pair --gateway
+https://nexus-executor.abhirajtomar.com --code <fresh-code>`, `make build`,
+and `make start`. **Pairing exits after enrollment**; Nexus stays offline
+until the running executor logs `gateway session established`. Keep
+`make start` running, or supervise the host executor with systemd.
 
 ## Quickstart — Docker / Podman (containerized executor)
 
@@ -114,11 +124,13 @@ docker compose up --build -d # or: make docker-up
 The compose stack runs this image plus a `postgres:16` sidecar with a
 private network; the executor **applies its migrations at boot**, so
 restarting onto a new image is the whole upgrade story. Pairing still needs
-to happen once: either set `PAIR_CODE` in `.env` (the boot consumes it), or
-run `podman compose exec executor npm run pair` inside the running executor
-(use `docker` in place of `podman` for Docker). Host `make pair` does not
-inherit Compose's database override or container identity. Job workspaces persist in
-the `executor-workspaces` volume; the database in `pgdata`.
+to happen once: run `nexus-executor pair` inside the running executor
+(use `docker` in place of `podman` for Docker). In a container, set
+`NEXUS_EXECUTOR_STATE` to a mounted path so the CLI state survives restarts,
+and mount the gateway identity at `GATEWAY_IDENTITY_PATH` persistently.
+
+Job workspaces persist in the `executor-workspaces` volume; the database in
+`pgdata`.
 
 For a containerized executor, configure OpenCode networking and storage
 before using this recipe: container `127.0.0.1:4096` is not the host's
@@ -134,18 +146,45 @@ is not automatically copied into the container.
 
 1. **On the hub**: open Builder → Executors → "Pair executor" and copy the
    one-shot code.
-2. **On the executor machine**: fill `.env` — `HUB_URL` (the hub's address),
-   `PAIR_CODE` (the code), `EXECUTOR_PUBLIC_URL` (the address the hub should
-   dial back), and `EXECUTOR_NAME` (defaults to the hostname).
-3. Run `make pair` (or just start the server with `PAIR_CODE` set — the
-   boot claims it when no auth row exists). You should see:
-   `paired with hub as "office-box" (id …)`.
-4. From then on the executor answers the hub's authenticated calls.
-   Re-running `make pair` while paired is a no-op.
+2. **On the executor machine**: fill `.env` — `EXECUTOR_TRANSPORT=gateway` +
+   `GATEWAY_URL` (the gateway transport, recommended) or `HUB_URL` +
+   `EXECUTOR_PUBLIC_URL` (direct), and `EXECUTOR_NAME` (defaults to the
+   hostname).
+3. Run `nexus-executor pair` (interactive) or
+   `nexus-executor pair --gateway <url> --code <CODE>` (non-interactive;
+   `--hub <url>` opts into direct). You should see:
+   `Paired "<name>" via <gateway> (executor <id>)`.
+4. From then on the executor answers the hub's authenticated calls. The
+   service reads the CLI pairing state at boot, so enrollment from `pair`
+   applies on the next `make start`. Running `nexus-executor pair` again
+   while already paired is a no-op.
 
-**Re-pairing after a revoke**: revoke the executor on the hub, delete the
-auth row (`DELETE FROM executor.config WHERE key = 'auth'`), then pair again
-with a fresh code.
+**Re-pairing after a revoke**: revoke the executor on the hub, run
+`nexus-executor unpair` (deletes the identity/state), then
+`nexus-executor pair` with a fresh code.
+
+## Control CLI
+
+`nexus-executor` is the executor's control command (via `bin/nexus-executor`;
+`npm link` or `npm i -g` make it available on `PATH`, and `install.sh`
+provisions a machine):
+
+    nexus-executor                    → status summary
+    nexus-executor pair               → interactive pairing (gateway by default)
+    nexus-executor pair --gateway URL --code CODE   → non-interactive
+    nexus-executor pair --hub URL --code CODE       → direct transport
+    nexus-executor status --json
+    nexus-executor doctor --json
+    nexus-executor unpair
+    nexus-executor version
+    nexus-executor config
+    nexus-executor logs
+    nexus-executor update
+
+Install a fresh machine with:
+
+    curl -fsSL https://executor.example.com/install | bash
+    curl -fsSL https://executor.example.com/install | bash -s -- --gateway URL --code CODE
 
 ## Networking over Tailscale / ZeroTier
 
@@ -166,8 +205,12 @@ in front) if you expose the executor publicly.
 | `LOG_LEVEL` | `info` | pino level. |
 | `EXECUTOR_NAME` | hostname | Shown on the hub next to jobs. |
 | `EXECUTOR_PUBLIC_URL` | — | The URL the hub dials back; **required for pairing**. |
-| `HUB_URL` | — | Hub base URL for the one-shot pairing call. |
-| `PAIR_CODE` | — | One-shot code, consumed at boot (or via `make pair`) when unpaired. |
+| `HUB_URL` | — | Hub base URL for the one-shot direct pairing call. |
+| `PAIR_CODE` | — | One-shot code consumed by `nexus-executor pair` (or, as a fallback, at boot when unpaired and the CLI state is absent). |
+| `EXECUTOR_TRANSPORT` | `direct` | `gateway` = dial out to the nexus-gateway WebSocket; `direct` = the hub dials this executor's HTTP listener. The `nexus-executor pair` CLI state overrides this at boot when present. |
+| `GATEWAY_URL` | — | Public gateway base URL (gateway transport; no `/v1/enroll` suffix). |
+| `GATEWAY_IDENTITY_PATH` | `<workspace>/../gateway-identity.json` | Ed25519 identity + credential store (gateway transport). |
+| `NEXUS_EXECUTOR_STATE` | `~/.config/nexus-executor/state.json` | CLI pairing state index path (override for containers/tests). |
 | `OPENCODE_BASE_URL` | — | `opencode serve` URL; **required to run jobs** (jobs queue without it). |
 | `OPENCODE_TOKEN` | — | The service's pinned password (`opencode:<token>` over Basic), or a full scheme header. |
 | `OPENCODE_AGENT` | `build` | Session agent. |
@@ -208,8 +251,10 @@ status.
 | `GET /api/v1/jobs/:jobId/log` | `{gone:true}` after cleanup, else `{branch, commits:[{sha,subject,at}], status}` (commits on the branch since the snapshot base + porcelain status). |
 | `PUT /api/v1/config` | `{systemPrompt?, defaults?, models?}` — upserts the executor's stored config (the hub pushes its canonical values here). `{ok:true}`. |
 
-Management commands: `make migrate` applies `src/migrations`; `make pair`
-runs the pairing claim; `make dev`/`make start` run the server.
+Management commands: `make migrate` applies `src/migrations`;
+`nexus-executor pair/status/doctor/…` control pairing and diagnostics;
+`make dev`/`make start` run the server. `make pair` remains as
+`tsx src/cli/cli.ts pair`.
 
 ## Job lifecycle
 
@@ -259,8 +304,9 @@ parks are exempt).
 - **Where is a job's work?** `GET /api/v1/jobs/:id/log` (branch + commits +
   porcelain status) while the worktree exists; after a merge the workspace
   is removed and the merge sha is recorded on the job.
-- **Re-pairing after revoke**: revoke on the hub, `DELETE FROM
-  executor.config WHERE key = 'auth'`, run `make pair` with a fresh code.
+- **Re-pairing after revoke**: revoke on the hub, then `nexus-executor unpair`
+  (clears identity + CLI state), and pair again with a fresh code via
+  `nexus-executor pair`.
 - **Restarting**: in-flight agent turns live in the OpenCode service, not
   this process; on boot the worker re-adopts jobs with sessions and resumes
   polling them.

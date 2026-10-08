@@ -1,8 +1,5 @@
-import { pathToFileURL } from 'node:url';
-import pino from 'pino';
 import { hashToken, readAuthConfig, writeAuthConfig } from './auth.js';
-import { EXECUTOR_VERSION, executorCapabilities, loadConfig, type ExecutorConfig } from './config.js';
-import { createPool } from './db.js';
+import { EXECUTOR_VERSION, executorCapabilities, type ExecutorConfig } from './config.js';
 import type { Pool } from 'pg';
 
 /**
@@ -12,8 +9,10 @@ import type { Pool } from 'pg';
  * the token's SHA-256 hex digest (see auth.ts): a leaked executor database
  * cannot impersonate the hub.
  *
- * Used by `npm run pair` AND at boot when `PAIR_CODE` is set and the
- * executor is not yet paired. Running again once paired is a no-op.
+ * `claimPairing` is the DIRECT transport implementation behind the headless
+ * pairing core (`src/pairing/core.ts`), which the `nexus-executor pair` CLI
+ * and the service boot both call. The standalone `npm run pair` CLI entry was
+ * retired in favor of `nexus-executor pair`.
  */
 
 export interface PairingOutcome {
@@ -83,41 +82,4 @@ export async function claimPairing(
     name,
     hubUrl: config.hubUrl,
   };
-}
-
-/** `npm run pair` — the CLI entry (tsx --env-file=.env src/pairing.ts). */
-async function cli(): Promise<void> {
-  const logger = pino({ level: process.env.LOG_LEVEL?.trim() || 'info' });
-  const config = loadConfig();
-  const pool = createPool(config.databaseUrl);
-  try {
-    if (config.transport === 'gateway') {
-      // Gateway transport: enrollment exchanges the pairing code through the
-      // gateway and persists the device identity (no bearer token at all).
-      const { enrollGateway, readGatewayIdentity } = await import('./gateway.js');
-      if (readGatewayIdentity(config)) {
-        logger.info('Already enrolled with the gateway — nothing to do (delete the identity file to re-enroll).');
-        return;
-      }
-      const identity = await enrollGateway(config);
-      logger.info({ executorId: identity.executorId }, 'Enrolled with the gateway.');
-      return;
-    }
-    const outcome = await claimPairing(config, pool);
-    if (outcome.alreadyPaired) {
-      logger.info({ hubUrl: outcome.hubUrl }, `Already paired as "${outcome.name}" — nothing to do.`);
-      return;
-    }
-    logger.info({ id: outcome.id, hubUrl: outcome.hubUrl }, `Paired with the hub as "${outcome.name}".`);
-  } finally {
-    await pool.end();
-  }
-}
-
-const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
-if (invokedDirectly) {
-  cli().catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
-  });
 }
