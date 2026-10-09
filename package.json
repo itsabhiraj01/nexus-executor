@@ -1,6 +1,6 @@
 {
   "name": "nexus-executor",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Standalone remote job runner for the Nexus hub — receives build jobs over authenticated HTTP and drives a local OpenCode V2 server in isolated git worktrees.",
   "type": "module",

@@ -53,6 +53,9 @@ export function testConfig(workspaceRoot: string, overrides: Partial<ExecutorCon
     // retry suites override.
     retryMaxAttempts: 1,
     retryDelayMinutes: 0,
+    // Retention sweep off so existing suites keep their workspaces;
+    // retention tests opt in.
+    workspaceRetentionDays: 0,
     ...overrides,
   };
 }

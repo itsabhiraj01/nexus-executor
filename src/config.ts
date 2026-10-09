@@ -6,7 +6,7 @@ import { resolve } from 'node:path';
  * place. `.env.example` documents each variable; keep the two in sync.
  */
 
-export const EXECUTOR_VERSION = '0.2.0';
+export const EXECUTOR_VERSION = '0.3.0';
 
 export interface ExecutorConfig {
   /** Connection string of this executor's own Postgres database. */
@@ -43,6 +43,9 @@ export interface ExecutorConfig {
   toolProgressMs: number;
   /** Started jobs fail after this long (0 disables; waiting_for_user exempt). */
   jobTimeoutMs: number;
+  /** Days a terminal job's workspace (worktree + branch) is kept before the
+   *  retention sweep removes it (0 = keep forever, sweep off). */
+  workspaceRetentionDays: number;
   /** Total attempts one job gets when its spec carries no retry ask
    *  (1 = fail on the first error — retries off). */
   retryMaxAttempts: number;
@@ -63,7 +66,7 @@ export interface ExecutorConfig {
  *  `jobRetries` (an executor that retries in-job must never also be
  *  retried by the hub: budgets would multiply). */
 export function executorCapabilities(): Record<string, unknown> {
-  return { jobRetries: true, modelFallback: true, projectRegistry: true };
+  return { jobRetries: true, modelFallback: true, projectRegistry: true, discovery: true };
 }
 
 function required(name: string, env: NodeJS.ProcessEnv): string {
@@ -115,6 +118,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ExecutorConfig
     silenceStallMs: minutes('EXECUTOR_STALL_MINUTES', env, 20),
     toolProgressMs: minutes('EXECUTOR_TOOL_PROGRESS_MINUTES', env, 10),
     jobTimeoutMs: minutes('EXECUTOR_JOB_TIMEOUT_MINUTES', env, 120),
+    workspaceRetentionDays: integer('EXECUTOR_WORKSPACE_RETENTION_DAYS', env, 7),
     retryMaxAttempts: Math.min(10, Math.max(1, integer('EXECUTOR_RETRY_MAX', env, 3, 1))),
     retryDelayMinutes: Math.min(60, integer('EXECUTOR_RETRY_DELAY_MINUTES', env, 2)),
     transport: env.EXECUTOR_TRANSPORT?.trim() === 'gateway' ? 'gateway' : 'direct',

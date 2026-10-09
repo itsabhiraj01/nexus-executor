@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -138,7 +138,7 @@ describe('paired executor', () => {
     const ok = await app.inject({ method: 'GET', url: '/api/v1/status', headers: auth() });
     expect(ok.statusCode).toBe(200);
     expect(ok.json()).toMatchObject({
-      ok: true, name: 'test-executor', version: '0.2.0', paired: true,
+      ok: true, name: 'test-executor', version: '0.3.0', paired: true,
       opencode: { configured: false, baseUrl: 'http://stub' },
       jobs: { active: 0, queued: 0, total: 0 },
       // The hub gates its own auto-retry on jobRetries (an executor that
@@ -313,5 +313,37 @@ describe('paired executor', () => {
     const models = await app.inject({ method: 'GET', url: '/api/v1/models', headers: auth() });
     expect(models.statusCode).toBe(503);
     expect(models.json()).toEqual({ error: 'OpenCode is not configured' });
+  });
+
+  it('fs/browse lists subdirectories with the soft-error contract', async () => {
+    const base = join(root, 'browse-me');
+    mkdirSync(join(base, 'alpha'), { recursive: true });
+    mkdirSync(join(base, 'beta'), { recursive: true });
+    writeFileSync(join(base, 'not-a-dir.txt'), 'x');
+
+    expect((await app.inject({ method: 'GET', url: '/api/v1/fs/browse' })).statusCode).toBe(401);
+
+    const res = await app.inject({ method: 'GET', url: `/api/v1/fs/browse?path=${encodeURIComponent(base + '/')}`, headers: auth() });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ path: base, entries: ['alpha', 'beta'], exact: true, error: null });
+
+    const missing = await app.inject({ method: 'GET', url: `/api/v1/fs/browse?path=${encodeURIComponent(join(base, 'nope') + '/')}`, headers: auth() });
+    expect(missing.statusCode).toBe(200);
+    expect(missing.json()).toMatchObject({ error: 'No such folder.', entries: [] });
+  });
+
+  it('repo/inspect requires path and answers a plain dir as git:false', async () => {
+    expect((await app.inject({ method: 'GET', url: '/api/v1/repo/inspect?path=/' })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'GET', url: '/api/v1/repo/inspect', headers: auth() })).statusCode).toBe(400);
+
+    const dir = join(root, 'plain-repo');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run' } }));
+    const res = await app.inject({ method: 'GET', url: `/api/v1/repo/inspect?path=${encodeURIComponent(dir)}`, headers: auth() });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      path: dir, git: false, language: 'typescript',
+      test: { command: 'npm test', source: 'package.json scripts.test' },
+    });
   });
 });

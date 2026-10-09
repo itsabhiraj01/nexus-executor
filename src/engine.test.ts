@@ -17,6 +17,7 @@ import {
 } from './engine.js';
 import {
   createOpenCodeClient,
+  OpenCodeError,
   type ModelRef,
   type OpenCodeClient,
   type OpenCodeMessage,
@@ -554,6 +555,49 @@ describe('in-job retries', () => {
     await ctx.engine.cancel('job-retry-gone');
   });
 
+  it('a first-attempt setup failure keeps the workspace — the retry resumes the SAME branch', async () => {
+    // Session creation fails ONCE (attempt 1 — e.g. a 401 fixed before the
+    // retry runs), then recovers.
+    const base = makeEngine();
+    let failuresLeft = 1;
+    const flaky: OpenCodeClient = {
+      ...base.client,
+      createSession: (input) => failuresLeft-- > 0
+        ? Promise.reject(new OpenCodeError('OpenCode /api/session failed: 401 {"message":"Authentication required"}', 401))
+        : base.client.createSession(input),
+    };
+    const engine = new JobEngine({
+      pool,
+      config: { ...config, retryMaxAttempts: 2, retryDelayMinutes: 0 },
+      client: flaky,
+      git: execGit,
+    });
+
+    const { job } = await engine.createJob(spec({ jobId: 'job-setup-kept' }));
+    void job;
+    let row = (await getJobByHubId(pool, 'job-setup-kept'))!;
+    expect(row.status).toBe('queued');
+    expect(row.errorCode).toBe('session_setup_failed');
+    expect(row.attemptCount).toBe(2);
+    // No implicit deletion: the failed attempt's worktree AND branch survive.
+    const firstBranch = row.branch!;
+    const firstPath = row.worktreePath!;
+    expect(existsSync(firstPath)).toBe(true);
+    const verify = await execGit(['rev-parse', '--verify', '--quiet', firstBranch], { cwd: repoRoot });
+    expect(verify.code).toBe(0);
+
+    // The retry resumes the same branch/worktree instead of dying on a
+    // vanished branch ("The previous attempt's branch ... is gone").
+    await engine.admitQueued();
+    row = (await getJobByHubId(pool, 'job-setup-kept'))!;
+    expect(row.status).toBe('running');
+    expect(row.branch).toBe(firstBranch);
+    expect(row.worktreePath).toBe(firstPath);
+    expect(base.stub.sessions).toHaveLength(1);
+    expect(base.stub.prompts.at(-1)!.text).toContain('This is attempt 2 of 2');
+    await engine.cancel('job-setup-kept');
+  });
+
   it('honours the backoff window between attempts', async () => {
     const ctx = makeEngine({ retryMaxAttempts: 2, retryDelayMinutes: 30 });
     await runningJob(ctx, spec({ jobId: 'job-retry-backoff' }));
@@ -635,6 +679,78 @@ describe('in-job retries', () => {
     row = (await getJobByHubId(pool, 'job-retry-setup'))!;
     expect(row.status).toBe('failed');
     expect(row.attemptCount).toBe(2);
+  });
+});
+
+describe('workspace retention', () => {
+  it('flags aged terminal workspaces WITHOUT deleting them — validation only, notified exactly once', async () => {
+    const ctx = makeEngine({ workspaceRetentionDays: 7 });
+    const job = await runningJob(ctx, spec({ jobId: 'job-swept' }));
+    await ctx.engine.cancel('job-swept');
+    // Finished 8 days ago: outside the 7-day window.
+    await pool.query(`UPDATE executor.jobs SET finished_at = NOW() - interval '8 days' WHERE hub_job_id = 'job-swept'`);
+
+    await ctx.engine.tick();
+    // Validation, not deletion: worktree AND branch untouched.
+    expect(existsSync(job.worktreePath)).toBe(true);
+    const verify = await execGit(['rev-parse', '--verify', '--quiet', job.branch], { cwd: repoRoot });
+    expect(verify.code).toBe(0);
+    const row = (await getJobByHubId(pool, 'job-swept'))!;
+    expect(row.branch).toBe(job.branch);
+    // The notification: exactly ONE violation event + the status surface.
+    const countViolations = async (): Promise<number> =>
+      (await eventTypes(pool, row.id)).filter((type) => type === EVENT.WORKSPACE_RETENTION_VIOLATION).length;
+    expect(await countViolations()).toBe(1);
+    const stale = await ctx.engine.listStaleWorkspaces();
+    expect(stale.map((entry) => entry.jobId)).toContain('job-swept');
+    expect(stale.find((entry) => entry.jobId === 'job-swept')!.notified).toBe(true);
+
+    // A different engine instance's tick must not re-notify.
+    const again = makeEngine({ workspaceRetentionDays: 7 });
+    await again.engine.tick();
+    expect(await countViolations()).toBe(1);
+  });
+
+  it('deletes only under explicit force (the confirmed user answer)', async () => {
+    const ctx = makeEngine({ workspaceRetentionDays: 7 });
+    const job = await runningJob(ctx, spec({ jobId: 'job-swept-force' }));
+    await ctx.engine.cancel('job-swept-force');
+    await pool.query(`UPDATE executor.jobs SET finished_at = NOW() - interval '8 days' WHERE hub_job_id = 'job-swept-force'`);
+
+    // The "first error" pass: reports, deletes nothing.
+    const dry = await ctx.engine.sweepTerminalWorkspaces({ force: false });
+    expect(dry.stale.map((entry) => entry.jobId)).toContain('job-swept-force');
+    expect(dry.removed).toEqual([]);
+    expect(existsSync(job.worktreePath)).toBe(true);
+
+    // The user says delete: force sweeps every flagged workspace (the
+    // previous test's 'job-swept' is legitimately among them).
+    const forced = await ctx.engine.sweepTerminalWorkspaces({ force: true });
+    expect(forced.removed).toContain('job-swept-force');
+    expect(existsSync(job.worktreePath)).toBe(false);
+    const verify = await execGit(['rev-parse', '--verify', '--quiet', job.branch], { cwd: repoRoot });
+    expect(verify.code).not.toBe(0);
+    const row = (await getJobByHubId(pool, 'job-swept-force'))!;
+    expect(row.branch).toBe(''); // empty-string sentinel (columns are NOT NULL)
+    expect(row.worktreePath).toBe('');
+    expect(await eventTypes(pool, row.id)).toContain(EVENT.WORKSPACE_CLEANED);
+    expect((await ctx.engine.listStaleWorkspaces()).map((entry) => entry.jobId)).not.toContain('job-swept-force');
+  });
+
+  it('stays quiet inside the window, and fully off when retention is 0', async () => {
+    const fresh = makeEngine({ workspaceRetentionDays: 7 });
+    const job = await runningJob(fresh, spec({ jobId: 'job-sweep-fresh' }));
+    await fresh.engine.cancel('job-sweep-fresh');
+    await fresh.engine.tick(); // finished just now: inside the window
+    expect(existsSync(job.worktreePath)).toBe(true);
+    expect((await fresh.engine.listStaleWorkspaces()).map((entry) => entry.jobId)).not.toContain('job-sweep-fresh');
+    expect(await eventTypes(pool, job.id)).not.toContain(EVENT.WORKSPACE_RETENTION_VIOLATION);
+
+    // Retention 0 disables even the detection.
+    const off = makeEngine({ workspaceRetentionDays: 0 });
+    await pool.query(`UPDATE executor.jobs SET finished_at = NOW() - interval '30 days' WHERE hub_job_id = 'job-sweep-fresh'`);
+    expect(await off.engine.listStaleWorkspaces()).toEqual([]);
+    expect(existsSync(job.worktreePath)).toBe(true);
   });
 });
 

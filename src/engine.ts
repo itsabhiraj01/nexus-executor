@@ -246,10 +246,29 @@ export const EVENT = {
   WORKTREE_MERGE_FAILED: 'WORKTREE_MERGE_FAILED',
   WORKTREE_DEPLOYED: 'WORKTREE_DEPLOYED',
   WORKTREE_DEPLOY_FAILED: 'WORKTREE_DEPLOY_FAILED',
+  WORKSPACE_CLEANED: 'WORKSPACE_CLEANED',
+  WORKSPACE_RETENTION_VIOLATION: 'WORKSPACE_RETENTION_VIOLATION',
   AUTO_RETRY_SCHEDULED: 'AUTO_RETRY_SCHEDULED',
   AUTO_RETRY_STARTED: 'AUTO_RETRY_STARTED',
   MODEL_FALLBACK: 'MODEL_FALLBACK',
 } as const;
+
+/** The retention sweep runs at most this often (the tick is seconds). */
+export const WORKSPACE_SWEEP_INTERVAL_MS = 60 * 60_000;
+
+/** One retention violation: a terminal job past the workspace-retention
+ *  window still holding its worktree + branch. */
+export interface StaleWorkspace {
+  jobId: string;
+  status: string;
+  title: string;
+  branch: string;
+  worktreePath: string;
+  repoRoot: string;
+  finishedAt: Date;
+  /** A WORKSPACE_RETENTION_VIOLATION event was already appended. */
+  notified: boolean;
+}
 
 /**
  * Failure classes the executor retries INSIDE the job (same branch, fresh
@@ -429,6 +448,8 @@ export class JobEngine {
   private readonly verifyingJobs = new Set<string>();
   /** Detached verification cycles — tests drain them via `drain()`. */
   private readonly pending = new Set<Promise<unknown>>();
+  /** Retention-sweep throttle: the tick is seconds; the sweep is hourly. */
+  private lastWorkspaceSweepAt = 0;
 
   constructor(options: JobEngineOptions) {
     this.pool = options.pool;
@@ -640,8 +661,9 @@ export class JobEngine {
    * (or REUSE the previous attempt's branch on a retry), materialize
    * attachments (git-excluded), create the OpenCode session in the
    * worktree and send the composed prompt. Any failure lands the job in
-   * `failed` (or re-queued when the retry budget allows) with the first
-   * attempt's freshly-cut workspace cleaned up.
+   * `failed` (or re-queued when the retry budget allows) — the workspace
+   * is left on disk either way (the retry resumes on it); workspaces are
+   * only deleted by the hub's explicit merge op.
    */
   async launchJob(job: JobRow): Promise<void> {
     const fromStatus = job.status;
@@ -770,13 +792,11 @@ export class JobEngine {
       const code = (error as { code?: string }).code === 'workspace_setup_failed'
         ? 'workspace_setup_failed' : 'session_setup_failed';
       await this.failJob(job.id, code, error instanceof Error ? error.message : String(error), { interrupt: false });
-      // The first attempt's freshly-cut workspace is disposable. A retry's
-      // branch and worktree are NOT — they carry every earlier attempt's
-      // committed work, and the next attempt reuses them.
-      if (prepared && repoRoot && !isRetry) {
-        await removeJobWorkspace(this.git, { repoRoot, path: prepared.path, branch: prepared.branch })
-          .catch(() => { /* best effort */ });
-      }
+      // The workspace is NEVER removed here. The engine performs no
+      // implicit deletion: a failed attempt's branch and worktree stay on
+      // disk so the retry resumes them (deleting the first attempt's
+      // workspace used to strand every later attempt on a dead branch).
+      // The ONLY deletion path is the hub's explicit merge op below.
     }
   }
 
@@ -852,6 +872,7 @@ export class JobEngine {
           `Job timed out after ${Math.round(this.config.jobTimeoutMs / 60_000)} minutes.`);
       }
     }
+    await this.sweepTerminalWorkspaces().catch((error) => this.onError(error));
   }
 
   async pollJob(job: JobRow): Promise<void> {
@@ -1410,9 +1431,106 @@ export class JobEngine {
     }
   }
 
+  /**
+   * The ONLY workspace deletion in the whole engine — reached exclusively
+   * from the hub-invoked merge op (ops.ts `jobs/:jobId/merge`), by which
+   * point the branch's work has landed in the base ref. Failure/retry
+   * flows never call this.
+   */
   private async removeWorkspace(repoRoot: string, job: JobRow): Promise<void> {
     if (!job.worktreePath || !job.branch) return;
     await removeJobWorkspace(this.git, { repoRoot, path: job.worktreePath, branch: job.branch })
       .catch((error) => this.onError(error));
+  }
+
+  /**
+   * Terminal jobs (succeeded/failed/cancelled) whose `finished_at` is
+   * older than the retention window and that STILL hold a workspace — the
+   * retention violations. Read-only: detection never deletes.
+   */
+  async listStaleWorkspaces(): Promise<StaleWorkspace[]> {
+    const days = this.config.workspaceRetentionDays;
+    if (!days || days <= 0) return [];
+    const { rows } = await this.pool.query<DbJobRow>(`
+      SELECT * FROM executor.jobs
+      WHERE status = ANY($1::text[])
+        AND finished_at IS NOT NULL
+        AND finished_at < NOW() - ($2 || ' days')::interval
+        AND worktree_path <> ''
+      ORDER BY finished_at ASC LIMIT 50`, [TERMINAL_STATUSES, String(days)]);
+    return rows.map((row) => {
+      const job = rowToJob(row);
+      return {
+        jobId: job.hubJobId,
+        status: job.status,
+        title: job.title,
+        branch: job.branch,
+        worktreePath: job.worktreePath,
+        repoRoot: typeof job.metadata.repoRoot === 'string' ? job.metadata.repoRoot : '',
+        finishedAt: job.finishedAt!,
+        notified: typeof job.metadata.retentionNotifiedAt === 'string',
+      };
+    });
+  }
+
+  /**
+   * The retention sweep — VALIDATION ONLY unless explicitly forced:
+   *
+   * - default (the hourly tick): stale workspaces are REPORTED, never
+   *   deleted. Each flagged job gets ONE WORKSPACE_RETENTION_VIOLATION
+   *   event (deduped via `metadata.retentionNotifiedAt`), and the stale
+   *   set is surfaced in `status.get` — that is the hub's notification
+   *   surface.
+   * - `force: true` (a user-confirmed maintenance op after the first
+   *   validation error): the stale workspaces are actually removed
+   *   (worktree + branch), their pointers cleared, WORKSPACE_CLEANED
+   *   recorded.
+   *
+   * The tick throttles itself (hourly); forced calls always run.
+   */
+  async sweepTerminalWorkspaces(options: { force?: boolean } = {}): Promise<{ stale: StaleWorkspace[]; removed: string[] }> {
+    const force = options.force === true;
+    if (!force) {
+      const now = this.now();
+      if (now - this.lastWorkspaceSweepAt < WORKSPACE_SWEEP_INTERVAL_MS) return { stale: [], removed: [] };
+      this.lastWorkspaceSweepAt = now;
+    }
+    const days = this.config.workspaceRetentionDays;
+    const stale = (await this.listStaleWorkspaces()).slice(0, 25);
+    const removed: string[] = [];
+    for (const entry of stale) {
+      const { rows } = await this.pool.query<DbJobRow>(
+        `SELECT * FROM executor.jobs WHERE hub_job_id = $1`, [entry.jobId]);
+      const job = rows[0] ? rowToJob(rows[0]) : null;
+      if (!job) continue;
+      if (!force) {
+        if (!entry.notified) {
+          await appendJobEvent(this.pool, {
+            jobId: job.id, eventType: EVENT.WORKSPACE_RETENTION_VIOLATION,
+            summary: `Workspace is ${days}+ days past ${job.status} — retention policy says delete it; deletion needs an explicit force (POST /api/v1/maintenance/workspace-sweep {"force":true}).`,
+            payload: { branch: job.branch, path: job.worktreePath, status: job.status, retentionDays: days },
+          });
+          await this.mergeMetadata(job.id, { retentionNotifiedAt: new Date(this.now()).toISOString() });
+        }
+        continue;
+      }
+      if (entry.repoRoot && job.branch && job.worktreePath) {
+        await removeJobWorkspace(this.git, { repoRoot: entry.repoRoot, path: job.worktreePath, branch: job.branch })
+          .catch((error) => this.onError(error));
+        await appendJobEvent(this.pool, {
+          jobId: job.id, eventType: EVENT.WORKSPACE_CLEANED,
+          summary: `Workspace removed by forced retention sweep (${days} days after ${job.status}).`,
+          payload: { branch: job.branch, path: job.worktreePath, status: job.status, retentionDays: days, forced: true },
+        });
+        removed.push(entry.jobId);
+      }
+      // Empty-string sentinels — the schema declares both columns NOT NULL
+      // DEFAULT '' (same convention as `model`/`merged_sha`), and every
+      // consumer guards with falsy checks.
+      await this.pool.query(
+        `UPDATE executor.jobs SET worktree_path = '', branch = '', version = version + 1, updated_at = NOW()
+         WHERE id = $1`, [job.id]);
+    }
+    return { stale, removed };
   }
 }

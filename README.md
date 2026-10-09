@@ -300,6 +300,7 @@ in front) if you expose the executor publicly.
 | `EXECUTOR_STALL_MINUTES` | `20` | An in-flight turn with zero session activity fails after this. `0` disables. |
 | `EXECUTOR_TOOL_PROGRESS_MINUTES` | `10` | A tool whose output stopped changing for this long fails the job fast (the wedged-call signature). `0` disables. |
 | `EXECUTOR_JOB_TIMEOUT_MINUTES` | `120` | Started-job ceiling; `waiting_for_user` is exempt. `0` disables. |
+| `EXECUTOR_WORKSPACE_RETENTION_DAYS` | `7` | Terminal workspaces older than this are FLAGGED (a `WORKSPACE_RETENTION_VIOLATION` event on the job, once), never auto-deleted. `0` disables even the flagging. Actual deletion is the explicit, forced `workspace-sweep` op (see API). |
 | `EXECUTOR_RETRY_MAX` | `3` | Total attempts a job gets after a retryable failure **when the dispatch pinned no budget** (the hub's `retry.maxAttempts` always wins). `1` = retries off. |
 | `EXECUTOR_RETRY_DELAY_MINUTES` | `2` | Minutes between a retryable failure and the requeued attempt. `0` = next tick. |
 
@@ -315,7 +316,7 @@ status.
 | Route | Behavior |
 | --- | --- |
 | `GET /health` | Public. `{ok, db:'up'\|'down', name, paired}`; 503 when the db is down. |
-| `GET /api/v1/status` | `{ok:true, name, version, paired:true, opencode:{configured,baseUrl}, jobs:{active,queued,total}, capabilities:{jobRetries,modelFallback,projectRegistry}, uptimeSeconds}`. |
+| `GET /api/v1/status` | `{ok:true, name, version, paired:true, opencode:{configured,baseUrl}, jobs:{active,queued,total}, capabilities:{jobRetries,modelFallback,projectRegistry}, uptimeSeconds}`. (Payload shape is protocol-locked: the gateway validates it with an exact field whitelist — field additions are a coordinated protocol change.) |
 | `GET /api/v1/models?directory=` | `{items:[{id,name,provider}]}` from the OpenCode service; 503 when unconfigured. |
 | `POST /api/v1/jobs` | Create a job. Body `{jobId, title?, prompt, verificationCommand?, project:{name?, repoUrl?, localPath?, buildCommand?, runCommand?, testCommand?, customPrompt?}\|null, models?: string[], attachments?: [{name,mimeType,dataBase64}], retry?: {maxAttempts: 1..10, delayMinutes: 0..60}}`. Caps: prompt ≤ 200k chars, ≤ 10 attachments, ≤ 25 MB total attachment bytes. **Idempotent on `jobId`** (existing job → 200 `{job}`, no duplicate). New job → 201 `{job}`; admitted immediately when a slot is free, else `queued`. `retry` pins the in-job retry budget (absent = `EXECUTOR_RETRY_MAX`/`EXECUTOR_RETRY_DELAY_MINUTES`). A `localPath` that points at a registered (executor-owned) project best-effort fetches that project's remote before the job runs. |
 | `GET /api/v1/jobs?status&limit&updatedSince` | `{jobs:[JobSummary]}` ordered by `updated_at` ascending. `limit` ≤ 500 (default 100); `updatedSince` is an ISO lower bound (exclusive). JobSummary: `{id, hubJobId, status, title, failureReason, errorCode, attemptCount, maxAttempts, mergedSha, createdAt, startedAt, finishedAt, updatedAt}`. |
@@ -327,6 +328,7 @@ status.
 | `POST /api/v1/jobs/:jobId/merge` | Only `succeeded` jobs with a branch. Safety-net commit first (unresolved conflicts → 409 `{error, conflicts}`), then a tree-less `merge-tree` + `commit-tree` + CAS `update-ref` into the base ref. Success: `{merged:true, mergeSha, baseRef}`; already-contained: `{merged:true, mergeSha:<branch tip>, alreadyContained:true}`; conflicts: 200 `{merged:false, conflicts, error, baseRef}`; deploy failure adds `deployError`. The workspace is removed afterwards. |
 | `GET /api/v1/jobs/:jobId/log` | `{gone:true}` after cleanup, else `{branch, commits:[{sha,subject,at}], status}` (commits on the branch since the snapshot base + porcelain status). |
 | `PUT /api/v1/config` | `{systemPrompt?, defaults?, models?}` — upserts the executor's stored config (the hub pushes its canonical values here). `{ok:true}`. |
+| `POST /api/v1/maintenance/workspace-sweep` | Workspace-retention enforcement (gateway op: `maintenance.workspaceSweep`). WITHOUT `force`: pure validation — 409 `{error, code:'workspace_retention_violation', stale:[…]}` listing exactly what would be deleted (nothing is). With `{force:true}` (the user's confirmed answer): the stale worktrees + branches are removed → 200 `{removed, removedCount, stale}`. Gateway-transport deployments: the nexus-gateway protocol adapter must whitelist the operation first; HTTP (direct transport) serves it today. |
 
 Management commands: `make migrate` applies `src/migrations`;
 `nexus-executor pair/status/doctor/…` control pairing and diagnostics;

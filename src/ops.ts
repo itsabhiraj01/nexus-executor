@@ -10,6 +10,7 @@ import {
 } from './engine.js';
 import { parseModelRef, type OpenCodeClient } from './opencode.js';
 import { readJobLog } from './workspace.js';
+import { browseFolders, inspectRepository } from './fs-discovery.js';
 
 /**
  * The executor's operation core, transport-agnostic: ONE implementation
@@ -209,6 +210,11 @@ export async function opStatus(deps: RouteDeps): Promise<OpResult> {
       count(*)::int AS total
     FROM executor.jobs`);
   const counts = rows[0] ?? { active: 0, queued: 0, total: 0 };
+  // NOTE: the gateway protocol validates this payload with an EXACT field
+  // whitelist (nexus-gateway protocol/nexus.ts) — adding a field here
+  // without extending that schema breaks the executor's gateway session.
+  // Retention violations therefore notify via job events
+  // (WORKSPACE_RETENTION_VIOLATION), which the hub already streams.
   return {
     status: 200,
     body: {
@@ -357,6 +363,39 @@ export async function opJobLog(deps: RouteDeps, jobId: string): Promise<OpResult
   return { status: 200, body: log as Record<string, unknown> };
 }
 
+/**
+ * POST /api/v1/maintenance/workspace-sweep (maintenance.workspaceSweep) —
+ * the retention sweep's user-facing handle. WITHOUT `force` it is a pure
+ * validation: any aged terminal workspaces come back as a 409 detailing
+ * exactly what would be deleted, so the UI can ask for confirmation.
+ * With `{force:true}` (the user's explicit "yes, delete") the sweep
+ * actually removes them.
+ */
+export async function opWorkspaceSweep(deps: RouteDeps, body: unknown): Promise<OpResult> {
+  const input = (body ?? {}) as Record<string, unknown>;
+  if (input.force !== undefined && typeof input.force !== 'boolean') {
+    return { status: 400, body: { error: 'force must be a boolean.' } };
+  }
+  const force = input.force === true;
+  const result = await deps.engine.sweepTerminalWorkspaces({ force });
+  const stale = result.stale.map((entry) => ({
+    ...entry,
+    finishedAt: entry.finishedAt.toISOString(),
+  }));
+  if (!force && stale.length) {
+    const days = deps.config.workspaceRetentionDays;
+    return {
+      status: 409,
+      body: {
+        error: `${stale.length} workspace(s) are past the ${days}-day retention window. They are NOT deleted — confirm with {"force": true} to remove them.`,
+        code: 'workspace_retention_violation',
+        stale,
+      },
+    };
+  }
+  return { status: 200, body: { removed: result.removed, removedCount: result.removed.length, stale } };
+}
+
 export async function opConfigPut(deps: RouteDeps, body: unknown): Promise<OpResult> {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { status: 400, body: { error: 'Body must be a JSON object.' } };
@@ -393,6 +432,19 @@ export async function opConfigPut(deps: RouteDeps, body: unknown): Promise<OpRes
       [upsert.key, JSON.stringify(upsert.value)]);
   }
   return { status: 200, body: { ok: true } };
+}
+
+/* — Discovery ops (fs.browse / repo.inspect) — shared by the HTTP routes
+ *  and the gateway dispatch; soft failures answer 200 bodies whose
+ *  `error` field carries the note (the hub folds those into its soft
+ *  result.note), payload-shape failures are hard 400s at the dispatch. */
+
+export async function opFsBrowse(path: string | undefined): Promise<OpResult> {
+  return { status: 200, body: { ...browseFolders(path ?? '') } as Record<string, unknown> };
+}
+
+export async function opRepoInspect(path: string): Promise<OpResult> {
+  return { status: 200, body: { ...await inspectRepository(path) } as Record<string, unknown> };
 }
 
 /* — Gateway protocol dispatch — */
@@ -434,8 +486,25 @@ export async function handleGatewayOperation(
     switch (operation) {
       case 'status.get':
         return wrap(await opStatus(deps));
+      // Executor-side support for the forced sweep; NOTE the gateway's
+      // protocol adapter (nexus-gateway src/protocol/nexus.ts) whitelists
+      // operations, so this only answers once the adapter learns it —
+      // until then the HTTP route serves direct-transport deployments.
+      case 'maintenance.workspaceSweep':
+        return wrap(await opWorkspaceSweep(deps, payload));
       case 'models.list':
         return wrap(await opModels(deps, typeof body.directory === 'string' ? body.directory : undefined));
+      case 'fs.browse': {
+        if (body.path !== undefined && !textArg(body.path, 1000)) {
+          return { ok: false, error: 'fs.browse payload must be {path? (1..1000 chars)}.', status: 400 };
+        }
+        return wrap(await opFsBrowse(body.path as string | undefined));
+      }
+      case 'repo.inspect': {
+        const path = textArg(body.path, 1000);
+        if (!path) return { ok: false, error: 'repo.inspect payload must be {path (1..1000 chars)}.', status: 400 };
+        return wrap(await opRepoInspect(path));
+      }
       case 'config.put':
         return wrap(await opConfigPut(deps, payload));
       case 'job.dispatch': {

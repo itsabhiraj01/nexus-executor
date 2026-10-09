@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify';
 import {
   healthPaired, jobSummary, MAX_MESSAGE_CHARS,
   opConfigPut, opCreateJob, opJobCancel, opJobEvents, opJobLog, opJobMerge,
-  opJobMessage, opJobVerify, opModels, opShowJob, opStatus,
+  opFsBrowse, opJobMessage, opJobVerify, opModels, opRepoInspect, opShowJob, opStatus, opWorkspaceSweep,
   type OpResult, type RouteDeps,
 } from './ops.js';
 import { rowToJob } from './engine.js';
@@ -50,6 +50,21 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
   app.get<{ Querystring: { directory?: string } }>('/api/v1/models', async (request, reply) => {
     send(reply, await opModels(deps, request.query.directory));
+  });
+
+  // Discovery routes (hub contract: builder.fs.browse / builder.repo.inspect);
+  // soft failures are 200 + {ok:false,error}, a missing path is a hard 400.
+  app.get<{ Querystring: { path?: string } }>('/api/v1/fs/browse', async (request, reply) => {
+    send(reply, await opFsBrowse(request.query.path));
+  });
+
+  app.get<{ Querystring: { path?: string } }>('/api/v1/repo/inspect', async (request, reply) => {
+    const path = request.query.path?.trim();
+    if (!path || path.length > 1000) {
+      void reply.code(400).send({ error: 'path is required (1..1000 chars)' });
+      return;
+    }
+    send(reply, await opRepoInspect(path));
   });
 
   app.post('/api/v1/jobs', { bodyLimit: 40 * 1024 * 1024, preHandler: limit(jobCreateLimiter) }, async (request, reply) => {
@@ -134,5 +149,9 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
   app.put('/api/v1/config', async (request, reply) => {
     send(reply, await opConfigPut(deps, request.body));
+  });
+
+  app.post('/api/v1/maintenance/workspace-sweep', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+    send(reply, await opWorkspaceSweep(deps, request.body));
   });
 }

@@ -368,8 +368,9 @@ export async function runDeployCommand(command: string, repoRoot: string): Promi
   }
 }
 
-/** Remove a job's worktree and its branch (best effort — used after merges
- *  and setup failures). */
+/** Remove a job's worktree and its branch (best effort). Called ONLY from
+ *  the hub-invoked merge flow — the engine never deletes a workspace on
+ *  its own; failed attempts keep theirs for resume and inspection. */
 export async function removeJobWorkspace(
   runner: GitRunner,
   input: { repoRoot: string; path: string; branch: string; deleteBranch?: boolean },
