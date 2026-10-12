@@ -34,6 +34,7 @@ interface GatewayIdentity {
 const PROOF_AUDIENCE = 'NEXUS-GATEWAY-CONNECT v1';
 const MAX_MESSAGE_BYTES = 48 * 1024 * 1024;
 const MAX_IN_FLIGHT = 16;
+const STABLE_SESSION_MS = 30_000;
 
 function identityPath(config: ExecutorConfig): string {
   return config.gatewayIdentityPath;
@@ -150,10 +151,12 @@ export async function runGatewayLoop(deps: RouteDeps, config: ExecutorConfig, op
       maxPayload: MAX_MESSAGE_BYTES,
     });
 
-    const outcome = await new Promise<'closed'>((resolve) => {
+    let openedAt: number | undefined;
+    let socketError: string | undefined;
+    const outcome = await new Promise<{ closeCode: number; closeReason: string }>((resolve) => {
       ws.on('open', () => {
-        attempt = 0;
-        logger.info({ url: wsBase }, 'gateway session established');
+        openedAt = Date.now();
+        logger.info({ url: wsBase }, 'gateway WebSocket opened; awaiting gateway requests');
       });
       ws.on('message', (data: Buffer | Buffer[]) => {
         if (inFlight >= MAX_IN_FLIGHT) return; // shed: hub-side deadlines expire; never block the loop
@@ -163,17 +166,25 @@ export async function runGatewayLoop(deps: RouteDeps, config: ExecutorConfig, op
           .catch(() => {}) // a malformed message is answered with nothing (gateway closes if it cares)
           .finally(() => { inFlight--; });
       });
-      ws.on('error', () => {});
-      ws.once('close', () => resolve('closed'));
+      ws.on('error', (error: Error) => { socketError = error.message; });
+      ws.once('close', (code: number, reason: Buffer) => {
+        resolve({ closeCode: code, closeReason: reason.toString('utf8') });
+      });
     });
-    void outcome;
+    const sessionDurationMs = openedAt === undefined ? 0 : Date.now() - openedAt;
 
     if (stopped()) break;
+    // A successful upgrade alone does not mean authentication succeeded.
+    // Short-lived connections must not reset the retry backoff.
+    if (sessionDurationMs >= STABLE_SESSION_MS) attempt = 0;
     // Exponential backoff with full jitter: 1s → 30s ceiling.
     attempt = Math.min(attempt + 1, 12);
     const ceiling = Math.min(30_000, 1000 * 2 ** Math.min(attempt, 5));
     const delay = Math.floor(Math.random() * ceiling);
-    logger.warn({ delayMs: delay, attempt }, 'gateway session lost; reconnecting');
+    logger.warn({
+      delayMs: delay, attempt, ...outcome, sessionDurationMs,
+      ...(socketError === undefined ? {} : { error: socketError }),
+    }, 'gateway session lost; reconnecting');
     await sleep(delay);
   }
 

@@ -1,19 +1,17 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 /**
- * `nexus-executor update` — best-effort, NON-destructive self-update:
- * `git pull --ff-only` + `npm install` + `npm run build`. Never touches data;
- * returns a restart hint instead of auto-restarting so the operator (and the
- * systemd unit) controls when the new code goes live.
+ * Use the same full-stack deployment path as install / make update.
+ * Resolve from the installed module, not the caller's working directory.
  */
 
 export function update(): string {
-  if (!existsSync('.git')) {
+  const root = fileURLToPath(new URL('../../', import.meta.url));
+  if (!existsSync(new URL('../../.git', import.meta.url))) {
     return 'update: not a git checkout (nothing to pull) — rebuild via the installed package manager.';
   }
-  execFileSync('git', ['pull', '--ff-only'], { stdio: 'inherit' });
-  execFileSync('npm', ['install'], { stdio: 'inherit' });
-  execFileSync('npm', ['run', 'build'], { stdio: 'inherit' });
-  return 'update: rebuilt — restart the service (systemctl --user restart nexus-executor).';
+  execFileSync('bash', [fileURLToPath(new URL('../../install.sh', import.meta.url))], { cwd: root, stdio: 'inherit' });
+  return 'update: pulled, built, backed up, migrated, and restarted Nexus services.';
 }
