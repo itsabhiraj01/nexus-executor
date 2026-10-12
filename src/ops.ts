@@ -100,7 +100,14 @@ export function validateJobBody(body: unknown): { spec?: JobSpecInput; error?: s
     const raw = input.project as Record<string, unknown>;
     const repoUrl = asTrimmedString(raw.repoUrl, 2_000) ?? undefined;
     const localPath = asTrimmedString(raw.localPath, 2_000) ?? undefined;
-    if (!repoUrl && !localPath) return { error: 'project.localPath or project.repoUrl is required.' };
+    // Registry dispatch: a projectRegistry executor resolves its own
+    // registered project by name, so projectName alone identifies the
+    // working copy (the hub drops repoUrl/localPath in that mode). Mirror
+    // the hub's zod bound: trimmed, ≤ 200 chars.
+    const projectName = asTrimmedString(raw.projectName, 200) ?? undefined;
+    if (!repoUrl && !localPath && !projectName) {
+      return { error: 'project.localPath, project.repoUrl or project.projectName is required.' };
+    }
     for (const key of ['name', 'buildCommand', 'runCommand', 'testCommand', 'customPrompt'] as const) {
       if (raw[key] !== undefined && typeof raw[key] !== 'string') return { error: `project.${key} must be a string.` };
     }
@@ -112,6 +119,7 @@ export function validateJobBody(body: unknown): { spec?: JobSpecInput; error?: s
     }
     project = {
       name: typeof raw.name === 'string' ? raw.name : '',
+      projectName,
       repoUrl, localPath,
       buildCommand: typeof raw.buildCommand === 'string' ? raw.buildCommand : undefined,
       runCommand: typeof raw.runCommand === 'string' ? raw.runCommand : undefined,
