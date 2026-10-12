@@ -33,6 +33,16 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   const jobCreateLimiter = new RateLimiter({ max: 30, windowMs: 60_000 });
   const actionLimiter = new RateLimiter({ max: 120, windowMs: 60_000 });
   const outputLimiter = new RateLimiter({ max: 300, windowMs: 60_000 });
+  // Terminal ops get their own buckets, sized for the protocol's shape, NOT
+  // the job ones': every browser on every hub user reaches us through the
+  // hub's single source IP, and a live xterm legitimately fires one input
+  // POST per keystroke flush window (~60/s held-key worst case; the console
+  // coalesces bursts into ≤18 KB frames). The 2026-10-12 freeze — a shared
+  // 120/min bucket 429'd input mid-typing and then refused the very Kill
+  // the user reached for — is what the split fixes: an input flood can
+  // never starve kill/detach/create/list, which keep a modest ceiling.
+  const terminalIoLimiter = new RateLimiter({ max: 3600, windowMs: 60_000 });
+  const terminalOpLimiter = new RateLimiter({ max: 240, windowMs: 60_000 });
 
   const limit = (limiter: RateLimiter) => async (request: { ip: string }, reply: FastifyReply) => {
     const hit = limiter.hit(request.ip || 'unknown');
@@ -153,21 +163,21 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     send(reply, await opConfigPut(deps, request.body));
   });
 
-  app.post('/api/v1/terminals', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+  app.post('/api/v1/terminals', { preHandler: limit(terminalOpLimiter) }, async (request, reply) => {
     send(reply, await opTerminalCreate(deps, request.body));
   });
 
-  app.get('/api/v1/terminals', { preHandler: limit(actionLimiter) }, async (_request, reply) => {
+  app.get('/api/v1/terminals', { preHandler: limit(terminalOpLimiter) }, async (_request, reply) => {
     send(reply, await opTerminalList(deps));
   });
 
   app.post<{ Params: { id: string } }>(
-    '/api/v1/terminals/:id/input', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+    '/api/v1/terminals/:id/input', { preHandler: limit(terminalIoLimiter) }, async (request, reply) => {
       send(reply, await opTerminalInput(deps, request.params.id, request.body));
     });
 
   app.post<{ Params: { id: string } }>(
-    '/api/v1/terminals/:id/resize', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+    '/api/v1/terminals/:id/resize', { preHandler: limit(terminalIoLimiter) }, async (request, reply) => {
       send(reply, await opTerminalResize(deps, request.params.id, request.body));
     });
 
@@ -177,12 +187,12 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     });
 
   app.post<{ Params: { id: string } }>(
-    '/api/v1/terminals/:id/detach', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+    '/api/v1/terminals/:id/detach', { preHandler: limit(terminalOpLimiter) }, async (request, reply) => {
       send(reply, await opTerminalDetach(deps, request.params.id));
     });
 
   app.post<{ Params: { id: string } }>(
-    '/api/v1/terminals/:id/kill', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+    '/api/v1/terminals/:id/kill', { preHandler: limit(terminalOpLimiter) }, async (request, reply) => {
       send(reply, await opTerminalKill(deps, request.params.id));
     });
 

@@ -253,6 +253,31 @@ describe('terminal routes', () => {
     expect(badKey.statusCode).toBe(400);
   });
 
+  it('interactive typing never starves the ops bucket — 121+ inputs stay 200 AND kill is still allowed', async () => {
+    // The 2026-10-12 regression: input shared a 120/min bucket with every
+    // other op, so a typing burst 429'd the stream AND the Kill the user
+    // reached for. The io bucket (input/resize, 3600/min — the console's
+    // worst-case flush rate) and the op bucket (create/list/detach/kill,
+    // 240/min) are separate now.
+    for (let i = 0; i < 121; i++) {
+      const hit = await app.inject({
+        method: 'POST', url: '/api/v1/terminals/nxt-abc123/input', headers: auth(), payload: { dataBase64: 'eA==' },
+      });
+      expect(hit.statusCode).toBe(200);
+    }
+    for (let i = 0; i < 5; i++) {
+      const hit = await app.inject({
+        method: 'POST', url: '/api/v1/terminals/nxt-abc123/resize', headers: auth(), payload: { cols: 100, rows: 30 },
+      });
+      expect(hit.statusCode).toBe(200);
+    }
+    // …and the very action a stuck user presses next still gets through.
+    const kill = await app.inject({ method: 'POST', url: '/api/v1/terminals/nxt-abc123/kill', headers: auth() });
+    expect(kill.statusCode).toBe(200);
+    const listed = await app.inject({ method: 'GET', url: '/api/v1/terminals', headers: auth() });
+    expect(listed.statusCode).toBe(200);
+  });
+
   it('maps registry errors: cap → 429, tmux failure → 502', async () => {
     createThrows = new TerminalCapError(8);
     const capped = await app.inject({

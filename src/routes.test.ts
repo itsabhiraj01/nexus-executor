@@ -5,6 +5,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
 import { createAuthHook, hashToken, writeAuthConfig } from './auth.js';
+import { EXECUTOR_VERSION } from './config.js';
 import { createPool, runModuleMigrations, defaultMigrationsDir } from './db.js';
 import { JobEngine } from './engine.js';
 import { claimPairing, PairingError } from './pairing.js';
@@ -138,7 +139,7 @@ describe('paired executor', () => {
     const ok = await app.inject({ method: 'GET', url: '/api/v1/status', headers: auth() });
     expect(ok.statusCode).toBe(200);
     expect(ok.json()).toMatchObject({
-      ok: true, name: 'test-executor', version: '0.3.1', paired: true,
+      ok: true, name: 'test-executor', version: EXECUTOR_VERSION, paired: true,
       opencode: { configured: false, baseUrl: 'http://stub' },
       jobs: { active: 0, queued: 0, total: 0 },
       // The hub gates its own auto-retry on jobRetries (an executor that
@@ -176,6 +177,13 @@ describe('paired executor', () => {
     expect((await post(validJob({ prompt: '' }))).statusCode).toBe(400);
     expect((await post(validJob({ prompt: 'x'.repeat(200_001) }))).statusCode).toBe(400);
     expect((await post(validJob({ project: { name: 'nothing' } }))).statusCode).toBe(400);
+    // Registry dispatch: for a projectRegistry executor the hub sends ONLY
+    // {name, projectName} (it drops repoUrl/localPath) — projectName alone
+    // must validate; blank or oversized projectName falls back to the
+    // required-identifier rule.
+    expect((await post(validJob({ project: { name: 'nexus', projectName: 'nexus' } }))).statusCode).toBe(201);
+    expect((await post(validJob({ project: { name: 'nexus', projectName: '   ' } }))).statusCode).toBe(400);
+    expect((await post(validJob({ project: { name: 'nexus', projectName: 'x'.repeat(201) } }))).statusCode).toBe(400);
     expect((await post(validJob({ models: ['not-a-ref'] }))).statusCode).toBe(400);
     expect((await post(validJob({
       attachments: Array.from({ length: 11 }, (_, index) => ({ name: `f${index}.txt`, mimeType: 'text/plain', dataBase64: 'aGk=' })),

@@ -10,8 +10,10 @@ import { resolve } from 'node:path';
 // executor/ directory is a restored-from-history snapshot used for hub-side
 // development — see docs/remote-executors.md). 0.3.1 adds persistent tmux
 // terminal sessions on top of 0.3.0's discovery/project-registry features;
-// 0.4.0 remains reserved for machine reporting in the monorepo's docs.
-export const EXECUTOR_VERSION = '0.3.1';
+// 0.3.2 splits terminal rate limits (interactive I/O can never starve
+// kill/detach — the 2026-10-12 freeze); 0.4.0 remains reserved for machine
+// reporting in the monorepo's docs.
+export const EXECUTOR_VERSION = '0.3.2';
 
 export interface ExecutorConfig {
   /** Connection string of this executor's own Postgres database. */
