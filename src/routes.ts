@@ -3,6 +3,7 @@ import {
   healthPaired, jobSummary, MAX_MESSAGE_CHARS,
   opConfigPut, opCreateJob, opJobCancel, opJobEvents, opJobLog, opJobMerge,
   opFsBrowse, opJobMessage, opJobVerify, opModels, opRepoInspect, opShowJob, opStatus, opWorkspaceSweep,
+  opTerminalCreate, opTerminalDetach, opTerminalInput, opTerminalKill, opTerminalList, opTerminalOutput, opTerminalResize,
   type OpResult, type RouteDeps,
 } from './ops.js';
 import { rowToJob } from './engine.js';
@@ -31,6 +32,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   const { pool, config } = deps;
   const jobCreateLimiter = new RateLimiter({ max: 30, windowMs: 60_000 });
   const actionLimiter = new RateLimiter({ max: 120, windowMs: 60_000 });
+  const outputLimiter = new RateLimiter({ max: 300, windowMs: 60_000 });
 
   const limit = (limiter: RateLimiter) => async (request: { ip: string }, reply: FastifyReply) => {
     const hit = limiter.hit(request.ip || 'unknown');
@@ -150,6 +152,39 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.put('/api/v1/config', async (request, reply) => {
     send(reply, await opConfigPut(deps, request.body));
   });
+
+  app.post('/api/v1/terminals', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+    send(reply, await opTerminalCreate(deps, request.body));
+  });
+
+  app.get('/api/v1/terminals', { preHandler: limit(actionLimiter) }, async (_request, reply) => {
+    send(reply, await opTerminalList(deps));
+  });
+
+  app.post<{ Params: { id: string } }>(
+    '/api/v1/terminals/:id/input', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+      send(reply, await opTerminalInput(deps, request.params.id, request.body));
+    });
+
+  app.post<{ Params: { id: string } }>(
+    '/api/v1/terminals/:id/resize', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+      send(reply, await opTerminalResize(deps, request.params.id, request.body));
+    });
+
+  app.get<{ Params: { id: string }; Querystring: Record<string, string> }>(
+    '/api/v1/terminals/:id/output', { preHandler: limit(outputLimiter) }, async (request, reply) => {
+      send(reply, await opTerminalOutput(deps, request.params.id, request.query));
+    });
+
+  app.post<{ Params: { id: string } }>(
+    '/api/v1/terminals/:id/detach', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+      send(reply, await opTerminalDetach(deps, request.params.id));
+    });
+
+  app.post<{ Params: { id: string } }>(
+    '/api/v1/terminals/:id/kill', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+      send(reply, await opTerminalKill(deps, request.params.id));
+    });
 
   app.post('/api/v1/maintenance/workspace-sweep', { preHandler: limit(actionLimiter) }, async (request, reply) => {
     send(reply, await opWorkspaceSweep(deps, request.body));

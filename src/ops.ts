@@ -11,6 +11,7 @@ import {
 import { parseModelRef, type OpenCodeClient } from './opencode.js';
 import { readJobLog } from './workspace.js';
 import { browseFolders, inspectRepository } from './fs-discovery.js';
+import { TerminalCapError, TerminalTmuxError, type TerminalRegistry } from './terminals.js';
 
 /**
  * The executor's operation core, transport-agnostic: ONE implementation
@@ -29,6 +30,10 @@ export interface RouteDeps {
   engine: JobEngine;
   client: OpenCodeClient | null;
   startedAt: number;
+  /** Persistent tmux-backed terminal sessions (terminal.* ops). Required:
+   *  main.ts always builds the registry (node-pty spawner + tmux runner);
+   *  availability itself is probed lazily via `available()`. */
+  registry: TerminalRegistry;
 }
 
 export interface OpResult {
@@ -447,6 +452,139 @@ export async function opRepoInspect(path: string): Promise<OpResult> {
   return { status: 200, body: { ...await inspectRepository(path) } as Record<string, unknown> };
 }
 
+/* ── terminal.* — persistent tmux-backed terminal sessions ────────────── */
+
+const MAX_TERMINAL_INPUT_B64 = 24_576; // 18 KB decoded
+export const MAX_TERMINAL_HOLD_MS = 15_000;
+const MIN_COLS = 20; const MAX_COLS = 500; const MIN_ROWS = 4; const MAX_ROWS = 200;
+
+/** Availability gate for every terminal op EXCEPT output: a session's
+ *  buffered tail + eof must stay answerable after tmux dies. A machine
+ *  without tmux ≥ 3.2 (registry.available() probes once and caches) reads
+ *  as unavailable. */
+async function terminalsReady(deps: RouteDeps): Promise<OpResult | null> {
+  if (!deps.registry || !(await deps.registry.available())) {
+    return { status: 400, body: { error: 'terminals_unavailable: tmux (≥ 3.2) is not installed on this executor.' } };
+  }
+  return null;
+}
+
+function sessionIdArg(value: unknown): string | null {
+  return typeof value === 'string' && /^nxt-[a-z0-9]{6,32}$/.test(value) ? value : null;
+}
+
+function terminalNotFound(id: string): OpResult {
+  return { status: 404, body: { error: `No terminal session ${id}.` } };
+}
+
+/** Registry errors → contract statuses; anything else rethrows (a bug is a 500). */
+function terminalErrorResult(error: unknown): OpResult {
+  if (error instanceof TerminalCapError) return { status: 429, body: { error: error.message } };
+  if (error instanceof TerminalTmuxError) return { status: 502, body: { error: error.message } };
+  throw error;
+}
+
+export async function opTerminalCreate(deps: RouteDeps, body: unknown): Promise<OpResult> {
+  const unready = await terminalsReady(deps);
+  if (unready) return unready;
+  if (body !== undefined && body !== null && (typeof body !== 'object' || Array.isArray(body))) {
+    return { status: 400, body: { error: 'Body must be a JSON object.' } };
+  }
+  const b = (body ?? {}) as Record<string, unknown>;
+  const cols = typeof b.cols === 'number' && Number.isInteger(b.cols) ? Math.min(Math.max(b.cols, MIN_COLS), MAX_COLS) : 80;
+  const rows = typeof b.rows === 'number' && Number.isInteger(b.rows) ? Math.min(Math.max(b.rows, MIN_ROWS), MAX_ROWS) : 24;
+  if (b.name !== undefined && (typeof b.name !== 'string' || b.name.length > 60)) {
+    return { status: 400, body: { error: 'name must be a string ≤ 60 chars.' } };
+  }
+  if (b.idempotencyKey !== undefined && (typeof b.idempotencyKey !== 'string' || !/^[a-z0-9]{6,32}$/.test(b.idempotencyKey))) {
+    return { status: 400, body: { error: 'idempotencyKey must match ^[a-z0-9]{6,32}$.' } };
+  }
+  try {
+    const created = await deps.registry.create({
+      cols, rows,
+      name: typeof b.name === 'string' ? b.name : undefined,
+      idempotencyKey: typeof b.idempotencyKey === 'string' ? b.idempotencyKey : undefined,
+    });
+    return { status: 201, body: { ...created } };
+  } catch (error) { return terminalErrorResult(error); }
+}
+
+export async function opTerminalList(deps: RouteDeps): Promise<OpResult> {
+  const unready = await terminalsReady(deps);
+  if (unready) return unready;
+  const { sessions } = await deps.registry.list();
+  return { status: 200, body: { sessions } };
+}
+
+export async function opTerminalInput(deps: RouteDeps, id: string, body: unknown): Promise<OpResult> {
+  const unready = await terminalsReady(deps);
+  if (unready) return unready;
+  if (!sessionIdArg(id)) return terminalNotFound(id);
+  const dataBase64 = (body as { dataBase64?: unknown } | null | undefined)?.dataBase64;
+  if (typeof dataBase64 !== 'string' || !dataBase64 || dataBase64.length > MAX_TERMINAL_INPUT_B64) {
+    return { status: 400, body: { error: `dataBase64 is required (1..${MAX_TERMINAL_INPUT_B64} base64 chars).` } };
+  }
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(dataBase64)) {
+    return { status: 400, body: { error: 'dataBase64 must be valid base64.' } };
+  }
+  const data = Buffer.from(dataBase64, 'base64').toString('utf8');
+  return deps.registry.input(id, data) === 'ok' ? { status: 200, body: { ok: true } } : terminalNotFound(id);
+}
+
+export async function opTerminalResize(deps: RouteDeps, id: string, body: unknown): Promise<OpResult> {
+  const unready = await terminalsReady(deps);
+  if (unready) return unready;
+  if (!sessionIdArg(id)) return terminalNotFound(id);
+  const b = (body ?? {}) as Record<string, unknown>;
+  const cols = Number(b.cols); const rows = Number(b.rows);
+  if (!Number.isInteger(cols) || !Number.isInteger(rows)) {
+    return { status: 400, body: { error: 'cols and rows (integers) are required.' } };
+  }
+  return deps.registry.resize(id, Math.min(Math.max(cols, MIN_COLS), MAX_COLS), Math.min(Math.max(rows, MIN_ROWS), MAX_ROWS)) === 'ok'
+    ? { status: 200, body: { ok: true } } : terminalNotFound(id);
+}
+
+export async function opTerminalOutput(
+  deps: RouteDeps, id: string, query: { sinceSeq?: unknown; waitMs?: unknown; attach?: unknown },
+): Promise<OpResult> {
+  // Deliberately NOT gated on availability: polls for an exited session must
+  // keep answering (404 / eof) after tmux disappears.
+  if (!deps.registry || !sessionIdArg(id)) return terminalNotFound(id);
+  const sinceSeq = Number(query.sinceSeq ?? 0);
+  if (!Number.isInteger(sinceSeq) || sinceSeq < 0) {
+    return { status: 400, body: { error: 'sinceSeq must be an integer ≥ 0.' } };
+  }
+  const waitMs = Math.min(Math.max(Number(query.waitMs ?? 0) || 0, 0), MAX_TERMINAL_HOLD_MS);
+  const attach = query.attach === '1' || query.attach === 'true' || query.attach === true;
+  const res = await deps.registry.read(id, sinceSeq, waitMs, attach);
+  if (!res) return terminalNotFound(id);
+  return {
+    status: 200,
+    body: {
+      seq: res.seq,
+      chunks: res.chunks.map((chunk) => ({ seq: chunk.seq, dataBase64: Buffer.from(chunk.data, 'utf8').toString('base64') })),
+      snapshot: res.snapshot,
+      status: res.status,
+      eof: res.eof,
+    },
+  };
+}
+
+export async function opTerminalDetach(deps: RouteDeps, id: string): Promise<OpResult> {
+  const unready = await terminalsReady(deps);
+  if (unready) return unready;
+  if (!sessionIdArg(id)) return terminalNotFound(id);
+  return deps.registry.detach(id) === 'ok' ? { status: 200, body: { ok: true } } : terminalNotFound(id);
+}
+
+export async function opTerminalKill(deps: RouteDeps, id: string): Promise<OpResult> {
+  const unready = await terminalsReady(deps);
+  if (unready) return unready;
+  if (!sessionIdArg(id)) return terminalNotFound(id);
+  await deps.registry.kill(id); // idempotent — unknown ids still answer ok
+  return { status: 200, body: { ok: true } };
+}
+
 /* — Gateway protocol dispatch — */
 
 export const GATEWAY_PROTOCOL_VERSION = 'nexus.executor.v1';
@@ -507,6 +645,35 @@ export async function handleGatewayOperation(
       }
       case 'config.put':
         return wrap(await opConfigPut(deps, payload));
+      case 'terminal.create':
+        return wrap(await opTerminalCreate(deps, body));
+      case 'terminal.list':
+        return wrap(await opTerminalList(deps));
+      case 'terminal.input': {
+        const id = sessionIdArg(body.id);
+        if (!id) return { ok: false, error: 'terminal.input payload must be {id, dataBase64}.', status: 400 };
+        return wrap(await opTerminalInput(deps, id, body));
+      }
+      case 'terminal.resize': {
+        const id = sessionIdArg(body.id);
+        if (!id) return { ok: false, error: 'terminal.resize payload must be {id, cols, rows}.', status: 400 };
+        return wrap(await opTerminalResize(deps, id, body));
+      }
+      case 'terminal.output': {
+        const id = sessionIdArg(body.id);
+        if (!id) return { ok: false, error: 'terminal.output payload must be {id, sinceSeq?, waitMs?, attach?}.', status: 400 };
+        return wrap(await opTerminalOutput(deps, id, body));
+      }
+      case 'terminal.detach': {
+        const id = sessionIdArg(body.id);
+        if (!id) return { ok: false, error: 'terminal.detach payload must be {id}.', status: 400 };
+        return wrap(await opTerminalDetach(deps, id));
+      }
+      case 'terminal.kill': {
+        const id = sessionIdArg(body.id);
+        if (!id) return { ok: false, error: 'terminal.kill payload must be {id}.', status: 400 };
+        return wrap(await opTerminalKill(deps, id));
+      }
       case 'job.dispatch': {
         // The canonical spec arrives wrapped: {job: <RemoteJobSpec>}.
         const spec = (payload ?? {}) as Record<string, unknown>;

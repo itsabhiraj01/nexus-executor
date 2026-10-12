@@ -138,7 +138,7 @@ describe('paired executor', () => {
     const ok = await app.inject({ method: 'GET', url: '/api/v1/status', headers: auth() });
     expect(ok.statusCode).toBe(200);
     expect(ok.json()).toMatchObject({
-      ok: true, name: 'test-executor', version: '0.3.0', paired: true,
+      ok: true, name: 'test-executor', version: '0.3.1', paired: true,
       opencode: { configured: false, baseUrl: 'http://stub' },
       jobs: { active: 0, queued: 0, total: 0 },
       // The hub gates its own auto-retry on jobRetries (an executor that

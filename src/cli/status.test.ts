@@ -14,10 +14,18 @@ describe('statusFromCli', () => {
     const dir = mkdtempSync(join(tmpdir(), 'nx-status-'));
     env(dir);
     delete process.env.NEXUS_EXECUTOR_STATE;
+    // With the override gone, cliStatePath falls back to $HOME — point it at
+    // the tmpdir too so a genuinely paired development box cannot leak its
+    // real state into this assertion.
+    const home = process.env.HOME;
+    process.env.HOME = dir;
     try {
       const out = await statusFromCli({ argv: [] });
       expect(out).toContain('not paired');
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+    } finally {
+      process.env.HOME = home;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('reports gateway-enrolled with --json', async () => {

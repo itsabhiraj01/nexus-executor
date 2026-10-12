@@ -6,7 +6,12 @@ import { resolve } from 'node:path';
  * place. `.env.example` documents each variable; keep the two in sync.
  */
 
-export const EXECUTOR_VERSION = '0.3.0';
+// Lineage note: the executor lives in THIS repository now (the monorepo's
+// executor/ directory is a restored-from-history snapshot used for hub-side
+// development — see docs/remote-executors.md). 0.3.1 adds persistent tmux
+// terminal sessions on top of 0.3.0's discovery/project-registry features;
+// 0.4.0 remains reserved for machine reporting in the monorepo's docs.
+export const EXECUTOR_VERSION = '0.3.1';
 
 export interface ExecutorConfig {
   /** Connection string of this executor's own Postgres database. */
@@ -66,7 +71,9 @@ export interface ExecutorConfig {
  *  `jobRetries` (an executor that retries in-job must never also be
  *  retried by the hub: budgets would multiply). */
 export function executorCapabilities(): Record<string, unknown> {
-  return { jobRetries: true, modelFallback: true, projectRegistry: true, discovery: true };
+  // `terminals: true` gates the console's Terminal action on this machine
+  // (persistent tmux sessions, ≥ 0.3.1; needs tmux ≥ 3.2 on the host).
+  return { jobRetries: true, modelFallback: true, projectRegistry: true, discovery: true, terminals: true };
 }
 
 function required(name: string, env: NodeJS.ProcessEnv): string {

@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import pino from 'pino';
+import { spawn as ptySpawn } from 'node-pty';
 import { createAuthHook, readAuthConfig } from './auth.js';
 import { loadConfig } from './config.js';
 import { createPool, defaultMigrationsDir, runModuleMigrations } from './db.js';
@@ -9,6 +10,7 @@ import { claimPairing } from './pairing.js';
 import { selectTransport } from './pairing/core.js';
 import { readCliState } from './pairing/state.js';
 import { registerRoutes } from './routes.js';
+import { TerminalRegistry, defaultTmuxAvailable, defaultTmuxRunner, type PtySpawner } from './terminals.js';
 import { startWorker } from './worker.js';
 
 /**
@@ -16,6 +18,16 @@ import { startWorker } from './worker.js';
  * set and no auth row exists) → Fastify + routes → poll worker → listen.
  * `npm run migrate` runs `src/main.ts --migrate-only`: apply and exit.
  */
+
+/** Real factory for the production registry (tests build their own with
+ *  fakes). tmux is the durable session store, node-pty runs the attach
+ *  clients; both are feature requirements of terminal sessions. */
+function buildTerminalRegistry(): TerminalRegistry {
+  const spawner: PtySpawner = (command, args, opts) => ptySpawn(command, args, {
+    name: 'xterm-256color', cols: opts.cols, rows: opts.rows, cwd: opts.cwd, env: opts.env,
+  });
+  return new TerminalRegistry({ tmux: defaultTmuxRunner(), tmuxAvailable: defaultTmuxAvailable(), spawner });
+}
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -58,6 +70,7 @@ async function main(): Promise<void> {
     if (!client) {
       logger.warn('OPENCODE_BASE_URL is unset — jobs will queue but never launch');
     }
+    const registry = buildTerminalRegistry();
     const onError = (error: unknown): void => {
       logger.warn({ err: error }, 'worker error');
     };
@@ -70,6 +83,7 @@ async function main(): Promise<void> {
       closing = true;
       logger.info({ signal }, 'shutting down');
       await stopWorker();
+      await registry.stopAll();
       await pool.end().catch(() => {});
       process.exit(0);
     };
@@ -77,7 +91,7 @@ async function main(): Promise<void> {
     process.once('SIGINT', () => void shutdown('SIGINT'));
 
     // Runs until a signal flips closing; reconnects internally forever.
-    await runGatewayLoop({ pool, config, engine, client, startedAt }, config, {
+    await runGatewayLoop({ pool, config, engine, client, startedAt, registry }, config, {
       logger, isStopped: () => closing,
     });
     return;
@@ -103,11 +117,12 @@ async function main(): Promise<void> {
   const app = Fastify({ logger: false });
   app.addHook('preHandler', createAuthHook(pool));
 
+  const registry = buildTerminalRegistry();
   const onError = (error: unknown): void => {
     logger.warn({ err: error }, 'worker error');
   };
   const engine = new JobEngine({ pool, config, client, onError });
-  registerRoutes(app, { pool, config, engine, client, startedAt });
+  registerRoutes(app, { pool, config, engine, client, startedAt, registry });
   const stopWorker = startWorker(engine, { onError });
 
   await app.listen({ port: config.port, host: config.host });
@@ -122,6 +137,7 @@ async function main(): Promise<void> {
       await app.close();
     } finally {
       await stopWorker();
+      await registry.stopAll();
       await pool.end().catch(() => {});
     }
     process.exit(0);
