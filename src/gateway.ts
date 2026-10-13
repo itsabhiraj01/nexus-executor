@@ -22,7 +22,7 @@ import { GATEWAY_PROTOCOL_VERSION, handleGatewayOperation, type RouteDeps } from
  * gateway restarts and hub deploys.
  */
 
-interface GatewayIdentity {
+export interface GatewayIdentity {
   version: 1;
   credential: string;
   executorId: string;
@@ -36,12 +36,8 @@ const MAX_MESSAGE_BYTES = 48 * 1024 * 1024;
 const MAX_IN_FLIGHT = 16;
 const STABLE_SESSION_MS = 30_000;
 
-function identityPath(config: ExecutorConfig): string {
-  return config.gatewayIdentityPath;
-}
-
-export function readGatewayIdentity(config: ExecutorConfig): GatewayIdentity | null {
-  const path = identityPath(config);
+export function readGatewayIdentity(config: Pick<ExecutorConfig, 'gatewayIdentityPath'>): GatewayIdentity | null {
+  const path = config.gatewayIdentityPath;
   if (!existsSync(path)) return null;
   try {
     const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<GatewayIdentity>;
@@ -53,12 +49,35 @@ export function readGatewayIdentity(config: ExecutorConfig): GatewayIdentity | n
   }
 }
 
-function writeGatewayIdentity(config: ExecutorConfig, identity: GatewayIdentity): void {
-  const path = identityPath(config);
+function writeGatewayIdentity(config: Pick<ExecutorConfig, 'gatewayIdentityPath'>, identity: GatewayIdentity): void {
+  const path = config.gatewayIdentityPath;
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp`;
   writeFileSync(tmp, JSON.stringify(identity, null, 2), { mode: 0o600 });
   renameSync(tmp, path);
+}
+
+/**
+ * Fresh per-attempt connect headers: a timestamped Ed25519 proof over
+ * audience‖credential‖timestamp‖nonce. The gateway checks shapes only; the
+ * hub verifies the signature and consumes the nonce (single use, ±120s
+ * window). Shared by the service loop and `nexus-executor repair`'s probe,
+ * so the CLI and the runtime can never drift on the wire format.
+ */
+export function buildConnectHeaders(identity: GatewayIdentity): Record<string, string> {
+  const timestamp = String(Date.now());
+  const nonce = randomBytes(16).toString('base64url');
+  const proof = ed25519Sign(
+    null,
+    Buffer.from(`${PROOF_AUDIENCE}\n${identity.credential}\n${timestamp}\n${nonce}`, 'utf8'),
+    identity.privateKeyPem,
+  ).toString('base64url');
+  return {
+    authorization: `Bearer ${identity.credential}`,
+    'x-nexus-proof-ts': timestamp,
+    'x-nexus-proof-nonce': nonce,
+    'x-nexus-proof': proof,
+  };
 }
 
 /**
@@ -133,21 +152,8 @@ export async function runGatewayLoop(deps: RouteDeps, config: ExecutorConfig, op
   let inFlight = 0;
 
   while (!stopped()) {
-    const timestamp = String(Date.now());
-    const nonce = randomBytes(16).toString('base64url');
-    const proof = ed25519Sign(
-      null,
-      Buffer.from(`${PROOF_AUDIENCE}\n${identity.credential}\n${timestamp}\n${nonce}`, 'utf8'),
-      identity.privateKeyPem,
-    ).toString('base64url');
-
     const ws = new Ws(`${wsBase}/v1/connect`, {
-      headers: {
-        authorization: `Bearer ${identity.credential}`,
-        'x-nexus-proof-ts': timestamp,
-        'x-nexus-proof-nonce': nonce,
-        'x-nexus-proof': proof,
-      },
+      headers: buildConnectHeaders(identity),
       maxPayload: MAX_MESSAGE_BYTES,
     });
 

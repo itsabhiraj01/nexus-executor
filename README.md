@@ -300,6 +300,7 @@ explicitly exported variable is never overridden.
     nexus-executor pair --hub URL --code CODE       → direct transport
     nexus-executor status --json
     nexus-executor doctor --json
+    nexus-executor repair [--json] [--hold-ms N]  → diagnose gateway/hub connectivity
     nexus-executor unpair
     nexus-executor project add <name> --dir <abs-path> [--remote <url>]
     nexus-executor project list
@@ -314,6 +315,26 @@ Install from a cloned checkout with:
 
     bash ./install.sh
     bash ./install.sh --gateway URL --code CODE
+
+`nexus-executor repair` (or `make repair`) is the connectivity diagnosis for
+the gateway transport: static checks (config, identity keypair, local
+services, clock) followed by live probes of the full chain
+(executor → Cloudflare → cloudflared → Caddy → nexus-gateway → hub). Its two
+`/v1/connect` probes — one with this executor's real proof, one with
+well-shaped garbage — localize a failure without server access:
+
+| valid probe | invalid probe | verdict |
+| --- | --- | --- |
+| holds open | rejected | `healthy` |
+| closed 1011 | rejected | `hub-session-open-failure` — auth passes, the hub's session-open errors (server-side) |
+| closed 1011 | same 1011 | `hub-call-failure` — the gateway's hub call errors before/regardless of auth |
+| rejected | rejected | `identity-rejected` — re-pair with a fresh identity |
+
+It prints targeted fixes (with the exact server-side commands) and exits 1
+when something is broken, so it works in cron/scripts. The valid probe opens
+a real session for `--hold-ms` (default 3s): run it when the executor is
+idle if you are worried about a job being routed to a socket that will not
+answer. Never prints the credential or private key.
 
 ## Executor-owned projects (project registry)
 

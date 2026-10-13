@@ -14,7 +14,8 @@
     "start": "node --env-file=.env dist/main.js",
     "test": "vitest run",
     "cli": "tsx src/cli/cli.ts",
-    "pair": "tsx src/cli/cli.ts pair"
+    "pair": "tsx src/cli/cli.ts pair",
+    "repair": "tsx src/cli/cli.ts repair"
   },
   "bin": {
     "nexus-executor": "bin/nexus-executor"

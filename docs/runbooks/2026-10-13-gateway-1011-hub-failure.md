@@ -1,7 +1,7 @@
 # Runbook — Gateway session closes with 1011 (`hub_failure`) — diagnosis in progress
 
 **Date:** 2026-10-13
-**Status:** Executor side ruled out; awaiting server-side evidence (commands in §4)
+**Status:** Executor side ruled out; `make repair` (§2.1) confirmed **auth passes, session-open fails** — awaiting server-side evidence for the *why* (commands in §4)
 **Executor:** `97afab48-5204-4344-8fa4-e0a02b87eb23` (`office-agent`, this host, transport `gateway`)
 
 ## TL;DR
@@ -20,6 +20,11 @@ gateway codec rejects — as opposed to a clean 401 denial. A denial would log
 `2026-10-08-gateway-executor-auth-failure.md`). **The root cause is on the
 server** (hub transport / DB / gateway↔hub path), not on this host.
 
+**Confirmed remotely 2026-10-13 01:50** by `make repair`'s differential probe
+(§2.1): a garbage credential is cleanly rejected (HTTP 401 at the upgrade)
+while our valid proof is accepted — the hub is up, its auth path works, and
+what errors is specifically the **post-auth session-open** call (hypothesis 1).
+
 ## 1. Timeline (2026-10-12, IST)
 
 | Time | Event |
@@ -28,6 +33,8 @@ server** (hub transport / DB / gateway↔hub path), not on this host.
 | 22:52:34 | First gateway dial answered **HTTP 502** (origin down); attempts 1–11 all 502 |
 | ~23:05 | Transition: WS upgrades start succeeding, but every session closes **1011** ~300 ms in |
 | 23:05 → | Steady state: `gateway WebSocket opened; awaiting gateway requests` → close 1011 → backoff → repeat. Executor otherwise healthy |
+| Oct 13 01:12 | Service restarted (reinstall; identity untouched, `make pair` idempotent — §3.1). 1011 loop persists with identical signatures (`sessionDurationMs ≈ 306–326`) |
+| Oct 13 01:50 | `make repair` differential probe (§2.1): invalid credential → HTTP 401 at the upgrade; valid proof → upgrade OK, close 1011 in 327 ms. Verdict `hub-session-open-failure` |
 
 No known server-side change at ~23:05 (user-confirmed). What restarted or
 recovered then is itself evidence — see command 2.
@@ -45,6 +52,39 @@ recovered then is itself evidence — see command 2.
 Note: **enrollment succeeded 2026-10-09 02:20 through the same public
 endpoint**, so the platform path worked for `enroll` then. What fails now is
 `connect` (auth + session open) — a different hub operation.
+
+### 2.1 `make repair` — the executor-side differential probe (2026-10-13 01:50)
+
+`nexus-executor repair` (new; `make repair`) runs the static checks, then
+dials `/v1/connect` twice — once with our real proof, once with well-shaped
+garbage — and classifies the difference:
+
+```text
+static checks    all PASS (config, identity keypair, cli state, NTP,
+                 database, opencode, all three services)
+connectivity     dns OK · POST /v1/enroll → 400 (chain alive) · skew −1 s
+session probes
+  connect valid    closed 1011 after 327 ms          ← the failure
+  connect invalid  upgrade rejected (HTTP 401)       ← the auth layer works
+diagnosis: hub-session-open-failure
+```
+
+Interpretation — per the protocol design the gateway validates nothing but
+shapes, and the garbage probe is shape-canonical, so that 401 is the hub's
+denial (confirm with command 7's nonce rows, but the signature is clean):
+
+- the hub is **up** and its auth path executes: `loadDevice` read
+  `builder.gateway_devices` and denied the unknown credential cleanly. A
+  missing/unreadable `gateway_devices` table would have made the invalid
+  probe fail the *same* way as the valid one (both 1011).
+- our credential/proof is **accepted** — the valid probe completes the
+  upgrade.
+- what errors is the call **after** auth: the session-open path
+  (`builder.gateway_sessions` insert / lease) — hypothesis 1.
+
+This is the remote equivalent of decision-table row 7's `nonces_last_hour >
+0` branch. The §4 commands now answer *why* session-open errors, not *where*
+the failure is.
 
 ## 3. Hypotheses, in priority order
 
@@ -66,6 +106,42 @@ endpoint**, so the platform path worked for `enroll` then. What fails now is
      session `open` (the `builder.gateway_sessions` path).
    - **No nonce rows** → the hub 500s *before/at* `loadDevice` (auth never
      completes).
+
+### 3.1 What `make pair` does (and does not) do
+
+`make pair` / `nexus-executor pair` is **idempotent**: `enrollGateway` returns
+the existing identity if `gateway-identity.json` is present and well-shaped —
+it does **not** contact the gateway, consume a pairing code, or change
+anything on the hub. Verified 2026-10-13 01:13: `make pair` printed
+`Paired "office-agent" … (executor 97afab48-…)` with the **same** executorId
+and `enrolledAt 2026-10-08T20:50:21Z`; the identity file's mtime was
+untouched. A service restart afterwards (01:12) also changed nothing — the
+1011 loop persisted with identical signatures.
+
+A **fresh** re-pair (new keypair → new hub executor row) is a legitimate
+remote diagnostic when server access is inconvenient, because enrollment
+exercises the hub's device tables end-to-end (pairing-code claim, executor
+row, device row):
+
+- fresh enroll **succeeds** + connect still 1011s → the hub's **session-open**
+  path is broken (confirms hypothesis 1/3 server-side);
+- fresh enroll **fails** → the hub DB / pairing tables are broken more broadly.
+
+Procedure (from `2026-10-08-gateway-executor-auth-failure.md` — the identity
+deletion is mandatory, or the enroll silently reuses the old key):
+
+```bash
+systemctl --user stop nexus-executor
+rm -f ~/nexus-executor/data/gateway-identity.json ~/.config/nexus-executor/state.json
+# Mint a fresh single-use code: hub console → Builder → Executors → Pair executor
+nexus-executor pair --gateway https://nexus-executor.abhirajtomar.com --code <CODE>
+systemctl --user start nexus-executor
+```
+
+Cost: creates a **new** executor row on the hub (the old `97afab48…` row
+lingers — revoke it there afterwards). Note our signature (`hub_failure`, not
+`authentication_failed`) does **not** match the stale-identity pattern that
+runbook fixed, so a re-pair is a diagnostic here, not the expected cure.
 
 ## 4. Server-side evidence to collect (run as `server@abhiraj`)
 
@@ -106,6 +182,7 @@ cd /home/server/services/nexus && node_modules/.bin/tsx .smoke/gateway-smoke.mts
 
 | Command | If it shows… | Then… |
 |---|---|---|
+| §2.1 (done) | `make repair` → `hub-session-open-failure` | Auth passes; failure is in session `open` — the same branch as row 7's `nonces > 0`. §4 now explains the *why* |
 | 1–2 | `startup_failed` / crash-loop before 23:05, or an `error`/`operation` field on `hub_failure` | We get the gateway's real failure directly (richer still if the 2026-10-10 logging patch was applied to `/opt/nexus-gateway/dist/src/hub/client.js`) |
 | 2 | `ActiveEnterTimestamp` ≈ 2026-10-12 23:05 | The gateway itself restarted then — find why (unit restart, crash-loop exit, server reboot) |
 | 3 | `:3201` missing | The hub's private transport listener is down → every connect is a `hub_failure` by definition |
@@ -121,6 +198,12 @@ cd /home/server/services/nexus && node_modules/.bin/tsx .smoke/gateway-smoke.mts
   socket error in the reconnect log; short-lived sessions no longer reset the
   backoff — `STABLE_SESSION_MS = 30_000`). It is what made this runbook's
   numbers possible.
+- `nexus-executor repair` / `make repair` (new, 2026-10-13): static checks +
+  the valid/garbage differential probe + verdict-keyed fix suggestions
+  (`src/cli/repair.ts`, tests `src/cli/repair.test.ts`, README §Control CLI,
+  `buildConnectHeaders` extracted from the loop so the CLI and runtime share
+  one proof implementation). It produced §2.1 — commit alongside the gateway
+  diagnostics.
 - The installer work from 2026-10-12 (native `nexus-db`, password pinning,
   backup/migration paths in `scripts/install.mjs`) is complete and verified —
   commit it as the session that produced it died before doing so.
