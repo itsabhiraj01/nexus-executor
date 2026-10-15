@@ -77,6 +77,36 @@ new feasibility record, not a chore.
 - Dispatch/result events are pushed from INSIDE the tool wrappers, never
   parsed from stream shapes.
 
+### Task 6 — durable checkpoints, restart-resume (2026-10-15)
+
+- `createCheckpointer(databaseUrl, schema)` creates a per-run schema and
+  points `new PostgresSaver(pool, undefined, { schema })` at it (constructor
+  form verified; `setup()` idempotent). `DROP SCHEMA … CASCADE` removes a
+  run's state wholesale.
+- **`durability: 'sync'` is mandatory in every `stream()` options bag.** The
+  default async durability lets a question be VISIBLE in the consumer stream
+  while its checkpoint write is still in flight — a restarted instance then
+  sees only the stale `-1/0`-stage positions (empirically: only the input
+  checkpoint committed).
+- `getState().tasks[].interrupts` is EMPTY on a fresh instance for tool
+  (`__pregel_push`) interrupts: the durable write carries the ORIGINAL task
+  id, the fresh graph recomputes a different one, `tasksWithWrites` matches
+  nothing. Discovery reads the newest tuple's `pendingWrites` directly and
+  scans for the `__interrupt__` channel.
+- `getTuple()` and `list()` DISAGREE on that same position: `getTuple`
+  returns the newest checkpoint with `pendingWrites = []` while `list`
+  carries the interrupt write. Discovery therefore uses
+  `list({ configurable }, { limit: 1 })` (DESC = newest first).
+- Questions are emitted only AFTER the run's stream quiesces, so consumers
+  can never observe a question whose durable interrupt write has not
+  committed (`durability:'sync'` narrows that window to a beat, not to zero).
+- Exactly-once answers are enforced in the DRIVER (`answer()` returns `false`
+  when no question with that id is pending); the checkpoint guarantees a
+  resumed interrupt replays the tool exactly once.
+- UUIDv6 checkpoint ids sort correctly by time (`DESC LIMIT 1` selects the
+  newest position); the earlier "wrong position" observation was entirely
+  explained by async durability.
+
 ## Known limits
 
 _(Finalized at Task 7 — anything not yet proven is listed here instead of

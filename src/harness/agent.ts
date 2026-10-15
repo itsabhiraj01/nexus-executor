@@ -36,8 +36,10 @@ export interface HarnessRunConfig {
 export interface HarnessDriver {
   /** Pull-based: consumers control flow; at most one in-flight buffer. */
   events: AsyncIterable<HarnessEvent>;
-  /** Resume the pending ask-user interrupt exactly once (answers are FIFO). */
-  answer(questionId: string, text: string): void;
+  /** Resume the pending ask-user interrupt. Returns false when no question
+   * with this id is pending — exactly-once is enforced HERE (spec: a reply
+   * never mutates state a second time, even after a restart). */
+  answer(questionId: string, text: string): boolean;
   cancel(): Promise<void>;
 }
 
@@ -142,6 +144,7 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
     },
   );
 
+  const checkpointer: BaseCheckpointSaver = config.checkpointer ?? new MemorySaver();
   const agent = createDeepAgent({
     model: config.model,
     backend: new CompositeBackend(
@@ -150,15 +153,62 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
     ),
     tools: [runCommandTool, askUserTool],
     systemPrompt: config.systemBrief ?? DEFAULT_BRIEF,
-    checkpointer: config.checkpointer ?? new MemorySaver(),
+    checkpointer,
   });
+
+  /** A pending ask_user interrupt persisted in the thread's checkpoint, if
+   * any (the restart case); null when the thread is fresh or uninterrupted.
+   * Discovery reads the saver's pending writes directly: getState()'s
+   * tasks[].interrupts stays EMPTY for push-task (tool) interrupts because
+   * the interrupt write carries the ORIGINAL task id while a fresh graph
+   * recomputes a different one — the write itself is the durable record
+   * (Task 6 finding, recorded in README). */
+  async function findAskInterrupt(): Promise<string | null> {
+    try {
+      // list() is DESC by checkpoint id → the newest position is first. (It
+      // also faithfully carries the interrupt write that getTuple() muted out
+      // of its pendingWrites — Task 6 discovery, recorded in README.)
+      for await (const tuple of checkpointer.list({ configurable: { thread_id: config.threadId } } as never, { limit: 1 } as never)) {
+        const writes = ((tuple as unknown as { pendingWrites?: unknown }).pendingWrites ?? []) as Array<[string, string, unknown]>;
+        for (const [, channel, value] of writes) {
+          if (channel !== '__interrupt__') continue;
+          const payload = (value as { value?: unknown } | null)?.value;
+          if (payload && typeof payload === 'object'
+            && (payload as { type?: unknown }).type === 'ask_user'
+            && typeof (payload as { question?: unknown }).question === 'string') {
+            return (payload as { question: string }).question;
+          }
+        }
+      }
+    } catch {
+      // No checkpoint yet (fresh thread) — start with the prompt.
+    }
+    return null;
+  }
 
   async function runLoop(): Promise<void> {
     let lastText = '';
     let questionCounter = 0;
     let sawInterrupt = false;
+    const waitForAnswer = (questionId: string): Promise<string> =>
+      new Promise<string>((resolve, reject) => {
+        answerPending = { questionId, resolve, reject };
+      });
     try {
-      let input: Record<string, unknown> | Command = { messages: [new HumanMessage(config.prompt)] };
+      // Restart-resume: if the checkpoint already holds a pending ask_user,
+      // rejoin it (emit the question, wait for THE answer, resume) instead of
+      // re-sending the original prompt onto an interrupted thread.
+      let input: Record<string, unknown> | Command;
+      const rejoinedQuestion = await findAskInterrupt();
+      if (rejoinedQuestion !== null) {
+        sawInterrupt = true;
+        const qid = `q${++questionCounter}`;
+        emit({ type: 'question', questionId: qid, text: rejoinedQuestion });
+        input = new Command({ resume: { text: await waitForAnswer(qid) } });
+        answerPending = null;
+      } else {
+        input = { messages: [new HumanMessage(config.prompt)] };
+      }
       for (;;) {
         // Deep Agents' compiled-graph generics encode THEIR agent config; the
         // adapter intentionally treats the stream opaquely (tuple parsing is
@@ -167,8 +217,14 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
           configurable: { thread_id: config.threadId },
           streamMode: ['messages', 'updates'],
           signal: abort.signal,
+          // Durable intent: every checkpoint put/putWrites is COMMITTED before
+          // the graph advances — otherwise the default async durability lets a
+          // parked question be invisible to a restarted instance (Task 6
+          // discovery, recorded in README).
+          durability: 'sync',
         } as never);
         let pending: string | null = null;
+        let pendingText = '';
         for await (const chunk of watchStream(
           stream as unknown as AsyncIterable<[string, unknown]>,
           { firstChunkMs: config.limits.firstChunkMs, chunkGapMs: config.limits.chunkGapMs, totalMs: config.limits.turnCapMs },
@@ -194,14 +250,16 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
             if (ask) {
               sawInterrupt = true;
               pending = `q${++questionCounter}`;
-              emit({ type: 'question', questionId: pending, text: ask.question });
+              pendingText = ask.question;
             }
           }
         }
         if (!pending) break;
-        const text = await new Promise<string>((resolve, reject) => {
-          answerPending = { questionId: pending!, resolve, reject };
-        });
+        // Emit the question only now — after the stream quiesced — so the
+        // interrupt's sync-durability commit has landed in the saver before a
+        // consumer can act on it (restart-discovery race, Task 6 finding).
+        emit({ type: 'question', questionId: pending, text: pendingText });
+        const text = await waitForAnswer(pending);
         answerPending = null;
         input = new Command({ resume: { text } });
       }
@@ -230,9 +288,12 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
     answer(questionId, text) {
       if (answerPending && answerPending.questionId === questionId) {
         answerPending.resolve(text);
+        return true;
       }
+      return false;
     },
     async cancel() {
+      answerPending?.reject(new WatchdogAbort());
       if (!abort.signal.aborted) abort.abort();
     },
   };
