@@ -26,9 +26,13 @@ import {
   type OpenCodeMessageError,
 } from './opencode.js';
 import {
+  isModelPolicyDenial, registerModelPolicy, ModelPolicyError, type ExecutorModelPolicy,
+} from './model-policy.js';
+import {
   ConflictError,
   commitJobChanges,
   execGit,
+  materializeJobAgent,
   materializeJobAttachments,
   mergeJobBranch,
   prepareWorktree,
@@ -40,6 +44,7 @@ import {
   syncCheckout,
   type AttachmentFile,
   type GitRunner,
+  type JobAgentMaterialization,
 } from './workspace.js';
 
 /**
@@ -106,6 +111,15 @@ export interface JobSpecInput {
   verificationCommand?: string;
   project?: ProjectSpec | null;
   models?: string[];
+  /** The agent-derived provider fence (hub ≥ agent-model-policy contract):
+   *  written into the job's worktree and proven with a canary before the
+   *  first session — legacy jobs (absent/null) run unfenced. */
+  modelPolicy?: ExecutorModelPolicy | null;
+  /** The pre-rendered native persona (hub ≥ nativeAgents capability):
+   *  materialized into the job's worktree BEFORE the first session opens
+   *  (the model-policy canary included — a directory's project-agent
+   *  catalog freezes at its first session) and pinned on the session. */
+  agent?: JobAgentMaterialization | null;
   attachments?: JobAttachmentInput[];
   retry?: JobRetrySpec | null;
 }
@@ -246,10 +260,13 @@ export const EVENT = {
   WORKTREE_MERGE_FAILED: 'WORKTREE_MERGE_FAILED',
   WORKTREE_DEPLOYED: 'WORKTREE_DEPLOYED',
   WORKTREE_DEPLOY_FAILED: 'WORKTREE_DEPLOY_FAILED',
+  AGENT_APPLIED: 'AGENT_APPLIED',
   WORKSPACE_CLEANED: 'WORKSPACE_CLEANED',
   WORKSPACE_RETENTION_VIOLATION: 'WORKSPACE_RETENTION_VIOLATION',
   AUTO_RETRY_SCHEDULED: 'AUTO_RETRY_SCHEDULED',
   AUTO_RETRY_STARTED: 'AUTO_RETRY_STARTED',
+  MODEL_POLICY: 'MODEL_POLICY',
+  MODEL_POLICY_BLOCKED: 'MODEL_POLICY_BLOCKED',
   MODEL_FALLBACK: 'MODEL_FALLBACK',
 } as const;
 
@@ -724,6 +741,52 @@ export class JobEngine {
         }
       }
 
+      // Native persona (hub ≥ nativeAgents capability): give the job's
+      // worktree the persona as a real OpenCode project agent — its skills
+      // section and MCP servers reach remote runs exactly like local ones.
+      // MUST land before the model-policy canary below: that probe opens
+      // the directory's first session, and OpenCode freezes a location's
+      // project-agent catalog at its first session.
+      if (spec.agent && this.client) {
+        try {
+          await materializeJobAgent(this.git, prepared.path, spec.agent);
+        } catch (error) {
+          throw Object.assign(new Error(error instanceof Error ? error.message : String(error)), { code: 'workspace_setup_failed' });
+        }
+        await appendJobEvent(this.pool, {
+          jobId: job.id, eventType: EVENT.AGENT_APPLIED,
+          summary: `Agent "${spec.agent.name}" materialized natively on the job worktree (${spec.agent.opencodeAgent}).`,
+          payload: { agent: spec.agent.opencodeAgent, name: spec.agent.name, mcp: spec.agent.mcp ? 'written' : 'none', tier: 'native' },
+        });
+      }
+
+      // The model policy fence: the hub ships the job's agents' provider
+      // allow-list; write it into the job's worktree ONCE (OpenCode
+      // directory config is sticky) and prove it denies a real out-of-
+      // policy model BEFORE the session starts — a service that cannot
+      // enforce it fails the job (retries skip the re-proof on the SAME
+      // directory; a reattached different worktree gets re-fenced).
+      if (spec.modelPolicy && this.client) {
+        const registeredDir = typeof job.metadata.modelPolicyDir === 'string' ? job.metadata.modelPolicyDir : '';
+        if (registeredDir !== prepared.path) {
+          let registration: { canary: string | null };
+          try {
+            registration = await registerModelPolicy(this.client, prepared.path, spec.modelPolicy.providers);
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            throw Object.assign(new ModelPolicyError(reason), { code: 'model_policy_failed' });
+          }
+          await this.pool.query(
+            `UPDATE executor.jobs SET metadata = metadata || $2::jsonb, version = version + 1, updated_at = NOW()
+             WHERE id = $1 AND status = $3`, [job.id, JSON.stringify({ modelPolicyDir: prepared.path }), fromStatus]);
+          await appendJobEvent(this.pool, {
+            jobId: job.id, eventType: EVENT.MODEL_POLICY,
+            summary: `Model policy enforced on the job worktree (providers: ${spec.modelPolicy.providers.join(', ')})${registration.canary ? ` — proven by denying ${registration.canary}` : ''}.`,
+            payload: { providers: spec.modelPolicy.providers, models: spec.modelPolicy.models, canary: registration.canary, directory: prepared.path },
+          });
+        }
+      }
+
       // The model: the spec's priority list AT the position any usage-limit
       // fallback walked to (the position is job-wide, surviving attempts).
       const priority = (spec.models ?? [])
@@ -734,6 +797,18 @@ export class JobEngine {
         Math.max(0, priority.length - 1),
       );
       const modelRef = priority[modelIndex] ?? null;
+      // A fenced job must never run an out-of-policy model: the chain the
+      // hub ships lives inside the policy by construction — refuse loudly
+      // if the two ever disagree (a hand-edited spec), never fall back to
+      // the service default behind the fence's back.
+      if (spec.modelPolicy && modelRef && !spec.modelPolicy.providers.includes(modelRef.providerID)) {
+        throw Object.assign(
+          new ModelPolicyError(
+            `the job's model ${modelRef.providerID}/${modelRef.modelID} is outside its model policy (providers: ${spec.modelPolicy.providers.join(', ')})`,
+          ),
+          { code: 'model_policy_failed' },
+        );
+      }
       const composed = await this.composePrompt(spec, attachmentsDir, attachmentFiles);
       const prompt = isRetry
         ? [
@@ -750,6 +825,10 @@ export class JobEngine {
       const session = await this.client!.createSession({
         title: job.title || `Job ${job.hubJobId}`,
         directory: prepared.path,
+        // The materialized native persona rides the session pin (its own
+        // frontmatter model/permission map); an absent persona keeps the
+        // service's configured default agent.
+        agent: spec.agent?.opencodeAgent ?? null,
         model: modelRef,
       });
       const modelEcho = session.model?.id
@@ -789,8 +868,9 @@ export class JobEngine {
         jobId: job.id, eventType: EVENT.EXECUTION_STATUS_CHANGED, summary: 'Job launched.',
       });
     } catch (error) {
-      const code = (error as { code?: string }).code === 'workspace_setup_failed'
-        ? 'workspace_setup_failed' : 'session_setup_failed';
+      const rawCode = (error as { code?: string }).code;
+      const code = rawCode === 'workspace_setup_failed' || rawCode === 'model_policy_failed'
+        ? rawCode : 'session_setup_failed';
       await this.failJob(job.id, code, error instanceof Error ? error.message : String(error), { interrupt: false });
       // The workspace is NEVER removed here. The engine performs no
       // implicit deletion: a failed attempt's branch and worktree stay on
@@ -799,6 +879,8 @@ export class JobEngine {
       // The ONLY deletion path is the hub's explicit merge op below.
     }
   }
+
+
 
   /** stored systemPrompt → project.customPrompt → the job prompt → the
    *  attachment listing ("### Attached files" — content is never inlined). */
@@ -944,6 +1026,24 @@ export class JobEngine {
           return false;
         });
         if (fell) return;
+        // A provider-policy denial (provider.no-route): the worktree's own
+        // model fence refused the turn's model BEFORE any provider call.
+        // Deterministic — no fallback, no in-job retry; the agent's model
+        // chain is where the fix lives (hub-side).
+        if (isModelPolicyDenial(last.error)) {
+          await this.interruptSession(job);
+          await appendJobEvent(this.pool, {
+            jobId: job.id, eventType: EVENT.MODEL_POLICY_BLOCKED,
+            summary: agentErrorSummary(last.error ?? 'provider policy denied the model'),
+            payload: { reason: agentErrorSummary(last.error ?? 'provider policy denied the model') },
+          });
+          await this.failJob(
+            job.id, 'model_policy_blocked',
+            `The job's model policy blocked the agent's turn: ${agentErrorSummary(last.error ?? { message: last.finish ?? 'unknown error' })}. Only the assigned agents' own model chains may run — the fix belongs on the agent's models hub-side.`,
+            { interrupt: false },
+          );
+          return;
+        }
         await this.interruptSession(job);
         await this.failJob(job.id, 'agent_error', agentErrorSummary(last.error ?? { message: last.finish ?? 'unknown error' }), { interrupt: false });
         return;

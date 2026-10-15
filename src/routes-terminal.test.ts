@@ -9,6 +9,8 @@ import { createPool, runModuleMigrations, defaultMigrationsDir } from './db.js';
 import type { JobEngine } from './engine.js';
 import { registerRoutes } from './routes.js';
 import { TerminalCapError, TerminalTmuxError, type TerminalRegistry } from './terminals.js';
+import { TerminalStoreError } from './terminal-store.js';
+import { createUpgrader } from './upgrade.js';
 import { testConfig } from './testkit.js';
 
 /**
@@ -27,8 +29,10 @@ let root: string;
 let availableResult = true;
 let availableCalls = 0;
 let createThrows: Error | null = null;
+let listThrows: Error | null = null;
 let createCalls: Array<{ cols: number; rows: number; name?: string; idempotencyKey?: string }>;
 let readCalls: Array<{ id: string; sinceSeq: number; waitMs: number; attach: boolean }>;
+let readThrows: Error | null = null;
 let writtenInputs: Array<{ id: string; data: string }>;
 
 function fakeRegistry(): TerminalRegistry {
@@ -42,12 +46,21 @@ function fakeRegistry(): TerminalRegistry {
       createCalls.push(input);
       return { id: 'nxt-abc123', name: input.name ?? 'nxt-abc123', createdAt: '2026-10-10T00:00:00.000Z' };
     },
-    list: async () => ({
-      sessions: [{
-        id: 'nxt-abc123', name: 'dev', cols: 80, rows: 24, status: 'live', clients: 1,
-        createdAt: '2026-10-10T00:00:00.000Z', lastActiveAt: '2026-10-10T00:00:01.000Z',
-      }],
-    }),
+    list: async () => {
+      if (listThrows) throw listThrows;
+      return {
+        sessions: [{
+          id: 'nxt-abc123', name: 'dev', cols: 80, rows: 24, status: 'live', clients: 1,
+          tmuxClients: 2, origin: 'imported' as const,
+          createdAt: '2026-10-10T00:00:00.000Z', lastActiveAt: '2026-10-10T00:00:01.000Z',
+        },
+        {
+          id: 'nxt-gone77', name: 'old', cols: 0, rows: 0, status: 'exited' as const, clients: 0,
+          origin: 'created' as const,
+          createdAt: '2026-10-10T00:00:00.000Z', lastActiveAt: '2026-10-10T00:05:00.000Z',
+        }],
+      };
+    },
     input: (id: string, data: string) => {
       if (id !== 'nxt-abc123') return 'not_found';
       writtenInputs.push({ id, data });
@@ -56,6 +69,7 @@ function fakeRegistry(): TerminalRegistry {
     resize: (id: string) => (id === 'nxt-abc123' ? 'ok' : 'not_found'),
     detach: (id: string) => (id === 'nxt-abc123' ? 'ok' : 'not_found'),
     read: async (id: string, sinceSeq: number, holdMs: number, attach: boolean) => {
+      if (readThrows) throw readThrows;
       readCalls.push({ id, sinceSeq, waitMs: holdMs, attach });
       if (id !== 'nxt-abc123') return null;
       return {
@@ -86,6 +100,7 @@ beforeAll(async () => {
   registerRoutes(app, {
     pool, config, engine: null as unknown as JobEngine, client: null, startedAt: Date.now(),
     registry: fakeRegistry(),
+    upgrader: createUpgrader({ config, stateFile: join(root, 'upgrade-state.json'), logFile: join(root, 'upgrade.log') }),
   });
   await app.ready();
 });
@@ -100,6 +115,8 @@ beforeEach(() => {
   availableResult = true;
   availableCalls = 0;
   createThrows = null;
+  listThrows = null;
+  readThrows = null;
   createCalls = [];
   readCalls = [];
   writtenInputs = [];
@@ -127,8 +144,13 @@ describe('terminal routes', () => {
 
     const listed = await app.inject({ method: 'GET', url: '/api/v1/terminals', headers: auth() });
     expect(listed.statusCode).toBe(200);
-    expect(listed.json().sessions).toHaveLength(1);
-    expect(listed.json().sessions[0]).toMatchObject({ id: 'nxt-abc123', status: 'live', cols: 80, rows: 24, clients: 1 });
+    expect(listed.json().sessions).toHaveLength(2);
+    expect(listed.json().sessions[0]).toMatchObject({
+      id: 'nxt-abc123', status: 'live', cols: 80, rows: 24, clients: 1,
+      // The sync additions ride the SAME shape (optional for legacy hubs).
+      tmuxClients: 2, origin: 'imported',
+    });
+    expect(listed.json().sessions[1]).toMatchObject({ id: 'nxt-gone77', status: 'exited', origin: 'created' });
 
     const input = await app.inject({
       method: 'POST', url: '/api/v1/terminals/nxt-abc123/input', headers: auth(),
@@ -254,11 +276,11 @@ describe('terminal routes', () => {
   });
 
   it('interactive typing never starves the ops bucket — 121+ inputs stay 200 AND kill is still allowed', async () => {
-    // The 2026-10-12 regression: input shared a 120/min bucket with every
-    // other op, so a typing burst 429'd the stream AND the Kill the user
-    // reached for. The io bucket (input/resize, 3600/min — the console's
-    // worst-case flush rate) and the op bucket (create/list/detach/kill,
-    // 240/min) are separate now.
+    // The 2026-10-12 freeze: input shared one bucket with every other op,
+    // so a typing burst 429'd the stream AND the Kill the user reached for.
+    // The io bucket (input/resize, 3600/min — the console's worst-case
+    // flush rate) and the op bucket (create/list/detach/kill, 240/min) are
+    // separate here (this lineage's 0.3.2 fix; kept through the unification).
     for (let i = 0; i < 121; i++) {
       const hit = await app.inject({
         method: 'POST', url: '/api/v1/terminals/nxt-abc123/input', headers: auth(), payload: { dataBase64: 'eA==' },
@@ -292,5 +314,24 @@ describe('terminal routes', () => {
     });
     expect(broken.statusCode).toBe(502);
     expect(broken.json().error).toContain('no server');
+  });
+
+  it('maps sync/scan and storage failures to 502 on list; 502 on output too', async () => {
+    // The sync IS the list: a failed inventory (timeout/permission/malformed)
+    // surfaces as a 502 — never silently answered with markings lost.
+    listThrows = new TerminalTmuxError('tmux list-sessions failed (code 124): tmux timed out');
+    const scanned = await app.inject({ method: 'GET', url: '/api/v1/terminals', headers: auth() });
+    expect(scanned.statusCode).toBe(502);
+    expect(scanned.json().error).toContain('tmux timed out');
+
+    listThrows = new TerminalStoreError('terminal session sweep failed: connection terminated');
+    const stored = await app.inject({ method: 'GET', url: '/api/v1/terminals', headers: auth() });
+    expect(stored.statusCode).toBe(502);
+    expect(stored.json().error).toContain('connection terminated');
+
+    // Reads driven to a discovery failure map the same way.
+    readThrows = new TerminalStoreError('terminal session registration failed: db is down');
+    const out = await app.inject({ method: 'GET', url: '/api/v1/terminals/nxt-abc123/output', headers: auth() });
+    expect(out.statusCode).toBe(502);
   });
 });

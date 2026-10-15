@@ -56,12 +56,17 @@ export function testConfig(workspaceRoot: string, overrides: Partial<ExecutorCon
     // Retention sweep off so existing suites keep their workspaces;
     // retention tests opt in.
     workspaceRetentionDays: 0,
+    upgradeCommand: null,
+    upgradeRepoDir: null,
+    upgradeRef: 'main',
+    upgradeServiceName: 'nexus-executor',
+    upgradeInstallDir: null,
     ...overrides,
   };
 }
 
 export interface StubState {
-  sessions: Array<{ id: string; title: string; directory?: string; model?: ModelRef | null }>;
+  sessions: Array<{ id: string; title: string; directory?: string; agent?: string | null; model?: ModelRef | null }>;
   prompts: Array<{ sessionId: string; text: string }>;
   interrupts: string[];
   /** Session model switches (the usage-limit fallback path). */
@@ -89,11 +94,12 @@ export function makeStubClient(): { client: OpenCodeClient; state: StubState } {
     const method = init?.method ?? 'GET';
     if (method === 'POST' && url.endsWith('/api/session')) {
       const body = JSON.parse(String(init!.body)) as {
-        title?: string; location?: { directory?: string }; model?: { providerID: string; id: string };
+        title?: string; location?: { directory?: string }; agent?: string; model?: { providerID: string; id: string };
       };
       const id = `ses_stub_${state.sessions.length + 1}`;
       state.sessions.push({
         id, title: body.title ?? '', directory: body.location?.directory,
+        agent: body.agent ?? null,
         model: body.model ? { providerID: body.model.providerID, modelID: body.model.id } : null,
       });
       state.messages[id] = [];

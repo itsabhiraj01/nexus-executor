@@ -93,9 +93,7 @@ describe.skipIf(!hasTmux)('real-tmux sync smoke (isolated socket)', () => {
     await execFileAsync('tmux', ['-L', sock, 'kill-server']).catch(() => {});
   });
 
-  // TODO(unification task 2.9): unskip all four when terminals.ts gains the
-  // TerminalStore-backed sync — these drive it (ported red from the monorepo).
-  it.skip('discovers attached + detached manual sessions; repeated sync is idempotent', async () => {
+  it('discovers attached + detached manual sessions; repeated sync is idempotent', async () => {
     await newManual('manual-dev', { x: 90, y: 25 });
     await newManual('detached-job');
     attachOutOfBand('manual-dev');
@@ -114,7 +112,7 @@ describe.skipIf(!hasTmux)('real-tmux sync smoke (isolated socket)', () => {
     expect(rows).toHaveLength(2);
   });
 
-  it.skip('attach/input/detach/kill an imported session end to end', async () => {
+  it('attach/input/detach/kill an imported session end to end', async () => {
     await newManual('manual-dev');
     const registry = makeRegistry();
     const { sessions } = await registry.list();
@@ -143,7 +141,7 @@ describe.skipIf(!hasTmux)('real-tmux sync smoke (isolated socket)', () => {
     await registry.stopAll();
   });
 
-  it.skip('a restarted registry restores mappings; a rename keeps the public id', async () => {
+  it('a restarted registry restores mappings; a rename keeps the public id', async () => {
     await newManual('manual-dev');
     const first = makeRegistry();
     const listed = await first.list();
@@ -165,7 +163,7 @@ describe.skipIf(!hasTmux)('real-tmux sync smoke (isolated socket)', () => {
     await second.stopAll();
   });
 
-  it.skip('sessions created through the registry stay in charge after the restart (durable ids)', async () => {
+  it('sessions created through the registry stay in charge after the restart (durable ids)', async () => {
     const first = makeRegistry();
     const created = await first.create({ cols: 90, rows: 25, name: 'dev-box', idempotencyKey: 'smoke1' });
     expect(created.id).toBe('nxt-smoke1');

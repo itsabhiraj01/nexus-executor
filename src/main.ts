@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import type { Pool } from 'pg';
 import pino from 'pino';
 import { spawn as ptySpawn } from 'node-pty';
 import { createAuthHook, readAuthConfig } from './auth.js';
@@ -11,6 +12,8 @@ import { selectTransport } from './pairing/core.js';
 import { readCliState } from './pairing/state.js';
 import { registerRoutes } from './routes.js';
 import { TerminalRegistry, defaultTmuxAvailable, defaultTmuxRunner, type PtySpawner } from './terminals.js';
+import { TerminalStore } from './terminal-store.js';
+import { createUpgrader } from './upgrade.js';
 import { startWorker } from './worker.js';
 
 /**
@@ -19,14 +22,19 @@ import { startWorker } from './worker.js';
  * `npm run migrate` runs `src/main.ts --migrate-only`: apply and exit.
  */
 
-/** Real factory for the production registry (tests build their own with
- *  fakes). tmux is the durable session store, node-pty runs the attach
- *  clients; both are feature requirements of terminal sessions. */
-function buildTerminalRegistry(): TerminalRegistry {
+/** The terminal session registry (docs/remote-executors.md §Terminal
+ *  sessions): tmux is the durable session store for the SHELLS, Postgres
+ *  (executor.terminal_sessions) the durable registry of public ids ↔ tmux
+ *  identities, node-pty runs the attach clients. Gateway and direct
+ *  branches share one instance; shutdown kills pty clients only — tmux
+ *  sessions and their registrations survive an executor restart by design. */
+function buildTerminalRegistry(pool: Pool): TerminalRegistry {
   const spawner: PtySpawner = (command, args, opts) => ptySpawn(command, args, {
     name: 'xterm-256color', cols: opts.cols, rows: opts.rows, cwd: opts.cwd, env: opts.env,
   });
-  return new TerminalRegistry({ tmux: defaultTmuxRunner(), tmuxAvailable: defaultTmuxAvailable(), spawner });
+  return new TerminalRegistry({
+    tmux: defaultTmuxRunner(), tmuxAvailable: defaultTmuxAvailable(), store: new TerminalStore(pool), spawner,
+  });
 }
 
 async function main(): Promise<void> {
@@ -45,6 +53,14 @@ async function main(): Promise<void> {
     await pool.end();
     return;
   }
+
+  // The self-upgrade state machine survives exactly what it triggers — this
+  // process restarting. Finalize before serving: a "restarting" state means
+  // the restart landed (done); a leftover "running" means the previous
+  // process died before the hand-off (failed). Both facts then read from
+  // /api/v1/status → the hub's capabilities bag.
+  const upgrader = createUpgrader({ config });
+  upgrader.finalizeAtBoot();
 
   if (transport === 'gateway') {
     // Outbound-only transport: no HTTP listener, no pair token — enroll
@@ -70,7 +86,7 @@ async function main(): Promise<void> {
     if (!client) {
       logger.warn('OPENCODE_BASE_URL is unset — jobs will queue but never launch');
     }
-    const registry = buildTerminalRegistry();
+    const registry = buildTerminalRegistry(pool);
     const onError = (error: unknown): void => {
       logger.warn({ err: error }, 'worker error');
     };
@@ -91,7 +107,7 @@ async function main(): Promise<void> {
     process.once('SIGINT', () => void shutdown('SIGINT'));
 
     // Runs until a signal flips closing; reconnects internally forever.
-    await runGatewayLoop({ pool, config, engine, client, startedAt, registry }, config, {
+    await runGatewayLoop({ pool, config, engine, client, startedAt, registry, upgrader }, config, {
       logger, isStopped: () => closing,
     });
     return;
@@ -117,12 +133,12 @@ async function main(): Promise<void> {
   const app = Fastify({ logger: false });
   app.addHook('preHandler', createAuthHook(pool));
 
-  const registry = buildTerminalRegistry();
+  const registry = buildTerminalRegistry(pool);
   const onError = (error: unknown): void => {
     logger.warn({ err: error }, 'worker error');
   };
   const engine = new JobEngine({ pool, config, client, onError });
-  registerRoutes(app, { pool, config, engine, client, startedAt, registry });
+  registerRoutes(app, { pool, config, engine, client, startedAt, registry, upgrader });
   const stopWorker = startWorker(engine, { onError });
 
   await app.listen({ port: config.port, host: config.host });

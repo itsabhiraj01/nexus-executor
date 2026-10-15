@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify';
 import {
   healthPaired, jobSummary, MAX_MESSAGE_CHARS,
   opConfigPut, opCreateJob, opJobCancel, opJobEvents, opJobLog, opJobMerge,
-  opFsBrowse, opJobMessage, opJobVerify, opModels, opRepoInspect, opShowJob, opStatus, opWorkspaceSweep,
+  opFsBrowse, opJobMessage, opJobVerify, opModels, opRepoInspect, opShowJob, opStatus, opUpgrade, opWorkspaceSweep,
   opTerminalCreate, opTerminalDetach, opTerminalInput, opTerminalKill, opTerminalList, opTerminalOutput, opTerminalResize,
   type OpResult, type RouteDeps,
 } from './ops.js';
@@ -198,5 +198,12 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
   app.post('/api/v1/maintenance/workspace-sweep', { preHandler: limit(actionLimiter) }, async (request, reply) => {
     send(reply, await opWorkspaceSweep(deps, request.body));
+  });
+
+  /* executor.upgrade — hub-triggered self-upgrade (docs/remote-executors.md
+   * §Upgrading): what runs is operator-configured ON THE MACHINE, never
+   * carried by the request (empty body). */
+  app.post('/api/v1/upgrade', { preHandler: limit(actionLimiter) }, async (_request, reply) => {
+    send(reply, await opUpgrade(deps));
   });
 }

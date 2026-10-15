@@ -682,6 +682,42 @@ describe('in-job retries', () => {
   });
 });
 
+describe('native personas (model-policy era spec fields)', () => {
+  it('materializes a native persona (markdown + MCP) git-excluded and pins the session to it', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({
+      jobId: 'job-agent',
+      agent: {
+        name: 'Coder', opencodeAgent: 'nexus-coder-ab12cd34',
+        markdown: '---\ndescription: "Coder"\nmode: primary\n---\n\nYou code.\n\n## Your skills\n- `nexus-conventions` — rules\n',
+        mcp: { $schema: 'https://opencode.ai/config.json', mcp: { wiki: { type: 'remote', url: 'https://wiki.example/mcp', enabled: true } } },
+      },
+    }));
+    // The markdown lands where OpenCode discovers it; the session pins it.
+    const agentFile = join(job.worktreePath, '.opencode', 'agents', 'nexus-coder-ab12cd34.md');
+    expect(readFileSync(agentFile, 'utf8')).toContain('You code.');
+    expect(ctx.stub.sessions[0]).toMatchObject({ agent: 'nexus-coder-ab12cd34' });
+    // The MCP fragment merges into opencode.json (not clobbering policy keys).
+    const openConfig = JSON.parse(readFileSync(join(job.worktreePath, 'opencode.json'), 'utf8')) as { mcp: Record<string, unknown> };
+    expect(openConfig.mcp).toMatchObject({ wiki: { url: 'https://wiki.example/mcp' } });
+    // Both files are git-excluded: the safety-net commit sweeps neither.
+    await execGit(['add', '-A', '--', '.'], { cwd: job.worktreePath });
+    expect((await execGit(['status', '--porcelain'], { cwd: job.worktreePath })).stdout.trim()).toBe('');
+    expect((await execGit(['ls-files'], { cwd: job.worktreePath })).stdout).not.toContain('.opencode');
+    // …and the launch records the application.
+    const types = await eventTypes(pool, job.id);
+    expect(types).toContain(EVENT.AGENT_APPLIED);
+    await ctx.engine.cancel('job-agent');
+  });
+
+  it('pins no agent for legacy specs (prompt-tier persona folded by the hub)', async () => {
+    const ctx = makeEngine();
+    await runningJob(ctx, spec({ jobId: 'job-noagent' }));
+    expect(ctx.stub.sessions[0]).toMatchObject({ agent: null });
+    await ctx.engine.cancel('job-noagent');
+  });
+});
+
 describe('workspace retention', () => {
   it('flags aged terminal workspaces WITHOUT deleting them — validation only, notified exactly once', async () => {
     const ctx = makeEngine({ workspaceRetentionDays: 7 });

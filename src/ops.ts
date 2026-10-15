@@ -9,9 +9,12 @@ import {
   type JobSpecInput,
 } from './engine.js';
 import { parseModelRef, type OpenCodeClient } from './opencode.js';
+import type { ExecutorPolicySlice } from './model-policy.js';
 import { readJobLog } from './workspace.js';
 import { browseFolders, inspectRepository } from './fs-discovery.js';
 import { TerminalCapError, TerminalTmuxError, type TerminalRegistry } from './terminals.js';
+import { TerminalStoreError } from './terminal-store.js';
+import type { Upgrader } from './upgrade.js';
 
 /**
  * The executor's operation core, transport-agnostic: ONE implementation
@@ -34,6 +37,10 @@ export interface RouteDeps {
    *  main.ts always builds the registry (node-pty spawner + tmux runner);
    *  availability itself is probed lazily via `available()`. */
   registry: TerminalRegistry;
+  /** Hub-triggered self-upgrades (executor.upgrade op). Required: main.ts
+   *  always builds the upgrader (state on disk under data/); an
+   *  unconfigured machine answers opUpgrade with a plain 400. */
+  upgrader: Upgrader;
 }
 
 export interface OpResult {
@@ -130,13 +137,76 @@ export function validateJobBody(body: unknown): { spec?: JobSpecInput; error?: s
 
   let models: string[] = [];
   if (input.models !== undefined && input.models !== null) {
-    if (!Array.isArray(input.models) || input.models.length > 5) return { error: 'models must be an array of ≤ 5 entries.' };
+    if (!Array.isArray(input.models) || input.models.length > 6) return { error: 'models must be an array of ≤ 6 entries.' };
     for (const entry of input.models) {
       if (typeof entry !== 'string' || !parseModelRef(entry)) {
         return { error: `models entries must be 'provider/model' strings (got ${JSON.stringify(entry)}).` };
       }
       models.push(entry.trim());
     }
+  }
+
+  // The agent-derived model policy the hub ships with strict jobs (its
+  // agents ARE the model configuration). Validated structurally; the
+  // engine writes+proves it on the job worktree before the session starts.
+  let modelPolicy: JobSpecInput['modelPolicy'] = null;
+  if (input.modelPolicy !== undefined && input.modelPolicy !== null) {
+    if (typeof input.modelPolicy !== 'object' || Array.isArray(input.modelPolicy)) {
+      return { error: 'modelPolicy must be an object or null.' };
+    }
+    const raw = input.modelPolicy as Record<string, unknown>;
+    const strings = (value: unknown, key: string, max: number): string[] | string => {
+      if (!Array.isArray(value) || value.length < 1 || value.length > max) {
+        return `modelPolicy.${key} must be an array of 1–${max} strings.`;
+      }
+      for (const entry of value) {
+        if (typeof entry !== 'string' || !entry.trim() || entry.length > 300) {
+          return `modelPolicy.${key} entries must be non-empty strings ≤ 300 chars.`;
+        }
+      }
+      return value.map((entry) => (entry as string).trim());
+    };
+    const providers = strings(raw.providers, 'providers', 12);
+    if (typeof providers === 'string') return { error: providers };
+    const policyModels = strings(raw.models, 'models', 12);
+    if (typeof policyModels === 'string') return { error: policyModels };
+    const agents = Array.isArray(raw.agents) ? raw.agents : null;
+    if (!agents || agents.length < 1 || agents.length > 8) {
+      return { error: 'modelPolicy.agents must be an array of 1–8 entries.' };
+    }
+    modelPolicy = {
+      providers,
+      models: policyModels,
+      agents: agents.map((agent) => agent as ExecutorPolicySlice),
+    };
+  }
+
+  // The pre-rendered native persona (hub ≥ nativeAgents capability): the
+  // engine materializes it into the job's worktree before the first session
+  // and pins the session to it. Structurally validated; legacy jobs (absent
+  // /null) run prompt-tier as before.
+  let agent: JobSpecInput['agent'] = null;
+  if (input.agent !== undefined && input.agent !== null) {
+    if (typeof input.agent !== 'object' || Array.isArray(input.agent)) {
+      return { error: 'agent must be an object or null.' };
+    }
+    const raw = input.agent as Record<string, unknown>;
+    const name = asTrimmedString(raw.name, 200);
+    const opencodeAgent = asTrimmedString(raw.opencodeAgent, 200);
+    if (!name) return { error: 'agent.name is required (non-empty string, ≤ 200 chars).' };
+    if (!opencodeAgent || !/^[a-z0-9-]+$/.test(opencodeAgent)) {
+      return { error: 'agent.opencodeAgent is required (lowercase slug string, ≤ 200 chars).' };
+    }
+    if (typeof raw.markdown !== 'string' || !raw.markdown.trim() || raw.markdown.length > 100_000) {
+      return { error: 'agent.markdown is required (non-empty string, ≤ 100k chars) — the rendered OpenCode project-agent file.' };
+    }
+    let mcp: Record<string, unknown> | null = null;
+    if (raw.mcp !== undefined && raw.mcp !== null) {
+      if (typeof raw.mcp !== 'object' || Array.isArray(raw.mcp)) return { error: 'agent.mcp must be an object or null.' };
+      if (JSON.stringify(raw.mcp).length > 65_536) return { error: 'agent.mcp must serialize to ≤ 64 KB.' };
+      mcp = raw.mcp as Record<string, unknown>;
+    }
+    agent = { name, opencodeAgent, markdown: raw.markdown, mcp };
   }
 
   // The in-job retry budget the hub resolved (project → settings → env
@@ -198,6 +268,8 @@ export function validateJobBody(body: unknown): { spec?: JobSpecInput; error?: s
       verificationCommand: typeof input.verificationCommand === 'string' ? input.verificationCommand : '',
       project,
       models,
+      modelPolicy,
+      agent,
       attachments,
       retry,
     },
@@ -242,9 +314,36 @@ export async function opStatus(deps: RouteDeps): Promise<OpResult> {
       // arm its cross-run auto-retry for those failures — the budgets
       // would multiply).
       capabilities: executorCapabilities(deps.config),
+      // The self-upgrade state machine (unified lineage): phase, error and
+      // a bounded log tail — the hub folds it into its capabilities bag so
+      // the console renders upgrade progress with zero new hub schema.
+      upgrade: deps.upgrader.status(),
       uptimeSeconds: Math.floor((Date.now() - deps.startedAt) / 1000),
     },
   };
+}
+
+/* ── POST /api/v1/upgrade (executor.upgrade) — hub-triggered self-upgrade ──
+ * The hub asks; the machine owns what runs (upgrade.ts). Refusals: 400 not
+ * configured, 409 active jobs, 409 an upgrade already in flight. */
+export async function opUpgrade(deps: RouteDeps): Promise<OpResult> {
+  if (!deps.upgrader.configured()) {
+    return {
+      status: 400,
+      body: { error: 'Executor upgrades are not configured on this machine — set EXECUTOR_UPGRADE_COMMAND, or EXECUTOR_REPO_DIR to use the shipped self-upgrade script (docs/remote-executors.md §Upgrading).' },
+    };
+  }
+  const { rows } = await deps.pool.query<{ active: number }>(`
+    SELECT count(*)::int AS active
+    FROM executor.jobs
+    WHERE status IN ('created', 'running', 'verifying', 'waiting_for_user')`);
+  const active = rows[0]?.active ?? 0;
+  if (active > 0) {
+    return { status: 409, body: { error: `The executor is carrying ${active} active job(s) — upgrade when it is idle.`, activeJobs: active } };
+  }
+  const outcome = deps.upgrader.start();
+  if (!outcome.ok) return { status: outcome.statusCode ?? 500, body: { error: outcome.error ?? 'The upgrade could not start.' } };
+  return { status: 200, body: { ok: true, upgrade: outcome.status } };
 }
 
 export async function opModels(deps: RouteDeps, directory: string | undefined): Promise<OpResult> {
@@ -489,6 +588,9 @@ function terminalNotFound(id: string): OpResult {
 function terminalErrorResult(error: unknown): OpResult {
   if (error instanceof TerminalCapError) return { status: 429, body: { error: error.message } };
   if (error instanceof TerminalTmuxError) return { status: 502, body: { error: error.message } };
+  // Durable-store (registration persistence) failures: 502 — an unhealthy
+  // dependency the hub should keep retrying, not a user mistake.
+  if (error instanceof TerminalStoreError) return { status: 502, body: { error: error.message } };
   throw error;
 }
 
@@ -520,8 +622,13 @@ export async function opTerminalCreate(deps: RouteDeps, body: unknown): Promise<
 export async function opTerminalList(deps: RouteDeps): Promise<OpResult> {
   const unready = await terminalsReady(deps);
   if (unready) return unready;
-  const { sessions } = await deps.registry.list();
-  return { status: 200, body: { sessions } };
+  // list() IS the sync: every call reconciles a full tmux-server inventory
+  // (manual sessions imported, vanished sessions tombstoned) before
+  // answering. Throwing paths map to the contract (502 scan/store failure).
+  try {
+    const { sessions } = await deps.registry.list();
+    return { status: 200, body: { sessions } };
+  } catch (error) { return terminalErrorResult(error); }
 }
 
 export async function opTerminalInput(deps: RouteDeps, id: string, body: unknown): Promise<OpResult> {
@@ -564,7 +671,10 @@ export async function opTerminalOutput(
   }
   const waitMs = Math.min(Math.max(Number(query.waitMs ?? 0) || 0, 0), MAX_TERMINAL_HOLD_MS);
   const attach = query.attach === '1' || query.attach === 'true' || query.attach === true;
-  const res = await deps.registry.read(id, sinceSeq, waitMs, attach);
+  let res;
+  try {
+    res = await deps.registry.read(id, sinceSeq, waitMs, attach);
+  } catch (error) { return terminalErrorResult(error); }
   if (!res) return terminalNotFound(id);
   return {
     status: 200,
@@ -653,6 +763,8 @@ export async function handleGatewayOperation(
       }
       case 'config.put':
         return wrap(await opConfigPut(deps, payload));
+      case 'executor.upgrade':
+        return wrap(await opUpgrade(deps));
       case 'terminal.create':
         return wrap(await opTerminalCreate(deps, body));
       case 'terminal.list':

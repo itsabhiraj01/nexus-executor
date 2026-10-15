@@ -1,15 +1,17 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
 import { createAuthHook, hashToken, writeAuthConfig } from './auth.js';
-import { EXECUTOR_VERSION } from './config.js';
 import { createPool, runModuleMigrations, defaultMigrationsDir } from './db.js';
 import { JobEngine } from './engine.js';
+import { EXECUTOR_VERSION } from './config.js';
 import { claimPairing, PairingError } from './pairing.js';
 import { registerRoutes } from './routes.js';
+import type { TerminalRegistry } from './terminals.js';
+import { createUpgrader, type UpgradeSpawn } from './upgrade.js';
 import { testConfig, wipeJobs } from './testkit.js';
 
 /**
@@ -26,6 +28,28 @@ let app: FastifyInstance;
 let engine: JobEngine;
 let root: string;
 
+/** Jobs-route suite never exercises terminal.* ops: an always-off stub. */
+function fakeRegistry(): TerminalRegistry {
+  return {
+    available: async () => false,
+    create: async () => { throw new Error('jobs suite never creates terminals'); },
+    list: async () => ({ sessions: [] }),
+    input: () => 'not_found',
+    resize: () => 'not_found',
+    detach: () => 'not_found',
+    read: async () => null,
+    kill: async () => 'ok' as const,
+    stopAll: async () => undefined,
+  } as unknown as TerminalRegistry;
+}
+
+/** The upgrade op's spawn seam: tests arm/disarm the configured command on
+ *  the shared config object and steer failure through `spawnFailure`. */
+let spawnCalls: { file: string; args: string[]; env: NodeJS.ProcessEnv }[] = [];
+let spawnFailure: Error | null = null;
+let upgraderPaths: { stateFile: string; logFile: string };
+let suiteConfig: ReturnType<typeof testConfig>;
+
 beforeAll(async () => {
   pool = createPool(process.env.DATABASE_URL!);
   await pool.query('DROP SCHEMA IF EXISTS executor CASCADE');
@@ -33,10 +57,18 @@ beforeAll(async () => {
   await runModuleMigrations(pool, 'executor', 'executor', defaultMigrationsDir());
   root = mkdtempSync(join(tmpdir(), 'nexus-exec-routes-'));
   const config = testConfig(join(root, 'workspaces'));
+  suiteConfig = config;
   engine = new JobEngine({ pool, config, client: null });
+  const spawnImpl: UpgradeSpawn = (file, args, options) => {
+    if (spawnFailure) throw spawnFailure;
+    spawnCalls.push({ file, args: [...args], env: options.env });
+    return { pid: 31337, unref() {} };
+  };
+  upgraderPaths = { stateFile: join(root, 'upgrade-state.json'), logFile: join(root, 'upgrade.log') };
+  const upgrader = createUpgrader({ config, stateFile: upgraderPaths.stateFile, logFile: upgraderPaths.logFile, spawnImpl });
   app = Fastify({ logger: false });
   app.addHook('preHandler', createAuthHook(pool));
-  registerRoutes(app, { pool, config, engine, client: null, startedAt: Date.now() });
+  registerRoutes(app, { pool, config, engine, client: null, startedAt: Date.now(), registry: fakeRegistry(), upgrader });
   await app.ready();
 });
 
@@ -99,7 +131,7 @@ describe('pairing claim', () => {
     expect(outcome).toMatchObject({ alreadyPaired: false, id: 'exec-1', name: 'office-box', hubUrl: 'http://hub.local' });
     expect(claimed).toMatchObject({
       code: 'CODE-123', name: 'office-box', url: 'http://exec.local:4099',
-      capabilities: { jobRetries: true, modelFallback: true },
+      capabilities: { jobRetries: true, modelFallback: true, terminals: true, terminalSync: true },
     });
 
     const { rows } = await pool.query<{ value: { tokenHash: string; hubUrl: string } }>(
@@ -144,7 +176,7 @@ describe('paired executor', () => {
       jobs: { active: 0, queued: 0, total: 0 },
       // The hub gates its own auto-retry on jobRetries (an executor that
       // retries in-job must never also be retried by the hub).
-      capabilities: { jobRetries: true, modelFallback: true },
+      capabilities: { jobRetries: true, modelFallback: true, terminals: true, terminalSync: true },
     });
     expect(typeof ok.json().uptimeSeconds).toBe('number');
 
@@ -322,7 +354,83 @@ describe('paired executor', () => {
     expect(models.statusCode).toBe(503);
     expect(models.json()).toEqual({ error: 'OpenCode is not configured' });
   });
+});
 
+describe('POST /api/v1/upgrade (self-upgrade op)', () => {
+  beforeEach(() => {
+    spawnCalls = [];
+    spawnFailure = null;
+    suiteConfig.upgradeCommand = null;
+    suiteConfig.upgradeRepoDir = null;
+    rmSync(upgraderPaths.stateFile, { force: true });
+    rmSync(upgraderPaths.logFile, { force: true });
+  });
+
+  it('needs the paired token', async () => {
+    expect((await app.inject({ method: 'POST', url: '/api/v1/upgrade' })).statusCode).toBe(401);
+  });
+
+  it('answers 400 with an actionable hint when upgrades are not configured', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/v1/upgrade', headers: auth() });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toMatch(/EXECUTOR_UPGRADE_COMMAND|EXECUTOR_REPO_DIR/);
+  });
+
+  it('the status body reports the upgrade block and (un)advertised selfUpgrade capability', async () => {
+    const unconfigured = await app.inject({ method: 'GET', url: '/api/v1/status', headers: auth() });
+    expect(unconfigured.json().capabilities.selfUpgrade).toBeUndefined();
+    expect(unconfigured.json().upgrade).toMatchObject({ phase: 'idle', error: null });
+
+    suiteConfig.upgradeCommand = 'make upgrade';
+    const configured = await app.inject({ method: 'GET', url: '/api/v1/status', headers: auth() });
+    expect(configured.json().capabilities.selfUpgrade).toBe(true);
+  });
+
+  it('refuses while the executor carries active jobs (409); queued rows do NOT block', async () => {
+    suiteConfig.upgradeCommand = 'make upgrade';
+    await app.inject({ method: 'POST', url: '/api/v1/jobs', headers: auth(), payload: validJob({ jobId: 'job-blocks-upgrade' }) });
+    // Queued alone: durable rows that simply start after the restart — no refusal.
+    const queuedOk = await app.inject({ method: 'POST', url: '/api/v1/upgrade', headers: auth() });
+    expect(queuedOk.statusCode).toBe(200);
+    rmSync(upgraderPaths.stateFile, { force: true });
+    spawnCalls = [];
+
+    // A job actually in flight (running) blocks it.
+    await pool.query(`UPDATE executor.jobs SET status = 'running' WHERE hub_job_id = 'job-blocks-upgrade'`);
+    const res = await app.inject({ method: 'POST', url: '/api/v1/upgrade', headers: auth() });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toMatch(/active job/i);
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it('200s idle: spawns the command detached, reports the running state', async () => {
+    suiteConfig.upgradeCommand = 'make upgrade';
+    const res = await app.inject({ method: 'POST', url: '/api/v1/upgrade', headers: auth() });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ ok: true, upgrade: { phase: 'running', pid: 31337, command: 'make upgrade' } });
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]).toMatchObject({ file: 'bash', args: ['-c', 'make upgrade'] });
+    expect(spawnCalls[0]!.env.EXECUTOR_UPGRADE_STATE_FILE).toBe(upgraderPaths.stateFile);
+
+    // …and the single-flight lock now refuses duplicates.
+    const again = await app.inject({ method: 'POST', url: '/api/v1/upgrade', headers: auth() });
+    expect(again.statusCode).toBe(409);
+    expect(again.json().error).toMatch(/already running/i);
+    expect(spawnCalls).toHaveLength(1);
+  });
+
+  it('surfaces a spawn failure as 500 + a failed state (not a wedge)', async () => {
+    suiteConfig.upgradeCommand = 'make upgrade';
+    spawnFailure = new Error('no bash here');
+    const res = await app.inject({ method: 'POST', url: '/api/v1/upgrade', headers: auth() });
+    expect(res.statusCode).toBe(500);
+    expect(res.json().error).toContain('no bash here');
+    const state = JSON.parse(readFileSync(upgraderPaths.stateFile, 'utf8')) as { phase: string };
+    expect(state.phase).toBe('failed');
+  });
+});
+
+describe('discovery routes', () => {
   it('fs/browse lists subdirectories with the soft-error contract', async () => {
     const base = join(root, 'browse-me');
     mkdirSync(join(base, 'alpha'), { recursive: true });
