@@ -1,8 +1,8 @@
 {
   "name": "nexus-executor",
-  "version": "0.3.1",
+  "version": "1.0.0",
   "private": true,
-  "description": "Standalone remote job runner for the Nexus hub — receives build jobs over authenticated HTTP and drives a local OpenCode V2 server in isolated git worktrees.",
+  "description": "The Nexus executor — remote job runner for the hub: receives build jobs over authenticated HTTP (direct) or the gateway WebSocket and drives a local OpenCode V2 server in isolated git worktrees. 1.0.0 unifies the two diverged lineages (this repo's 0.3.x + the hub monorepo's 0.4/0.5): model policy, native personas, terminal-store sync, self-upgrades, discovery + project registry, per-run private test databases.",
   "type": "module",
   "engines": {
     "node": ">=22"
