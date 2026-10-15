@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MemorySaver } from '@langchain/langgraph';
-import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import { ToolMessage } from '@langchain/core/messages';
 import { startHarnessRun, type HarnessDriver } from './agent.js';
 import { ScriptedChatModel, type ScriptStep } from './fake-model.js';
 import { resolveLimits } from './limits.js';
@@ -115,5 +115,56 @@ describe('startHarnessRun (Deep Agents + scripted model)', () => {
     const events = await collectUntil(driver.events, (e) => e.type === 'error');
     const error = events.find((e) => e.type === 'error');
     expect(error).toMatchObject({ type: 'error', code: 'cancelled' });
+  });
+
+  it('completion.summary is the accumulated response, not the last delta (review I4)', async () => {
+    const dir = scratch();
+    const { driver } = makeDriver([{ kind: 'text_chunks', chunks: ['Hello', ', ', 'world'] }], dir);
+
+    const events = await collectUntil(driver.events, (e) => e.type === 'completion');
+    const texts = events.filter((e) => e.type === 'text').map((e) => (e as { text: string }).text);
+    // Whatever the chunk granularity (merged here, per-token on a real
+    // provider), joined deltas must equal the run's words — and the summary
+    // must equal ALL of them, not the last delta (the pre-fix behavior).
+    expect(texts.join('')).toBe('Hello, world');
+    expect(events.at(-1)).toMatchObject({ type: 'completion', summary: 'Hello, world' });
+  });
+
+  it('a checkpoint-discovery failure is a VISIBLE error, never a silent fresh run (review I2)', async () => {
+    class FlakySaver extends MemorySaver {
+      override async *list(...args: unknown[]): AsyncGenerator<never> {
+        void args;
+        throw new Error('pg connection reset mid-discovery');
+      }
+    }
+    const model = new ScriptedChatModel([{ kind: 'text', text: 'must never start' }]);
+    const driver = startHarnessRun({
+      threadId: `flaky-${Date.now()}`, prompt: 'Do the task.', model,
+      workspaceDir: scratch(), limits: resolveLimits(),
+      checkpointer: new FlakySaver(),
+    });
+
+    const events = await collectUntil(driver.events, (e) => e.type === 'error');
+    const error = events.find((e) => e.type === 'error');
+    expect(error).toMatchObject({ type: 'error', code: 'model_error' });
+    expect((error as { message?: string }).message).toContain('pg connection reset');
+    expect(model.calls.length).toBe(0);
+  });
+
+  it('a watchdog timeout KILLS the in-flight tool — not just the consumer (review I3)', async () => {
+    const dir = scratch();
+    const { driver } = makeDriver([
+      { kind: 'tool_call', name: 'run_command', args: { command: 'echo $$ > pid.txt; exec sleep 60' } },
+      { kind: 'text', text: 'unreachable' },
+    ], dir, { limits: { turnCapMs: 400, toolDefaultMs: 30_000 } });
+
+    const events = await collectUntil(driver.events, (e) => e.type === 'error');
+    expect(events.find((e) => e.type === 'error')).toMatchObject({ type: 'error', code: 'watchdog_timeout' });
+
+    // The run's abort raced into the tool wrapper; the group must be reaped.
+    await new Promise((r) => setTimeout(r, 1_500));
+    const pid = Number(readFileSync(join(dir, 'pid.txt'), 'utf8').trim());
+    expect(Number.isInteger(pid)).toBe(true);
+    expect(() => process.kill(pid, 0)).toThrowError(/ESRCH/);
   });
 });

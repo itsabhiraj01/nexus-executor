@@ -1,3 +1,4 @@
+import { getEventListeners } from 'node:events';
 import { describe, expect, it } from 'vitest';
 import { watchStream, WatchdogAbort, WatchdogTimeout } from './watchdog.js';
 
@@ -81,6 +82,17 @@ describe('watchStream', () => {
     expect((error as WatchdogTimeout).kind).toBe('total');
     expect(items.length).toBeLessThanOrEqual(5);
     expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  it('does not accumulate abort listeners across chunks', async () => {
+    const controller = new AbortController();
+    const out = await collect(watchStream(
+      drip(3, Array.from({ length: 25 }, (_, i) => i)),
+      { firstChunkMs: 500, chunkGapMs: 500, totalMs: 5_000 },
+      controller.signal,
+    ));
+    expect(out).toHaveLength(25);
+    expect(getEventListeners(controller.signal, 'abort')).toEqual([]);
   });
 
   it('honors an external AbortSignal distinctly from timeouts', async () => {

@@ -50,6 +50,18 @@ export async function* watchStream<T>(
   const startedAt = Date.now();
   let first = true;
 
+  // ONE abort promise for the whole stream (a per-chunk listener would
+  // accumulate: N chunks = N listeners on the run's shared signal), and it is
+  // removed on exit — `once: true` only self-removes WHEN FIRED, so a never-
+  // aborted run would otherwise leave it parked on the long-lived controller.
+  let onAbort: (() => void) | null = null;
+  const abortPromise = signal
+    ? new Promise<RaceOutcome<T>>((resolve) => {
+      onAbort = () => resolve({ kind: 'aborted' });
+      signal.addEventListener('abort', onAbort, { once: true });
+    })
+    : null;
+
   try {
     for (;;) {
       const gapBudget = first ? budgets.firstChunkMs : budgets.chunkGapMs;
@@ -70,12 +82,7 @@ export async function* watchStream<T>(
           }, Math.min(gapBudget, totalLeft));
         }),
       ];
-      if (signal) {
-        racers.push(new Promise<RaceOutcome<T>>((resolve) => {
-          if (signal.aborted) queueMicrotask(() => resolve({ kind: 'aborted' }));
-          else signal.addEventListener('abort', () => resolve({ kind: 'aborted' }), { once: true });
-        }));
-      }
+      if (abortPromise) racers.push(abortPromise);
       const outcome = await Promise.race(racers).finally(() => {
         if (timer) clearTimeout(timer);
       });
@@ -93,6 +100,7 @@ export async function* watchStream<T>(
       yield outcome.result.value;
     }
   } finally {
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
     // Any exit path — exhaustion, our own throw, consumer break — closes the
     // source rather than orphaning it.
     await iterator.return?.();

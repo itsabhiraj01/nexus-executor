@@ -26,12 +26,18 @@ export async function createCheckpointer(databaseUrl: string, schema: string): P
     throw new Error(`Checkpoint schema must be a plain identifier, got ${JSON.stringify(schema)}`);
   }
   const pool = new Pool({ connectionString: databaseUrl, max: 2 });
-  await pool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
-  const saver = new PostgresSaver(pool, undefined, { schema });
-  await saver.setup();
-  return {
-    saver,
-    query: (text, params) => pool.query(text, params as never[] | undefined),
-    close: () => pool.end(),
-  };
+  try {
+    await pool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
+    const saver = new PostgresSaver(pool, undefined, { schema });
+    await saver.setup();
+    return {
+      saver,
+      query: (text, params) => pool.query(text, params as never[] | undefined),
+      close: () => pool.end(),
+    };
+  } catch (error) {
+    // A failed setup must not orphan the pool on a long-lived executor.
+    await pool.end().catch(() => {});
+    throw error;
+  }
 }

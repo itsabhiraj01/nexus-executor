@@ -62,7 +62,10 @@ export function resolveModel(
     model: ref.model,
     apiKey: provider.apiKey ?? 'unused',
     configuration: { baseURL: provider.baseUrl },
-    timeout: opts?.timeoutMs ?? 120_000,
+    // Must EXCEED the watchdog first-chunk budget or the client cancels
+    // first and a watchdog-shaped failure reports as a bare HTTP timeout
+    // (README §Task 7 coherence rule). 180 s > the 120 s default budget.
+    timeout: opts?.timeoutMs ?? 180_000,
     maxRetries: 0,
   });
 }

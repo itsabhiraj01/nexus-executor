@@ -68,7 +68,49 @@ function scrubbedEnv(spec: SupervisedCommandSpec): NodeJS.ProcessEnv {
 export async function runSupervisedCommand(spec: SupervisedCommandSpec): Promise<CommandResult> {
   const startedAt = Date.now();
   return new Promise<CommandResult>((resolve) => {
-    let child: ChildProcess;
+    // All state/helpers exist BEFORE the spawn attempt: a synchronous spawn
+    // throw must be able to settle('spawn_error') without touching
+    // uninitialized bindings (review finding — TDZ landmine on that path).
+    let child: ChildProcess | undefined;
+    let settled = false;
+    let timedOut = false;
+    let aborted = false;
+    let truncated = false;
+    let tailTotal = 0;
+    const tail: Buffer[] = [];
+    let killArmed = false;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const killGroup = (signal: NodeJS.Signals): void => {
+      try { if (child?.pid) process.kill(-child.pid, signal); } catch { /* group gone */ }
+    };
+
+    const armKill = (): void => {
+      if (killArmed || settled) return;
+      killArmed = true;
+      killGroup('SIGTERM');
+      setTimeout(() => killGroup('SIGKILL'), KILL_GRACE_MS).unref();
+    };
+
+    const onAbort = (): void => {
+      aborted = true;
+      armKill();
+    };
+
+    function settle(outcome: CommandOutcome, code: number | null = null): void {
+      if (settled) return;
+      settled = true;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      spec.signal?.removeEventListener('abort', onAbort);
+      child?.stdout?.destroy();
+      child?.stderr?.destroy();
+      resolve({
+        outcome, code,
+        output: Buffer.concat(tail).toString('utf8'),
+        truncated, durationMs: Date.now() - startedAt,
+      });
+    }
+
     try {
       child = spawn('/bin/sh', ['-c', spec.command], {
         cwd: spec.cwd, env: scrubbedEnv(spec),
@@ -80,13 +122,6 @@ export async function runSupervisedCommand(spec: SupervisedCommandSpec): Promise
       return;
     }
 
-    let settled = false;
-    let timedOut = false;
-    let aborted = false;
-    let truncated = false;
-    let tailTotal = 0;
-    const tail: Buffer[] = [];
-
     const pushChunk = (chunk: Buffer): void => {
       spec.onOutput?.(chunk.toString('utf8'));
       tail.push(chunk);
@@ -96,7 +131,7 @@ export async function runSupervisedCommand(spec: SupervisedCommandSpec): Promise
         truncated = true;
       }
       if (tailTotal > spec.maxOutputBytes && tail.length === 1) {
-        tail[0] = tail[0]!.subarray(tailTotal - spec.maxOutputBytes);
+        tail[0] = Buffer.from(tail[0]!.subarray(tailTotal - spec.maxOutputBytes));
         tailTotal = spec.maxOutputBytes;
         truncated = true;
       }
@@ -104,44 +139,14 @@ export async function runSupervisedCommand(spec: SupervisedCommandSpec): Promise
     child.stdout?.on('data', pushChunk);
     child.stderr?.on('data', pushChunk);
 
-    const killGroup = (signal: NodeJS.Signals): void => {
-      try { if (child.pid) process.kill(-child.pid, signal); } catch { /* group gone */ }
-    };
-
-    let killArmed = false;
-    const armKill = (): void => {
-      if (killArmed || settled) return;
-      killArmed = true;
-      killGroup('SIGTERM');
-      setTimeout(() => killGroup('SIGKILL'), KILL_GRACE_MS).unref();
-    };
-
-    const timeoutTimer = setTimeout(() => {
+    timeoutTimer = setTimeout(() => {
       timedOut = true;
       armKill();
     }, spec.timeoutMs);
     timeoutTimer.unref?.();
 
-    const onAbort = (): void => {
-      aborted = true;
-      armKill();
-    };
     if (spec.signal?.aborted) onAbort();
     else spec.signal?.addEventListener('abort', onAbort, { once: true });
-
-    function settle(outcome: CommandOutcome, code: number | null = null): void {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutTimer);
-      spec.signal?.removeEventListener('abort', onAbort);
-      child.stdout?.destroy();
-      child.stderr?.destroy();
-      resolve({
-        outcome, code,
-        output: Buffer.concat(tail).toString('utf8'),
-        truncated, durationMs: Date.now() - startedAt,
-      });
-    }
 
     child.on('error', () => settle('spawn_error'));
     child.on('exit', (code) => {

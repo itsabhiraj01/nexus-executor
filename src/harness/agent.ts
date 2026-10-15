@@ -58,6 +58,9 @@ class PushChannel<T> implements AsyncIterable<T> {
   private failure: unknown = null;
 
   push(value: T): void {
+    // Closed channels accept NOTHING: outliving work (a tool wrapper racing
+    // run teardown) must not become an unbounded in-memory sink.
+    if (this.closed) return;
     const waiter = this.waiters.shift();
     if (waiter) waiter({ value, done: false });
     else this.queued.push(value);
@@ -99,6 +102,11 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
   const abort = new AbortController();
   let answerPending: PendingAnswer | null = null;
   let toolCounter = 0;
+  // Accumulated text of the CURRENT model response. Streamed token.text
+  // values are DELTAS — the completion summary is the accumulation, reset at
+  // each tool result and each new stream (a tool result means the NEXT
+  // response supersedes anything said before it).
+  let lastText = '';
 
   const emit = (event: HarnessEvent): void => {
     if (!abort.signal.aborted || event.type === 'error') events.push(event);
@@ -120,6 +128,7 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
         outcome: result.outcome === 'spawn_error' ? 'error' : result.outcome,
         output: result.output.slice(-2_000), durationMs: result.durationMs,
       });
+      lastText = '';
       return `outcome: ${result.outcome}${result.code === null ? '' : ` (exit ${result.code})`}\n${result.output}`;
     },
     {
@@ -164,30 +173,31 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
    * recomputes a different one — the write itself is the durable record
    * (Task 6 finding, recorded in README). */
   async function findAskInterrupt(): Promise<string | null> {
-    try {
-      // list() is DESC by checkpoint id → the newest position is first. (It
-      // also faithfully carries the interrupt write that getTuple() muted out
-      // of its pendingWrites — Task 6 discovery, recorded in README.)
-      for await (const tuple of checkpointer.list({ configurable: { thread_id: config.threadId } } as never, { limit: 1 } as never)) {
-        const writes = ((tuple as unknown as { pendingWrites?: unknown }).pendingWrites ?? []) as Array<[string, string, unknown]>;
-        for (const [, channel, value] of writes) {
-          if (channel !== '__interrupt__') continue;
-          const payload = (value as { value?: unknown } | null)?.value;
-          if (payload && typeof payload === 'object'
-            && (payload as { type?: unknown }).type === 'ask_user'
-            && typeof (payload as { question?: unknown }).question === 'string') {
-            return (payload as { question: string }).question;
-          }
+    // NO catch-all here: only "zero tuples" means fresh. Swallowing read
+    // errors (dropped pg connection, timeout) as "fresh" would re-send the
+    // prompt onto an interrupted thread — the parked question becomes
+    // unanswerable and the model re-runs prior side effects (review finding:
+    // the one real lost-answer path). A failure here propagates to the
+    // run's error event instead — a VISIBLE failure beats a silent lie.
+    // list() is DESC by checkpoint id → the newest position is first. (It
+    // also faithfully carries the interrupt write that getTuple() muted out
+    // of its pendingWrites — Task 6 discovery, recorded in README.)
+    for await (const tuple of checkpointer.list({ configurable: { thread_id: config.threadId } } as never, { limit: 1 } as never)) {
+      const writes = ((tuple as unknown as { pendingWrites?: unknown }).pendingWrites ?? []) as Array<[string, string, unknown]>;
+      for (const [, channel, value] of writes) {
+        if (channel !== '__interrupt__') continue;
+        const payload = (value as { value?: unknown } | null)?.value;
+        if (payload && typeof payload === 'object'
+          && (payload as { type?: unknown }).type === 'ask_user'
+          && typeof (payload as { question?: unknown }).question === 'string') {
+          return (payload as { question: string }).question;
         }
       }
-    } catch {
-      // No checkpoint yet (fresh thread) — start with the prompt.
     }
     return null;
   }
 
   async function runLoop(): Promise<void> {
-    let lastText = '';
     let questionCounter = 0;
     let sawInterrupt = false;
     const waitForAnswer = (questionId: string): Promise<string> =>
@@ -205,11 +215,11 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
         const qid = `q${++questionCounter}`;
         emit({ type: 'question', questionId: qid, text: rejoinedQuestion });
         input = new Command({ resume: { text: await waitForAnswer(qid) } });
-        answerPending = null;
       } else {
         input = { messages: [new HumanMessage(config.prompt)] };
       }
       for (;;) {
+        lastText = '';
         // Deep Agents' compiled-graph generics encode THEIR agent config; the
         // adapter intentionally treats the stream opaquely (tuple parsing is
         // validated at runtime below), hence the localized casts.
@@ -234,7 +244,8 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
           if (mode === 'messages') {
             const [token] = data as [{ getType?: () => string; text?: string; usage_metadata?: { input_tokens?: number; output_tokens?: number } }, unknown];
             if (token && typeof token.text === 'string' && token.text && token.getType?.() === 'ai') {
-              lastText = token.text;
+              // Deltas accumulate into the running response's text.
+              lastText += token.text;
               emit({ type: 'text', text: token.text });
             }
             const usage = token?.usage_metadata;
@@ -260,18 +271,22 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
         // consumer can act on it (restart-discovery race, Task 6 finding).
         emit({ type: 'question', questionId: pending, text: pendingText });
         const text = await waitForAnswer(pending);
-        answerPending = null;
         input = new Command({ resume: { text } });
       }
       if (lastText) emit({ type: 'completion', summary: lastText });
       else if (!sawInterrupt) emit({ type: 'error', code: 'unknown', message: 'The agent run ended without a completion message.' });
     } catch (error) {
       answerPending?.reject(error instanceof Error ? error : new Error(String(error)));
-      if (error instanceof WatchdogAbort || abort.signal.aborted) {
-        emit({ type: 'error', code: 'cancelled', message: 'Run cancelled.' });
-      } else if (error instanceof WatchdogTimeout) {
+      // EVERY terminal failure tears the run down: a watchdog timeout (or any
+      // other error) kills in-flight tools and the graph exactly like a
+      // cancel — never leave work running after the run was declared dead.
+      // `wasAborted` is captured BEFORE the teardown so error classification
+      // can still tell a user-cancel apart from a watchdog/model failure.
+      const wasAborted = abort.signal.aborted;
+      if (!wasAborted) abort.abort();
+      if (error instanceof WatchdogTimeout) {
         emit({ type: 'error', code: 'watchdog_timeout', message: `Model stream watchdog: ${error.kind}` });
-      } else if (abort.signal.aborted) {
+      } else if (error instanceof WatchdogAbort || wasAborted) {
         emit({ type: 'error', code: 'cancelled', message: 'Run cancelled.' });
       } else {
         emit({ type: 'error', code: 'model_error', message: error instanceof Error ? error.message : String(error) });
@@ -287,13 +302,17 @@ export function startHarnessRun(config: HarnessRunConfig): HarnessDriver {
     events,
     answer(questionId, text) {
       if (answerPending && answerPending.questionId === questionId) {
-        answerPending.resolve(text);
+        const slot = answerPending;
+        answerPending = null;
+        slot.resolve(text);
         return true;
       }
       return false;
     },
     async cancel() {
-      answerPending?.reject(new WatchdogAbort());
+      const slot = answerPending;
+      answerPending = null;
+      slot?.reject(new WatchdogAbort());
       if (!abort.signal.aborted) abort.abort();
     },
   };

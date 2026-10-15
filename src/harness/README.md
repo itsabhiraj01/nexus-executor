@@ -146,9 +146,11 @@ surface moved yet, by design.
       interrupts resume across a REAL Postgres restart with exactly-once
       replies; adapter construction is failure-clean (error events, never
       silent wedging).
-- [x] New limits with sane clamps (`limits.ts`: tool 10 s–50 min,
-      watchdog gaps, 30-min turn cap, 256 KiB output, ≤120 s tool args;
-      smoke documents the HTTP-vs-watchdog coherence rule).
+- [x] New limits with sane clamps (`limits.ts`: tool default 120 s–50 min
+      ceiling, watchdog gaps 120 s, 30-min absolute turn cap, 64 KiB captured
+      output with a 1 MiB config ceiling; the model client's HTTP timeout
+      defaults to 180 s so it always exceeds the first-chunk budget — the
+      README's coherence rule).
 - [x] Upstream caveats encountered (all recorded above): no
       `FakeToolCallingChatModel` in @langchain/core 1.2.17;
       `durability:'sync'` is mandatory; `getState().tasks[].interrupts` is

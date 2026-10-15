@@ -5,8 +5,8 @@
  * `limits.toolMaxMs`, never honored above it.
  *
  * Defaults mirror the spec table: model first-response 120 s, inter-chunk
- * 120 s, absolute turn 10 min, tool default 120 s, tool ceiling 50 min,
- * output 100_000 bytes.
+ * 120 s, absolute turn 30 min, tool default 120 s, tool ceiling 50 min,
+ * captured output 64 KiB (configs may raise it to at most 1 MiB).
  */
 
 export interface HarnessLimits {
@@ -27,11 +27,14 @@ export interface HarnessLimits {
 export const DEFAULT_HARNESS_LIMITS: HarnessLimits = {
   firstChunkMs: 120_000,
   chunkGapMs: 120_000,
-  turnCapMs: 600_000,
+  turnCapMs: 30 * 60_000,
   toolDefaultMs: 120_000,
   toolMaxMs: 50 * 60_000,
-  maxOutputBytes: 100_000,
+  maxOutputBytes: 64 * 1024,
 };
+
+/** Hard cap for the output budget — per the spec, configs top out at 1 MiB. */
+const MAX_OUTPUT_BYTES = 1024 * 1024;
 
 const FIELDS = [
   'firstChunkMs', 'chunkGapMs', 'turnCapMs',
@@ -51,6 +54,9 @@ export function resolveLimits(overrides: Partial<HarnessLimits> = {}): HarnessLi
   }
   if (limits.toolDefaultMs > limits.toolMaxMs) {
     limits.toolDefaultMs = limits.toolMaxMs;
+  }
+  if (limits.maxOutputBytes > MAX_OUTPUT_BYTES) {
+    limits.maxOutputBytes = MAX_OUTPUT_BYTES;
   }
   return limits;
 }

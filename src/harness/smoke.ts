@@ -26,40 +26,43 @@ if (!baseUrl || !modelName) {
 const workspace = mkdtempSync(join(tmpdir(), 'harness-smoke-'));
 console.log('[smoke] provider', baseUrl, '| model', modelName, '| workspace', workspace);
 
-try {
-  const model = resolveModel(
-    { provider: 'smoke', model: modelName },
-    { smoke: { baseUrl, apiKey: process.env.HARNESS_SMOKE_API_KEY } },
-    // HTTP timeout must exceed the first-chunk watchdog or the client layer
-    // cancels first (observed: "Request timed out." at the 120 s default).
-    { timeoutMs: 300_000 },
-  );
-  const driver = startHarnessRun({
-    threadId: `smoke-${Date.now()}`,
-    prompt: 'Create a file named smoke.txt in this workspace containing the single word "ok" '
-      + '(one way: run_command with `echo ok > smoke.txt`). Then reply with just DONE.',
-    model,
-    workspaceDir: workspace,
-    // Budgets are relaxed for cheap LOCAL endpoints: a cold/contended CPU
-    // model may take a minute per burst (observed 48 s to first chunk).
-    limits: resolveLimits({ toolDefaultMs: 15_000, firstChunkMs: 120_000, chunkGapMs: 150_000 }),
+let exitCode = 1;
+const model = resolveModel(
+  { provider: 'smoke', model: modelName },
+  { smoke: { baseUrl, apiKey: process.env.HARNESS_SMOKE_API_KEY } },
+  // HTTP timeout must exceed the first-chunk watchdog or the client layer
+  // cancels first (observed: "Request timed out." at the 120 s default).
+  { timeoutMs: 300_000 },
+);
+const driver = startHarnessRun({
+  threadId: `smoke-${Date.now()}`,
+  prompt: 'Create a file named smoke.txt in this workspace containing the single word "ok" '
+    + '(one way: run_command with `echo ok > smoke.txt`). Then reply with just DONE.',
+  model,
+  workspaceDir: workspace,
+  // Budgets are relaxed for cheap LOCAL endpoints: a cold/contended CPU
+  // model may take a minute per burst (observed 48 s to first chunk).
+  limits: resolveLimits({ toolDefaultMs: 15_000, firstChunkMs: 120_000, chunkGapMs: 150_000 }),
+});
+const deadline = setTimeout(() => {
+  console.error('[smoke] HARD TIMEOUT (420s) — cancelling the run');
+  void driver.cancel().finally(() => {
+    rmSync(workspace, { recursive: true, force: true });
+    process.exit(2);
   });
-  const deadline = setTimeout(() => {
-    console.error('[smoke] HARD TIMEOUT (420s) — cancelling the run');
-    void driver.cancel().finally(() => process.exit(2));
-  }, 420_000);
+}, 420_000);
 
-  let completed = false;
-  for await (const event of driver.events) {
-    console.log('[smoke]', event.type, JSON.stringify(event).slice(0, 220));
-    if (event.type === 'completion') completed = true;
-    if (event.type === 'error') break;
-  }
-  clearTimeout(deadline);
-
-  const fileOk = existsSync(join(workspace, 'smoke.txt'));
-  console.log('[smoke] RESULT: completion =', completed, '| smoke.txt on disk =', fileOk);
-  process.exit(completed ? 0 : 1);
-} finally {
-  rmSync(workspace, { recursive: true, force: true });
+let completed = false;
+for await (const event of driver.events) {
+  console.log('[smoke]', event.type, JSON.stringify(event).slice(0, 220));
+  if (event.type === 'completion') completed = true;
+  if (event.type === 'error') break;
 }
+clearTimeout(deadline);
+
+const fileOk = existsSync(join(workspace, 'smoke.txt'));
+console.log('[smoke] RESULT: completion =', completed, '| smoke.txt on disk =', fileOk);
+exitCode = completed ? 0 : 1;
+// Cleanup BEFORE exit — a finally-block runs too late behind process.exit.
+rmSync(workspace, { recursive: true, force: true });
+process.exit(exitCode);

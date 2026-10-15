@@ -6,11 +6,16 @@ describe('resolveLimits', () => {
     expect(resolveLimits()).toEqual({
       firstChunkMs: 120_000,
       chunkGapMs: 120_000,
-      turnCapMs: 600_000,
+      turnCapMs: 30 * 60_000,
       toolDefaultMs: 120_000,
       toolMaxMs: 3_000_000,
-      maxOutputBytes: 100_000,
+      maxOutputBytes: 64 * 1024,
     });
+  });
+
+  it('clamps the output budget to the 1 MiB spec ceiling', () => {
+    expect(resolveLimits({ maxOutputBytes: 10 * 1024 * 1024 }).maxOutputBytes).toBe(1024 * 1024);
+    expect(resolveLimits({ maxOutputBytes: 512 * 1024 }).maxOutputBytes).toBe(512 * 1024);
   });
 
   it('applies overrides without touching the frozen defaults object', () => {
