@@ -41,8 +41,41 @@ new feasibility record, not a chore.
 
 ## Task records
 
-_(Appended per plan task — Task 2 kill-cleanup facts, Task 5 stream shapes,
-Task 6 PostgresSaver form + resume semantics, Task 7 smoke/probe results.)_
+### Task 2 — kill-cleanup facts (2026-10-15)
+
+- TERM-ignoring process group reaped by the SIGKILL grace path; pid gone via
+  `kill(pid, 0)` ESRCH within ~2.3 s after a 300 ms timeout (tool-runner
+  suite, test 3).
+- `HOME=<cwd>` and `TERM=dumb` are in the scrubbed base env; PATH passes
+  through. Verified: `DATABASE_URL` and an injected `MARKER_SECRET` absent
+  from children.
+
+### Task 4 — model resolution (2026-10-15)
+
+- ChatOpenAI 1.6.2 observable fields: `m.model`, `m.timeout`,
+  `m.clientConfig.baseURL/.apiKey`. `modelName` and `maxRetries` are NOT
+  exposed as instance fields (constructor accepts both).
+
+### Task 5 — Deep Agents adapter (2026-10-15)
+
+- `createDeepAgent({ model, backend, tools, systemPrompt, checkpointer })`
+  works with a `BaseChatModel` subclass: a `bindTools` passthrough suffices;
+  standard `AIMessage.tool_calls` drive the loop.
+- `agent.stream(input, { configurable: { thread_id }, streamMode: ['messages','updates'], signal })`
+  yields `[mode, data]` tuples; text arrives via `messages` mode (`token.text`
+  on `ai` chunks); `updates.__interrupt__[].value` carries the `interrupt()`
+  payload.
+- `interrupt(payload)` inside a tool returns the `Command({ resume })` value;
+  the tool result the model sees is the tool's returned text (verified: the
+  second model call's ToolMessage content is exactly the user's answer).
+- Tool timeouts do NOT end the agent loop — the ToolNode feeds the outcome
+  string back and the model continues (test 3).
+- Cancellation: langgraph stream's own `signal` does not by itself wake a
+  stream parked on a pending model call — the watchdog's abort race is the
+  working cancel surface, and any in-flight `run_command` receives the same
+  abort signal. Verified in ~150 ms.
+- Dispatch/result events are pushed from INSIDE the tool wrappers, never
+  parsed from stream shapes.
 
 ## Known limits
 
