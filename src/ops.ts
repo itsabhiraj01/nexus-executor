@@ -471,6 +471,21 @@ export async function opJobMessage(deps: RouteDeps, jobId: string, text: string)
   }
 }
 
+/** POST /api/v1/jobs/:jobId/rebase + op job.rebase (spec 2026-10-15 §3.2):
+ *  pull the base ref into the job's live worktree on demand. The response
+ *  is the immediate outcome snapshot; conflict repair then folds through
+ *  the job's events (REBASE_*). */
+export async function opJobRebase(deps: RouteDeps, jobId: string): Promise<OpResult> {
+  try {
+    const outcome = await deps.engine.rebaseJob(jobId);
+    return { status: 200, body: outcome };
+  } catch (error) {
+    const result = engineErrorResult(error);
+    if (result) return result;
+    throw error;
+  }
+}
+
 export async function opJobCancel(deps: RouteDeps, jobId: string): Promise<OpResult> {
   const job = await deps.engine.cancel(jobId);
   if (!job) return { status: 404, body: { error: `Unknown job ${jobId}.` } };
@@ -748,7 +763,7 @@ export const GATEWAY_PROTOCOL_VERSION = 'nexus.executor.v1';
 /** The canonical operation set; MUST match the gateway's protocol adapter
  *  (nexus-gateway src/protocol/nexus.ts) exactly — divergence fails loudly
  *  at the gateway boundary (unknown operation → connection rejected). */
-const ID_OPS = ['job.get', 'job.cancel', 'job.verify', 'job.merge', 'job.log'] as const;
+const ID_OPS = ['job.get', 'job.cancel', 'job.verify', 'job.merge', 'job.log', 'job.rebase'] as const;
 type IdOp = (typeof ID_OPS)[number];
 
 function textArg(value: unknown, max: number): string | null {
@@ -867,6 +882,7 @@ export async function handleGatewayOperation(
           if (op === 'job.cancel') return wrap(await opJobCancel(deps, jobId));
           if (op === 'job.verify') return wrap(await opJobVerify(deps, jobId));
           if (op === 'job.merge') return wrap(await opJobMerge(deps, jobId));
+          if (op === 'job.rebase') return wrap(await opJobRebase(deps, jobId));
           return wrap(await opJobLog(deps, jobId));
         }
         return { ok: false, error: `Unknown operation ${operation}.`, status: 400 };

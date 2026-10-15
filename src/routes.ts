@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify';
 import {
   healthPaired, jobSummary, MAX_MESSAGE_CHARS,
   opConfigPut, opCreateJob, opJobCancel, opJobEvents, opJobLog, opJobMerge,
-  opFsBrowse, opJobMessage, opJobVerify, opModels, opRepoInspect, opShowJob, opStatus, opUpgrade, opWorkspaceSweep,
+  opFsBrowse, opJobMessage, opJobRebase, opJobVerify, opModels, opRepoInspect, opShowJob, opStatus, opUpgrade, opWorkspaceSweep,
   opTerminalCreate, opTerminalDetach, opTerminalInput, opTerminalKill, opTerminalList, opTerminalOutput, opTerminalResize,
   type OpResult, type RouteDeps,
 } from './ops.js';
@@ -143,6 +143,13 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.post<{ Params: { jobId: string } }>(
     '/api/v1/jobs/:jobId/cancel', { preHandler: limit(actionLimiter) }, async (request, reply) => {
       send(reply, await opJobCancel(deps, request.params.jobId));
+    });
+
+  // job.rebase — pull the base ref into the job's live worktree on demand
+  // (pipeline pre-review freshness check; spec 2026-10-15 §3.2).
+  app.post<{ Params: { jobId: string } }>(
+    '/api/v1/jobs/:jobId/rebase', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+      send(reply, await opJobRebase(deps, request.params.jobId));
     });
 
   app.post<{ Params: { jobId: string } }>(
