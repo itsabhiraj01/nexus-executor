@@ -52,7 +52,7 @@ export async function claimPairing(
         name: config.executorName,
         url: config.publicUrl,
         version: EXECUTOR_VERSION,
-        capabilities: executorCapabilities(),
+        capabilities: executorCapabilities(config),
       }),
     });
   } catch (cause) {

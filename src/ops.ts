@@ -241,7 +241,7 @@ export async function opStatus(deps: RouteDeps): Promise<OpResult> {
       // jobRetries manages in-job retries itself (the hub must not also
       // arm its cross-run auto-retry for those failures — the budgets
       // would multiply).
-      capabilities: executorCapabilities(),
+      capabilities: executorCapabilities(deps.config),
       uptimeSeconds: Math.floor((Date.now() - deps.startedAt) / 1000),
     },
   };

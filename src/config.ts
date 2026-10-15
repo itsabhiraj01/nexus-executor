@@ -1,19 +1,31 @@
+import { readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { resolve } from 'node:path';
+import { resolveUpgradeCommand } from './upgrade.js';
 
 /**
  * Every runtime knob the executor reads, parsed from the environment in one
  * place. `.env.example` documents each variable; keep the two in sync.
  */
 
-// Lineage note: the executor lives in THIS repository now (the monorepo's
+/** The executor's version, SINGLE-SOURCED from package.json (resolves from
+ *  both `src/` under tsx and `dist/` compiled): the hub reads the same file
+ *  on its side to compute "latest", so there must never be a second,
+ *  hand-maintained copy to drift (the 0.3.0/0.4.0 split). */
+function readPackageVersion(): string {
+  try {
+    const parsed = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown };
+    if (typeof parsed.version === 'string' && parsed.version.trim()) return parsed.version.trim();
+  } catch { /* unreadable packaging — the fallback still reports honestly */ }
+  return '0.0.0';
+}
+
+// Lineage note: THIS repository is the single executor lineage — the monorepo's
 // executor/ directory is a restored-from-history snapshot used for hub-side
-// development — see docs/remote-executors.md). 0.3.1 adds persistent tmux
-// terminal sessions on top of 0.3.0's discovery/project-registry features;
-// 0.3.2 splits terminal rate limits (interactive I/O can never starve
-// kill/detach — the 2026-10-12 freeze); 0.4.0 remains reserved for machine
-// reporting in the monorepo's docs.
-export const EXECUTOR_VERSION = '0.3.2';
+// development (see docs/remote-executors.md), and the 0.3.x/0.4.x/0.5.0
+// divergence between the two lineages was unified into this repo at 1.0.0
+// (status item 165's deferred reconciliation, completed).
+export const EXECUTOR_VERSION = readPackageVersion();
 
 export interface ExecutorConfig {
   /** Connection string of this executor's own Postgres database. */
@@ -66,16 +78,45 @@ export interface ExecutorConfig {
   gatewayUrl: string | null;
   /** Ed25519 identity + credential store (gateway transport). */
   gatewayIdentityPath: string;
+  /** The verbatim command hub-triggered upgrades run when set (takes
+   *  precedence over the shipped script — the rsync/copy/docker escape
+   *  hatch). null = probe the repo layout (below). */
+  upgradeCommand: string | null;
+  /** This machine's own git checkout of this repository — hub-triggered
+   *  upgrades run the shipped self-upgrade.sh against it (fetch → reset →
+   *  rebuild → restart). null = hub-triggered upgrades refuse. */
+  upgradeRepoDir: string | null;
+  /** The ref self-upgrade.sh resets the checkout onto. */
+  upgradeRef: string;
+  /** The systemd unit self-upgrade.sh restarts. */
+  upgradeServiceName: string;
+  /** When the service runs from somewhere else (a persistent install the
+   *  reset can't clobber), self-upgrade.sh rsyncs the rebuilt tree here
+   *  (persistent state — .env, data/ — survives). */
+  upgradeInstallDir: string | null;
 }
 
 /** The feature contract this executor speaks, advertised in /api/v1/status
- *  and at pairing — the hub gates its own cross-run auto-retry on
+ *  and at pairing. The hub gates its own cross-run auto-retry on
  *  `jobRetries` (an executor that retries in-job must never also be
- *  retried by the hub: budgets would multiply). */
-export function executorCapabilities(): Record<string, unknown> {
-  // `terminals: true` gates the console's Terminal action on this machine
-  // (persistent tmux sessions, ≥ 0.3.1; needs tmux ≥ 3.2 on the host).
-  return { jobRetries: true, modelFallback: true, projectRegistry: true, discovery: true, terminals: true };
+ *  retried by the hub: budgets would multiply); `modelPolicy` unlocks
+ *  hub-side model fencing; `selfUpgrade` unlocks the Restart-to-update
+ *  console action. */
+export function executorCapabilities(config: Pick<ExecutorConfig, 'upgradeCommand' | 'upgradeRepoDir'>): Record<string, unknown> {
+  return {
+    jobRetries: true,
+    modelFallback: true,
+    projectRegistry: true,
+    discovery: true,
+    terminals: true,
+    terminalSync: true,
+    modelPolicy: true,
+    // NOTE: `nativeAgents` (worktree persona materialization) is intentionally
+    // NOT advertised until the engine reconcile (Task 2.8) ports the
+    // monorepo's agent-materialization code path — advertising it first would
+    // make the hub send personas this engine can't honor.
+    ...(resolveUpgradeCommand(config) ? { selfUpgrade: true } : {}),
+  };
 }
 
 function required(name: string, env: NodeJS.ProcessEnv): string {
@@ -134,5 +175,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ExecutorConfig
     gatewayUrl: optional('GATEWAY_URL', env)?.replace(/\/+$/, '') ?? null,
     gatewayIdentityPath: optional('GATEWAY_IDENTITY_PATH', env)
       ?? resolve(env.EXECUTOR_WORKSPACE_ROOT?.trim() || resolve(process.cwd(), 'data', 'workspaces'), '..', 'gateway-identity.json'),
+    upgradeCommand: optional('EXECUTOR_UPGRADE_COMMAND', env),
+    upgradeRepoDir: optional('EXECUTOR_REPO_DIR', env),
+    upgradeRef: env.EXECUTOR_UPGRADE_REF?.trim() || 'main',
+    upgradeServiceName: env.EXECUTOR_SERVICE_NAME?.trim() || 'nexus-executor',
+    upgradeInstallDir: optional('EXECUTOR_INSTALL_DIR', env),
   };
 }

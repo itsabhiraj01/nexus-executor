@@ -69,10 +69,16 @@ export const execGit: GitRunner = async (args, options) => {
     return { code: 0, stdout, stderr };
   } catch (error) {
     const err = error as { code?: unknown; stdout?: string; stderr?: string; message?: string };
+    // A spawn-level failure (cwd missing, git not executable) never runs
+    // git: child_process rejects with a string errno code and util.promisify
+    // has already overwritten err.stderr/err.stdout with '' — so the old
+    // `err.stderr ?? err.message` chain hid the only explanation there is
+    // ('spawn git ENOENT'). Surface the message for exactly that case.
+    const spawnFailure = typeof err.code === 'string' && !(err.stderr || err.stdout);
     return {
       code: typeof err.code === 'number' ? err.code : 1,
       stdout: err.stdout ?? '',
-      stderr: err.stderr ?? err.message ?? '',
+      stderr: spawnFailure ? (err.message ?? '') : (err.stderr ?? err.message ?? ''),
     };
   }
 };
@@ -368,9 +374,8 @@ export async function runDeployCommand(command: string, repoRoot: string): Promi
   }
 }
 
-/** Remove a job's worktree and its branch (best effort). Called ONLY from
- *  the hub-invoked merge flow — the engine never deletes a workspace on
- *  its own; failed attempts keep theirs for resume and inspection. */
+/** Remove a job's worktree and its branch (best effort — used after merges
+ *  and setup failures). */
 export async function removeJobWorkspace(
   runner: GitRunner,
   input: { repoRoot: string; path: string; branch: string; deleteBranch?: boolean },
@@ -540,6 +545,79 @@ async function excludeDirectory(runner: GitRunner, worktreePath: string, dir: st
   const existing = existsSync(excludePath) ? await readFile(excludePath, 'utf8') : '';
   if (existing.split('\n').some((line) => line.trim() === `${dir}/`)) return;
   await appendFile(excludePath, `${existing.endsWith('\n') || !existing ? '' : '\n'}${dir}/\n`);
+}
+
+/* ── Native agent personas (hub ≥ nativeAgents capability) ─────────────── */
+
+/** The persona payload the hub ships in `spec.agent`: pre-rendered, so this
+ *  tree never imports hub rendering code (boundary lint) — it just writes
+ *  the strings into the job's worktree. */
+export interface JobAgentMaterialization {
+  /** Display name (events/UI only). */
+  name: string;
+  /** The OpenCode project-agent id the session pins (`nexus-<slug>-<id8>`). */
+  opencodeAgent: string;
+  /** Full `.opencode/agents/<opencodeAgent>.md` content. */
+  markdown: string;
+  /** Full opencode.json MCP fragment, or null when the persona has no servers. */
+  mcp: Record<string, unknown> | null;
+}
+
+/** Append the missing EXACT patterns to the worktree's git exclude
+ *  (idempotent; anchored patterns only match each checkout's top level).
+ *  Mirrored from the hub's ensureGitExcluded. */
+async function excludePatterns(runner: GitRunner, worktreePath: string, patterns: readonly string[]): Promise<void> {
+  const resolved = await runner(['rev-parse', '--git-path', 'info/exclude'], { cwd: worktreePath });
+  if (resolved.code !== 0 || !resolved.stdout.trim()) {
+    throw new WorkspaceError(`Could not resolve the worktree's git exclude file: ${resolved.stderr.trim() || 'git failed'}`);
+  }
+  const excludePath = resolve(worktreePath, resolved.stdout.trim());
+  await mkdir(dirname(excludePath), { recursive: true });
+  const existing = existsSync(excludePath) ? await readFile(excludePath, 'utf8') : '';
+  const lines = new Set(existing.split('\n').map((line) => line.trim()));
+  const missing = patterns.filter((pattern) => !lines.has(pattern));
+  if (!missing.length) return;
+  await appendFile(excludePath, `${existing.endsWith('\n') || !existing ? '' : '\n'}${missing.join('\n')}\n`);
+}
+
+/**
+ * Native persona tier for remote jobs: write
+ * `<worktree>/.opencode/agents/<name>.md` (+ its MCP fragment) so the job's
+ * session can pin the persona as a real OpenCode project agent — the run
+ * then gets the persona's curated skills list and MCP servers exactly like
+ * a local execution (previously remote runs were prompt-tier only and lost
+ * both). The git-excluded exclude lands BEFORE any file (a failing exclude
+ * write fails the launch rather than risk an unexcluded file reaching the
+ * safety-net commit). The MCP fragment merges into an existing opencode.json
+ * (parse failure fails the launch — never clobber); the model-policy
+ * registration that runs afterwards merges its policies on top of it.
+ * Idempotent — retries re-materialize on the re-attached worktree.
+ */
+export async function materializeJobAgent(
+  runner: GitRunner,
+  worktreePath: string,
+  agent: JobAgentMaterialization,
+): Promise<{ opencodeAgent: string; mcp: 'none' | 'written' }> {
+  await excludePatterns(runner, worktreePath, agent.mcp ? ['/.opencode/agents/', '/opencode.json'] : ['/.opencode/agents/']);
+  const dir = join(worktreePath, '.opencode', 'agents');
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, `${agent.opencodeAgent}.md`), agent.markdown, 'utf8');
+  let mcp: 'none' | 'written' = 'none';
+  if (agent.mcp) {
+    const file = join(worktreePath, 'opencode.json');
+    let existing: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(await readFile(file, 'utf8'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) existing = parsed as Record<string, unknown>;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new WorkspaceError(`The workspace's existing opencode.json is not valid JSON — the agent's MCP config cannot be merged into it (${(error as Error).message}).`);
+      }
+    }
+    await writeFile(file, `${JSON.stringify({ $schema: 'https://opencode.ai/config.json', ...existing, mcp: agent.mcp.mcp ?? agent.mcp }, null, 2)}\n`, 'utf8');
+    mcp = 'written';
+  }
+  return { opencodeAgent: agent.opencodeAgent, mcp };
 }
 
 /* ── Verification environment + runner ──────────────────────────────────
