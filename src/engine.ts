@@ -31,11 +31,14 @@ import {
 import {
   ConflictError,
   commitJobChanges,
+  completeWorktreeMerge,
   execGit,
+  listUnmergedPaths,
   materializeJobAgent,
   materializeJobAttachments,
   mergeJobBranch,
   prepareWorktree,
+  pullBaseIntoWorktree,
   removeJobWorkspace,
   resolveBaseRef,
   runDeployCommand,
@@ -281,6 +284,10 @@ export const EVENT = {
   MODEL_POLICY: 'MODEL_POLICY',
   MODEL_POLICY_BLOCKED: 'MODEL_POLICY_BLOCKED',
   MODEL_FALLBACK: 'MODEL_FALLBACK',
+  REBASE_CLEAN: 'REBASE_CLEAN',
+  REBASE_MERGED: 'REBASE_MERGED',
+  REBASE_CONFLICTS: 'REBASE_CONFLICTS',
+  REBASE_FAILED: 'REBASE_FAILED',
 } as const;
 
 /** The retention sweep runs at most this often (the tick is seconds). */
@@ -431,6 +438,19 @@ export function repairPrompt(command: string, result: { code: number; output: st
   ].join('\n');
 }
 
+/** The conflict-resolution prompt for the rebase stage (mirrors the hub's
+ *  rebasePrompt text — the stage feels identical local or remote). */
+export function rebaseConflictPrompt(conflicts: readonly string[], baseRef: string): string {
+  return [
+    `The ${baseRef} branch moved ahead of your branch, and pulling it into your worktree produced merge conflicts in:`,
+    '',
+    ...conflicts.slice(0, 30).map((path) => `- ${path}`),
+    ...(conflicts.length > 30 ? [`- (…${conflicts.length - 30} more)`] : []),
+    '',
+    'Resolve the conflicts in your worktree: edit the marked files keeping both sides\' intent, then `git add` every resolved file and commit the merge (`git commit --no-edit`). Do NOT abort the merge. After resolving, the merge completes and any verification command runs.',
+  ].join('\n');
+}
+
 /** The stall failure reason (mirrors the hub's wording, minus the
  *  OpenCode-version specifics). */
 export function stallFailureReason(summary: string, interrupted?: boolean): string {
@@ -449,6 +469,7 @@ export function jobShortId(hubJobId: string): string {
 }
 
 const MAX_VERIFICATION_ATTEMPTS = 3;
+const MAX_REBASE_ROUNDS = 3;
 const SEEN_IDS_CAP = 500;
 
 function asStringArray(value: unknown): string[] {
@@ -686,6 +707,46 @@ export class JobEngine {
     return { branch, path, baseSha };
   }
 
+  /** Attach the job's worktree to an EXISTING named branch (pipeline stages):
+   * reuse a live worktree already on the branch when one exists anywhere,
+   * otherwise add a fresh one. Missing branch ⇒ workspace_setup_failed with
+   * the spec's actionable sentence — the branch is sacred, never re-cut. */
+  private async attachNamedBranch(repoRoot: string, baseBranch: string): Promise<{ branch: string; path: string; baseSha: string }> {
+    const probe = await this.git(['rev-parse', '--verify', '--quiet', `${baseBranch}^{commit}`], { cwd: repoRoot });
+    if (probe.code !== 0 || !probe.stdout.trim()) {
+      throw Object.assign(
+        new Error(`Branch ${baseBranch} is gone — rerun from an earlier pipeline stage to re-create it.`),
+        { code: 'workspace_setup_failed' },
+      );
+    }
+    const preferred = join(this.config.workspaceRoot, 'worktrees', baseBranch.replace(/[/::]/g, '-'));
+    if (existsSync(preferred)) {
+      const onBranch = await this.git(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: preferred });
+      if (onBranch.stdout.trim() === baseBranch) return { branch: baseBranch, path: preferred, baseSha: probe.stdout.trim() };
+    }
+    await this.git(['worktree', 'prune'], { cwd: repoRoot });
+    const added = await this.git(['worktree', 'add', preferred, baseBranch], { cwd: repoRoot });
+    if (added.code !== 0) {
+      // A branch may be checked out in only ONE worktree: if another stage's
+      // live worktree already holds it, reuse that path instead of failing.
+      if ((added.stderr || added.stdout).includes('already checked out')) {
+        const listed = await this.git(['worktree', 'list', '--porcelain'], { cwd: repoRoot });
+        for (const block of listed.stdout.split('\n\n')) {
+          const path = /^worktree (.+)$/m.exec(block)?.[1];
+          const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
+          if (branch === baseBranch && path && existsSync(path)) {
+            return { branch: baseBranch, path, baseSha: probe.stdout.trim() };
+          }
+        }
+      }
+      throw Object.assign(
+        new Error(`Attaching the worktree for "${baseBranch}" failed: ${(added.stderr || added.stdout).trim()}`),
+        { code: 'workspace_setup_failed' },
+      );
+    }
+    return { branch: baseBranch, path: preferred, baseSha: probe.stdout.trim() };
+  }
+
   /**
    * Launch one job: resolve the repo, cut the worktree on a snapshot base
    * (or REUSE the previous attempt's branch on a retry), materialize
@@ -713,11 +774,15 @@ export class JobEngine {
              WHERE id = $1 AND status = $3`, [job.id, prepared.path, fromStatus]);
         }
       } else {
-        prepared = await prepareWorktree(
-          this.git,
-          { repoRoot, worktreeRoot: join(this.config.workspaceRoot, 'worktrees') },
-          { jobName: jobShortId(job.hubJobId) },
-        );
+        prepared = spec.baseBranch
+          // Pipeline stage: attach to the stage's named branch (spec §4) —
+          // a branch is sacred, never silently re-cut.
+          ? await this.attachNamedBranch(repoRoot, spec.baseBranch)
+          : await prepareWorktree(
+            this.git,
+            { repoRoot, worktreeRoot: join(this.config.workspaceRoot, 'worktrees') },
+            { jobName: jobShortId(job.hubJobId) },
+          );
         await this.pool.query(
           `UPDATE executor.jobs SET branch = $2, worktree_path = $3,
              metadata = metadata || $4::jsonb, version = version + 1, updated_at = NOW()
@@ -731,6 +796,71 @@ export class JobEngine {
           summary: `Worktree ${prepared.branch}`,
           payload: { branch: prepared.branch, path: prepared.path, baseSha: prepared.baseSha, baseRef, repoRoot },
         });
+      }
+
+      // Any fresh launch supersedes a rebase-repair state left by a
+      // previous attempt (the retry re-attaches and replays the step).
+      if (job.metadata.pendingRebaseRepair === true) {
+        await this.mergeMetadata(job.id, { pendingRebaseRepair: false, rebaseRounds: 0 });
+      }
+
+      // Pipeline stage (spec §4 rebaseFirst): pull the base ref BEFORE any
+      // session/prompt. Conflicts open the lazy repair session and this
+      // launch is DONE — the repair turn's end fold resumes the stage.
+      if (spec.rebaseFirst && !isRetry) {
+        const staged = {
+          ...job,
+          branch: prepared.branch,
+          worktreePath: prepared.path,
+          metadata: { ...job.metadata, repoRoot, baseRef, baseSha: prepared.baseSha },
+        };
+        const result = await this.pullBaseForJob(staged);
+        if (result.outcome === 'repairing') return;
+      }
+
+      // Pipeline stage (spec §4 verifyFirst): run the verification BEFORE
+      // any session/prompt exists. Pass ⇒ succeed with NO session ever
+      // created; fail ⇒ fall through and open the session on the EXISTING
+      // repair prompt — the standard repair loop takes it from there.
+      let promptOverride: string | null = null;
+      if (spec.verifyFirst && !isRetry) {
+        const attempts = job.verificationAttemptCount + 1; // retry-inclusive
+        await appendJobEvent(this.pool, {
+          jobId: job.id, eventType: EVENT.VERIFICATION_STARTED,
+          summary: `Running \`${job.verificationCommand}\``, payload: { command: job.verificationCommand },
+        });
+        const result = await runJobCommand(job.verificationCommand, prepared.path, jobEnv());
+        const verifyMeta = JSON.stringify({
+          verification: { attempts, exitCode: result.code, outputTail: result.output.slice(-4000) },
+        });
+        await this.pool.query(
+          `UPDATE executor.jobs SET verification_attempt_count = $2, metadata = metadata || $3::jsonb, updated_at = NOW()
+           WHERE id = $1 AND status = $4`, [job.id, attempts, verifyMeta, fromStatus]);
+        if (result.code === 0) {
+          await appendJobEvent(this.pool, {
+            jobId: job.id, eventType: EVENT.VERIFICATION_PASSED,
+            summary: `Verification passed (attempt ${attempts}).`,
+            payload: { attempt: attempts, command: job.verificationCommand, output: result.output },
+          });
+          const { rowCount } = await this.pool.query(
+            `UPDATE executor.jobs SET status = 'succeeded', summary = 'Verification passed before any agent turn.',
+               finished_at = NOW(), version = version + 1, updated_at = NOW()
+             WHERE id = $1 AND status = $2`, [job.id, fromStatus]);
+          if (rowCount) {
+            await appendJobEvent(this.pool, {
+              jobId: job.id, eventType: EVENT.EXECUTION_SUCCEEDED,
+              summary: 'Verification passed before any agent turn.',
+              payload: { summary: 'Verification passed before any agent turn.', verifyFirst: true },
+            });
+          }
+          return;
+        }
+        await appendJobEvent(this.pool, {
+          jobId: job.id, eventType: EVENT.VERIFICATION_FAILED,
+          summary: `Verification failed (attempt ${attempts}, exit ${result.code}).`,
+          payload: { attempt: attempts, command: job.verificationCommand, exitCode: result.code, output: result.output },
+        });
+        promptOverride = repairPrompt(job.verificationCommand, result);
       }
 
       // Attachments: the git exclude goes in BEFORE any file lands. On a
@@ -822,8 +952,8 @@ export class JobEngine {
           { code: 'model_policy_failed' },
         );
       }
-      const composed = await this.composePrompt(spec, attachmentsDir, attachmentFiles);
-      const prompt = isRetry
+      const composed = promptOverride ?? await this.composePrompt(spec, attachmentsDir, attachmentFiles);
+      const prompt = isRetry && !promptOverride
         ? [
             retryPreamble({
               attempt: job.attemptCount,
@@ -1075,7 +1205,83 @@ export class JobEngine {
         }
         return;
       }
+      // Rebase-repair continuation (spec §4): the repair turn ended. Clean
+      // worktree ⇒ complete the merge and continue the stage (verify loop
+      // or success); still conflicted ⇒ re-prompt, bounded, then failed.
+      if (job.metadata.pendingRebaseRepair === true && last.id !== meta.lastRepairFoldMessageId) {
+        await this.mergeMetadata(job.id, { lastRepairFoldMessageId: last.id });
+        const baseRef = typeof job.metadata.rebaseBaseRef === 'string' && job.metadata.rebaseBaseRef
+          ? job.metadata.rebaseBaseRef
+          : (typeof job.metadata.baseRef === 'string' ? job.metadata.baseRef : '');
+        const unmerged = await listUnmergedPaths(this.git, job.worktreePath);
+        if (unmerged.length === 0) {
+          const mergeSha = await completeWorktreeMerge(this.git, job.worktreePath);
+          await this.mergeMetadata(job.id, { pendingRebaseRepair: false, rebaseRounds: 0 });
+          await appendJobEvent(this.pool, {
+            jobId: job.id, eventType: EVENT.REBASE_MERGED,
+            summary: `Rebase conflicts resolved — merge completed (${mergeSha.slice(0, 12)}).`,
+            payload: { baseRef, mergeSha, resolved: true },
+          });
+          if (job.verificationCommand) {
+            const stamped = await this.pool.query(
+              `UPDATE executor.jobs SET status = 'verifying', version = version + 1, updated_at = NOW()
+               WHERE id = $1 AND status = 'running'`, [job.id]);
+            if (stamped.rowCount) {
+              const fresh = (await getJobByHubId(this.pool, job.hubJobId))!;
+              await appendJobEvent(this.pool, {
+                jobId: job.id, eventType: EVENT.VERIFICATION_STARTED,
+                summary: `Running \`${job.verificationCommand}\``, payload: { command: job.verificationCommand },
+              });
+              this.track(this.runVerification(fresh));
+            }
+          } else {
+            await this.succeedJob(job, finalAssistantText(last));
+          }
+        } else {
+          const rounds = (typeof job.metadata.rebaseRounds === 'number' ? job.metadata.rebaseRounds : 0) + 1;
+          await this.mergeMetadata(job.id, { rebaseRounds: rounds });
+          if (rounds >= MAX_REBASE_ROUNDS) {
+            await appendJobEvent(this.pool, {
+              jobId: job.id, eventType: EVENT.REBASE_FAILED,
+              summary: `Rebase conflicts remain after ${rounds} repair rounds: ${unmerged.join(', ')}.`,
+              payload: { baseRef, conflicts: unmerged, rounds },
+            });
+            await this.failJob(
+              job.id, 'merge_conflict',
+              `Pulling ${baseRef} into the worktree still conflicts after ${rounds} repair round(s): ${unmerged.join(', ')}`,
+              { interrupt: false },
+            );
+          } else {
+            const text = rebaseConflictPrompt(unmerged, baseRef);
+            await this.client!.prompt(job.opencodeSessionId!, text);
+            await appendJobEvent(this.pool, {
+              jobId: job.id, eventType: EVENT.REPAIR_REQUESTED,
+              summary: `Rebase conflict repair, round ${rounds + 1}.`,
+              payload: { attempt: rounds, text, reason: 'rebase_conflicts', baseRef },
+            });
+          }
+        }
+        return;
+      }
       if (last.id !== meta.lastPromotedMessageId) {
+        // Pipeline plan-gate (spec §4 parkOnTurnEnd): park instead of
+        // promoting — summary captured, waiting_for_user; a hub message
+        // resumes the session and the NEXT turn end parks again.
+        if (job.spec.parkOnTurnEnd) {
+          await this.mergeMetadata(job.id, { lastPromotedMessageId: last.id });
+          const text = finalAssistantText(last);
+          const parked = await this.pool.query(
+            `UPDATE executor.jobs SET status = 'waiting_for_user', summary = $2, version = version + 1, updated_at = NOW()
+             WHERE id = $1 AND status = 'running'`, [job.id, text.slice(0, SUMMARY_LIMIT)]);
+          if (parked.rowCount) {
+            await appendJobEvent(this.pool, {
+              jobId: job.id, eventType: EVENT.EXECUTION_STATUS_CHANGED,
+              summary: 'Turn ended — stage parked for approval.',
+              payload: { reason: 'stage_gate', summary: text },
+            });
+          }
+          return;
+        }
         if (!job.verificationCommand) {
           await this.mergeMetadata(job.id, { lastPromotedMessageId: last.id });
           await this.succeedJob(job, finalAssistantText(last));
@@ -1183,6 +1389,102 @@ export class JobEngine {
    * `failed`/`verification_failed`. Every status write is guarded on
    * `status='verifying'` so a concurrent cancel wins.
    */
+  /* ── Base pulls: rebaseFirst stage branch + the job.rebase op (spec §3.2/§4) ── */
+
+  /** Merge the recorded base ref into the job's live worktree. Clean ⇒
+   *  REBASE_CLEAN/REBASE_MERGED recorded; conflicts ⇒ REBASE_CONFLICTS + a
+   *  lazy repair session. Returns the full outcome (the op maps it 1:1). */
+  private async pullBaseForJob(job: JobRow): Promise<{ outcome: 'clean' | 'merged' | 'repairing'; conflicts: string[]; mergeSha: string | null }> {
+    const repoRoot = typeof job.metadata.repoRoot === 'string' ? job.metadata.repoRoot : '';
+    const baseRef = typeof job.metadata.baseRef === 'string' && job.metadata.baseRef.trim()
+      ? job.metadata.baseRef : await resolveBaseRef(this.git, repoRoot, this.config.baseRef);
+    const outcome = await pullBaseIntoWorktree(this.git, { repoRoot, worktreePath: job.worktreePath, baseRef });
+    if (outcome.status === 'conflicts') {
+      await appendJobEvent(this.pool, {
+        jobId: job.id, eventType: EVENT.REBASE_CONFLICTS,
+        summary: `Pulling ${baseRef} into the worktree conflicts: ${outcome.conflicts.slice(0, 5).join(', ')}${outcome.conflicts.length > 5 ? ` (+${outcome.conflicts.length - 5} more)` : ''}.`,
+        payload: { baseRef, conflicts: outcome.conflicts },
+      });
+      await this.mergeMetadata(job.id, { pendingRebaseRepair: true, rebaseRounds: 0, rebaseBaseRef: baseRef });
+      await this.launchRebaseRepair(job, baseRef, outcome.conflicts);
+      return { outcome: 'repairing', conflicts: outcome.conflicts, mergeSha: null };
+    }
+    if (outcome.status === 'merged') {
+      await appendJobEvent(this.pool, {
+        jobId: job.id, eventType: EVENT.REBASE_MERGED,
+        summary: `Pulled ${baseRef} into the worktree (${outcome.mergeSha!.slice(0, 12)}).`,
+        payload: { baseRef, mergeSha: outcome.mergeSha },
+      });
+      return { outcome: 'merged', conflicts: [], mergeSha: outcome.mergeSha };
+    }
+    await appendJobEvent(this.pool, {
+      jobId: job.id, eventType: EVENT.REBASE_CLEAN,
+      summary: `The worktree is already up to date with ${baseRef}.`, payload: { baseRef },
+    });
+    return { outcome: 'clean', conflicts: [], mergeSha: null };
+  }
+
+  /** Prompt the conflict-resolution turn: reuse the job's session when it
+   *  has one (mid-pipeline rebase), lazily CREATE one otherwise (a
+   *  rebaseFirst stage job or a rerun started sessionless). */
+  private async launchRebaseRepair(job: JobRow, baseRef: string, conflicts: string[]): Promise<void> {
+    if (!this.client) {
+      throw new EngineError(503, 'OpenCode is not configured on this executor — cannot repair rebase conflicts.');
+    }
+    const text = rebaseConflictPrompt(conflicts, baseRef);
+    let sessionId = job.opencodeSessionId;
+    if (!sessionId) {
+      const session = await this.client.createSession({
+        title: job.title || `Job ${job.hubJobId}`,
+        directory: job.worktreePath,
+        agent: job.spec.agent?.opencodeAgent ?? null,
+        model: parseModelRef(job.model) ?? null,
+      });
+      sessionId = session.id;
+      await this.pool.query(
+        `UPDATE executor.jobs SET opencode_session_id = $2, version = version + 1, updated_at = NOW()
+         WHERE id = $1`, [job.id, sessionId]);
+      await appendJobEvent(this.pool, {
+        jobId: job.id, eventType: EVENT.SESSION_CREATED,
+        summary: `Session ${sessionId} (rebase repair)`,
+        payload: { sessionId, directory: job.worktreePath, model: job.model, reason: 'rebase_repair' },
+      });
+    }
+    const sent = await this.client.prompt(sessionId, text);
+    await appendJobEvent(this.pool, {
+      jobId: job.id, eventType: EVENT.REPAIR_REQUESTED,
+      summary: 'Rebase conflict resolution requested.',
+      payload: { attempt: 0, text, promptMessageId: sent.id, reason: 'rebase_conflicts', baseRef },
+    });
+    await this.pool.query(`
+      UPDATE executor.jobs SET status = 'running', started_at = COALESCE(started_at, NOW()),
+        version = version + 1, updated_at = NOW()
+      WHERE id = $1 AND status <> 'running'`, [job.id]);
+    await appendJobEvent(this.pool, {
+      jobId: job.id, eventType: EVENT.EXECUTION_STATUS_CHANGED, summary: 'Rebase conflict repair running.',
+    });
+  }
+
+  /** job.rebase: pull the base ref into the job's live worktree on demand
+   *  (the pre-review freshness check / rebase retriggers). */
+  async rebaseJob(hubJobId: string): Promise<{ status: 'up_to_date' | 'merged' | 'conflicts_repairing'; conflicts?: string[]; mergeSha?: string }> {
+    const job = await getJobByHubId(this.pool, hubJobId);
+    if (!job) throw new EngineError(404, `Unknown job ${hubJobId}.`);
+    if (!job.worktreePath || !existsSync(job.worktreePath) || TERMINAL_STATUSES.includes(job.status)) {
+      throw new EngineError(409, `Job ${hubJobId} has no live worktree — re-dispatch the rebase stage with rebaseFirst instead.`);
+    }
+    if (job.metadata.pendingRebaseRepair === true) {
+      return { status: 'conflicts_repairing' }; // a repair turn is already running
+    }
+    const result = await this.pullBaseForJob(job);
+    if (result.outcome === 'repairing') {
+      return { status: 'conflicts_repairing', conflicts: result.conflicts };
+    }
+    return result.outcome === 'merged'
+      ? { status: 'merged', ...(result.mergeSha ? { mergeSha: result.mergeSha } : {}) }
+      : { status: 'up_to_date' };
+  }
+
   private async runVerification(job: JobRow): Promise<void> {
     if (this.verifyingJobs.has(job.id)) return;
     this.verifyingJobs.add(job.id);

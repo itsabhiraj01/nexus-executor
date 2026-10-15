@@ -22,8 +22,8 @@ import {
   type OpenCodeClient,
   type OpenCodeMessage,
 } from './opencode.js';
-import { countEvents, eventTypes, makeRepo, makeStubClient, testConfig } from './testkit.js';
-import { commitJobChanges, execGit } from './workspace.js';
+import { countEvents, eventTypes, makeRepo, makeStubClient, testConfig, TEST_AUTHOR } from './testkit.js';
+import { commitJobChanges, execGit, listUnmergedPaths } from './workspace.js';
 
 let pool: Pool;
 let root: string;
@@ -715,6 +715,275 @@ describe('native personas (model-policy era spec fields)', () => {
     await runningJob(ctx, spec({ jobId: 'job-noagent' }));
     expect(ctx.stub.sessions[0]).toMatchObject({ agent: null });
     await ctx.engine.cancel('job-noagent');
+  });
+});
+
+describe('pipeline stages — baseBranch (spec §4)', () => {
+  it('attaches onto a pre-existing baseBranch instead of cutting a job-* branch', async () => {
+    const ctx = makeEngine();
+    await execGit(['branch', 'builder/stage-plan'], { cwd: repoRoot });
+    const job = await runningJob(ctx, spec({ jobId: 'job-basebranch', baseBranch: 'builder/stage-plan' }));
+    expect(job.branch).toBe('builder/stage-plan');
+    expect(existsSync(job.worktreePath)).toBe(true);
+    const current = await execGit(['branch', '--show-current'], { cwd: job.worktreePath });
+    expect(current.stdout.trim()).toBe('builder/stage-plan');
+    // A session + prompt run in the attached worktree, like any launch.
+    expect(ctx.stub.sessions[0]!.directory).toBe(job.worktreePath);
+    const types = await eventTypes(pool, job.id);
+    expect(types).toContain(EVENT.WORKTREE_CREATED);
+    await ctx.engine.cancel('job-basebranch');
+  });
+
+  it('reuses the same worktree when a second stage job names the same baseBranch', async () => {
+    const ctx = makeEngine();
+    await execGit(['branch', 'builder/stage-code'], { cwd: repoRoot });
+    const first = await runningJob(ctx, spec({ jobId: 'job-stage-a', baseBranch: 'builder/stage-code' }));
+    const second = await runningJob(ctx, spec({ jobId: 'job-stage-b', baseBranch: 'builder/stage-code' }));
+    expect(second.worktreePath).toBe(first.worktreePath);
+    expect(second.branch).toBe('builder/stage-code');
+    await ctx.engine.cancel('job-stage-a');
+    await ctx.engine.cancel('job-stage-b');
+  });
+
+  it('fails workspace_setup_failed with an actionable message when the baseBranch is gone', async () => {
+    const ctx = makeEngine();
+    const { job } = await ctx.engine.createJob(spec({ jobId: 'job-bb-gone', baseBranch: 'builder/nope-nope' }));
+    const row = (await getJobByHubId(pool, 'job-bb-gone'))!;
+    expect(row.status).toBe('failed');
+    expect(row.errorCode).toBe('workspace_setup_failed');
+    expect(row.failureReason).toContain('builder/nope-nope');
+    expect(row.failureReason).toContain('rerun from an earlier pipeline stage');
+    void job;
+  });
+});
+
+describe('pipeline stages — parkOnTurnEnd (spec §4)', () => {
+  it('parks waiting_for_user with the final summary instead of succeeding (stage_gate)', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({ jobId: 'job-park', parkOnTurnEnd: true }));
+    const now = Date.now();
+    ctx.stub.messages[job.opencodeSessionId!] = [done('m-park', 'The plan is ready.', now)];
+    await ctx.engine.pollJob((await getJobByHubId(pool, 'job-park'))!);
+    await ctx.engine.drain();
+
+    const row = (await getJobByHubId(pool, 'job-park'))!;
+    expect(row.status).toBe('waiting_for_user');
+    expect(row.summary).toBe('The plan is ready.');
+    const types = await eventTypes(pool, row.id);
+    expect(types).not.toContain(EVENT.EXECUTION_SUCCEEDED);
+    const { rows: gate } = await pool.query<{ payload: { reason?: string; summary?: string } }>(
+      `SELECT payload FROM executor.job_events WHERE job_id = $1 AND event_type = $2 ORDER BY sequence_number DESC LIMIT 1`,
+      [row.id, EVENT.EXECUTION_STATUS_CHANGED]);
+    expect(gate[0]!.payload.reason).toBe('stage_gate');
+    expect(gate[0]!.payload.summary).toBe('The plan is ready.');
+    await ctx.engine.cancel('job-park');
+  });
+
+  it('resumes on a message and parks AGAIN on the next turn end', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({ jobId: 'job-park2', parkOnTurnEnd: true }));
+    const sessionId = job.opencodeSessionId!;
+    ctx.stub.messages[sessionId] = [done('m1', 'Draft one.', Date.now())];
+    await ctx.engine.pollJob((await getJobByHubId(pool, 'job-park2'))!);
+    await ctx.engine.drain();
+    expect((await getJobByHubId(pool, 'job-park2'))!.status).toBe('waiting_for_user');
+
+    await ctx.engine.sendMessage('job-park2', 'Revise: use Postgres.');
+    expect((await getJobByHubId(pool, 'job-park2'))!.status).toBe('running');
+    expect(ctx.stub.prompts).toHaveLength(2);
+
+    ctx.stub.messages[sessionId] = [done('m2', 'Revised with Postgres.', Date.now() + 1)];
+    await ctx.engine.pollJob((await getJobByHubId(pool, 'job-park2'))!);
+    await ctx.engine.drain();
+    const row = (await getJobByHubId(pool, 'job-park2'))!;
+    expect(row.status).toBe('waiting_for_user');
+    expect(row.summary).toBe('Revised with Postgres.');
+    await ctx.engine.cancel('job-park2');
+  });
+});
+
+describe('pipeline stages — verifyFirst (spec §4)', () => {
+  it('pass ⇒ succeeds with NO session ever created; the attempt counter includes the first run', async () => {
+    const ctx = makeEngine();
+    const { job } = await ctx.engine.createJob(spec({
+      jobId: 'job-vf-pass', verifyFirst: true, verificationCommand: 'true',
+    }));
+    const row = (await getJobByHubId(pool, 'job-vf-pass'))!;
+    expect(row.status).toBe('succeeded');
+    expect(row.errorCode).toBeNull();
+    expect(row.verificationAttemptCount).toBe(1);
+    expect(row.opencodeSessionId).toBeNull();
+    expect(ctx.stub.sessions).toHaveLength(0);
+    const types = await eventTypes(pool, row.id);
+    expect(types).toContain(EVENT.VERIFICATION_STARTED);
+    expect(types).toContain(EVENT.VERIFICATION_PASSED);
+    expect(types).toContain(EVENT.EXECUTION_SUCCEEDED);
+    void job;
+  });
+
+  it('fail ⇒ opens the session on the standard repair prompt; the repair loop then runs the SAME session', async () => {
+    const ctx = makeEngine();
+    await ctx.engine.createJob(spec({
+      jobId: 'job-vf-fail', verifyFirst: true, verificationCommand: 'false',
+    }));
+    let row = (await getJobByHubId(pool, 'job-vf-fail'))!;
+    expect({ status: row.status, code: row.errorCode, reason: row.failureReason }).toEqual({
+      status: 'running', code: null, reason: null,
+    });
+    expect(row.verificationAttemptCount).toBe(1);
+    expect(ctx.stub.sessions).toHaveLength(1);
+    expect(ctx.stub.prompts).toHaveLength(1);
+    expect(ctx.stub.prompts[0]!.text).toContain('The verification command `false` failed with exit code');
+    expect(ctx.stub.prompts[0]!.text).toContain('make the verification command pass');
+    let types = await eventTypes(pool, row.id);
+    expect(types).toContain(EVENT.VERIFICATION_FAILED);
+
+    // The agent's repair turn ends → the standard loop re-verifies (still
+    // failing) and prompts the SAME session for the next repair round.
+    const sessionId = row.opencodeSessionId!;
+    ctx.stub.messages[sessionId] = [done('m-fix', 'Fixed it (maybe).', Date.now())];
+    await ctx.engine.pollJob((await getJobByHubId(pool, 'job-vf-fail'))!);
+    await ctx.engine.drain();
+    row = (await getJobByHubId(pool, 'job-vf-fail'))!;
+    expect(row.verificationAttemptCount).toBe(2);
+    expect(ctx.stub.prompts).toHaveLength(2);
+    expect(ctx.stub.prompts[1]!.sessionId).toBe(sessionId);
+    expect(ctx.stub.prompts[1]!.text).toContain('verification command `false` failed');
+    types = await eventTypes(pool, row.id);
+    expect(types).toContain(EVENT.REPAIR_REQUESTED);
+    await ctx.engine.cancel('job-vf-fail');
+  });
+});
+
+describe('pipeline stages — rebaseFirst + job.rebase (spec §3.2/§4)', () => {
+  /** Branch <name> ahead of main with the given file edits. */
+  async function makeDivergedBranch(name: string, edits: Record<string, string>): Promise<void> {
+    await execGit(['checkout', '-b', name], { cwd: repoRoot });
+    for (const [path, content] of Object.entries(edits)) writeFileSync(join(repoRoot, path), content);
+    await execGit(['add', '-A', '--', '.'], { cwd: repoRoot });
+    await execGit(['commit', '-m', `${name} divergence`], { cwd: repoRoot, env: TEST_AUTHOR });
+    await execGit(['checkout', 'main'], { cwd: repoRoot });
+  }
+
+  it('rebaseFirst merges the base ref BEFORE the session opens (REBASE_MERGED precedes SESSION_CREATED)', async () => {
+    await makeDivergedBranch('side-clean', { 'side.txt': 'from the moved base\n' });
+    const ctx = makeEngine({ baseRef: 'side-clean' });
+    const job = await runningJob(ctx, spec({ jobId: 'job-rb-clean', rebaseFirst: true }));
+    expect(readFileSync(join(job.worktreePath, 'side.txt'), 'utf8')).toContain('from the moved base');
+    const types = await eventTypes(pool, job.id);
+    expect(types).toContain(EVENT.REBASE_MERGED);
+    expect(types.indexOf(EVENT.REBASE_MERGED)).toBeLessThan(types.indexOf(EVENT.SESSION_CREATED));
+    await ctx.engine.cancel('job-rb-clean');
+  });
+
+  it('rebaseFirst records REBASE_CLEAN and proceeds when the base never moved', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({ jobId: 'job-rb-uptodate', rebaseFirst: true }));
+    const types = await eventTypes(pool, job.id);
+    expect(types).toContain(EVENT.REBASE_CLEAN);
+    expect(types).toContain(EVENT.SESSION_CREATED);
+    await ctx.engine.cancel('job-rb-uptodate');
+    void job;
+  });
+
+  it('conflicts open a lazy repair session; the resolved turn end completes the merge and succeeds', async () => {
+    await makeDivergedBranch('side-conflict', { 'README.md': '# side version\n' });
+    // The job branch disagrees: its snapshot carries a different README.
+    writeFileSync(join(repoRoot, 'README.md'), '# main version\n');
+    try {
+      const ctx = makeEngine({ baseRef: 'side-conflict' });
+      const job = await runningJob(ctx, spec({ jobId: 'job-rb-conflict', rebaseFirst: true }));
+      // Conflict → lazy repair session on the conflict prompt.
+      expect(ctx.stub.sessions).toHaveLength(1);
+      expect(ctx.stub.prompts).toHaveLength(1);
+      expect(ctx.stub.prompts[0]!.text).toContain('merge conflicts');
+      expect(ctx.stub.prompts[0]!.text).toContain('README.md');
+      const types1 = await eventTypes(pool, job.id);
+      expect(types1).toContain(EVENT.REBASE_CONFLICTS);
+      expect(types1).not.toContain(EVENT.PROMPT_SENT);
+      expect(await listUnmergedPaths(execGit, job.worktreePath)).toContain('README.md');
+
+      // Play the agent: resolve + stage + commit, then end the turn.
+      writeFileSync(join(job.worktreePath, 'README.md'), '# resolved\n');
+      await execGit(['add', '--', 'README.md'], { cwd: job.worktreePath });
+      await execGit(['commit', '--no-edit'], { cwd: job.worktreePath, env: TEST_AUTHOR });
+      ctx.stub.messages[job.opencodeSessionId!] = [done('m-repaired', 'Conflicts resolved.', Date.now())];
+      await ctx.engine.pollJob((await getJobByHubId(pool, 'job-rb-conflict'))!);
+      await ctx.engine.drain();
+
+      const row = (await getJobByHubId(pool, 'job-rb-conflict'))!;
+      expect(row.status).toBe('succeeded');
+      const types2 = await eventTypes(pool, row.id);
+      expect(types2).toContain(EVENT.REBASE_MERGED);
+      expect(types2).toContain(EVENT.EXECUTION_SUCCEEDED);
+      expect(readFileSync(join(job.worktreePath, 'README.md'), 'utf8')).toBe('# resolved\n');
+    } finally {
+      writeFileSync(join(repoRoot, 'README.md'), '# test repo\n'); // un-dirty the shared repo
+    }
+  });
+
+  it('bounded repair: 3 unresolved rounds ⇒ failed merge_conflict with the conflict list', async () => {
+    await makeDivergedBranch('side-stuck', { 'README.md': '# side stuck\n' });
+    writeFileSync(join(repoRoot, 'README.md'), '# main stuck\n');
+    try {
+      const ctx = makeEngine({ baseRef: 'side-stuck' });
+      const job = await runningJob(ctx, spec({ jobId: 'job-rb-stuck', rebaseFirst: true }));
+      const sessionId = job.opencodeSessionId!;
+      for (const round of [1, 2, 3]) {
+        ctx.stub.messages[sessionId] = [done(`m-stuck-${round}`, `Round ${round} did not help.`, Date.now() + round)];
+        await ctx.engine.pollJob((await getJobByHubId(pool, 'job-rb-stuck'))!);
+        await ctx.engine.drain();
+      }
+      const row = (await getJobByHubId(pool, 'job-rb-stuck'))!;
+      expect(row.status).toBe('failed');
+      expect(row.errorCode).toBe('merge_conflict');
+      expect(row.failureReason).toContain('README.md');
+      const types = await eventTypes(pool, row.id);
+      expect(types).toContain(EVENT.REBASE_FAILED);
+      expect(ctx.stub.prompts).toHaveLength(3); // initial conflict prompt + 2 re-prompts
+    } finally {
+      writeFileSync(join(repoRoot, 'README.md'), '# test repo\n');
+    }
+  });
+
+  it('job.rebase: 404 unknown job, 409 a terminal job (no live worktree), up_to_date when already current', async () => {
+    const ctx = makeEngine();
+    await expect(ctx.engine.rebaseJob('job-nope-404')).rejects.toMatchObject({ statusCode: 404 });
+    const job = await runningJob(ctx, spec({ jobId: 'job-rbop-t' }));
+    // Finish it first — a terminal row has no live worktree for the op.
+    ctx.stub.messages[job.opencodeSessionId!] = [done('m-done', 'Finished.', Date.now())];
+    await ctx.engine.pollJob((await getJobByHubId(pool, 'job-rbop-t'))!);
+    await ctx.engine.drain();
+    expect((await getJobByHubId(pool, 'job-rbop-t'))!.status).toBe('succeeded');
+    await expect(ctx.engine.rebaseJob('job-rbop-t')).rejects.toMatchObject({ statusCode: 409 });
+
+    const live = await runningJob(ctx, spec({ jobId: 'job-rbop-live' }));
+    await expect(ctx.engine.rebaseJob('job-rbop-live')).resolves.toEqual({ status: 'up_to_date' });
+    const types = await eventTypes(pool, live.id);
+    expect(types).toContain(EVENT.REBASE_CLEAN);
+    await ctx.engine.cancel('job-rbop-live');
+  });
+
+  it('job.rebase conflicts ⇒ conflicts_repairing + repair prompt on the SAME session; a repeat call is idempotent', async () => {
+    await makeDivergedBranch('side-op', { 'README.md': '# side op\n' });
+    writeFileSync(join(repoRoot, 'README.md'), '# main op\n');
+    try {
+      const ctx = makeEngine({ baseRef: 'side-op' });
+      const job = await runningJob(ctx, spec({ jobId: 'job-rbop-conf' })); // normal launch, session exists
+      const before = ctx.stub.prompts.length;
+      await expect(ctx.engine.rebaseJob('job-rbop-conf')).resolves.toMatchObject({
+        status: 'conflicts_repairing', conflicts: ['README.md'],
+      });
+      expect(ctx.stub.prompts.length).toBe(before + 1);
+      expect(ctx.stub.prompts.at(-1)!.sessionId).toBe(job.opencodeSessionId);
+      expect(ctx.stub.prompts.at(-1)!.text).toContain('merge conflicts');
+      // Idempotent while the repair turn runs: no new prompt, same answer.
+      await expect(ctx.engine.rebaseJob('job-rbop-conf')).resolves.toEqual({ status: 'conflicts_repairing' });
+      expect(ctx.stub.prompts.length).toBe(before + 1);
+      await ctx.engine.cancel('job-rbop-conf');
+    } finally {
+      writeFileSync(join(repoRoot, 'README.md'), '# test repo\n');
+    }
   });
 });
 

@@ -111,10 +111,14 @@ export function executorCapabilities(config: Pick<ExecutorConfig, 'upgradeComman
     terminals: true,
     terminalSync: true,
     modelPolicy: true,
-    // NOTE: `nativeAgents` (worktree persona materialization) is intentionally
-    // NOT advertised until the engine reconcile (Task 2.8) ports the
-    // monorepo's agent-materialization code path — advertising it first would
-    // make the hub send personas this engine can't honor.
+    // Pipeline stages (design 2026-10-15): the hub may dispatch stage jobs
+    // carrying baseBranch/verifyFirst/rebaseFirst/parkOnTurnEnd and call
+    // job.rebase. Gated hub-side on this flag.
+    pipelines: true,
+    // The executor materializes a job's shipped persona natively in the
+    // worktree (`.opencode/agents/<name>.md` + MCP fragment, pinned on the
+    // session) — remote runs get the persona's skills + MCP like local ones.
+    nativeAgents: true,
     ...(resolveUpgradeCommand(config) ? { selfUpgrade: true } : {}),
   };
 }

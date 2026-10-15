@@ -205,6 +205,54 @@ export async function listUnmergedPaths(runner: GitRunner, worktreePath: string)
   return out.stdout.split('\0').filter(Boolean);
 }
 
+/** The rebase/pull step shared by the `rebaseFirst` stage branch and the
+ *  `job.rebase` op (spec 2026-10-15 §3.2/§4): merge the base ref into the
+ *  job's live worktree. Remote `origin/<baseRef>` wins when an origin
+ *  remote exists (freshly fetched, best effort); local-registered projects
+ *  fall back to the branch tip itself. */
+export interface PullBaseResult {
+  status: 'up_to_date' | 'merged' | 'conflicts';
+  /** Populated only for the conflicts outcome. */
+  conflicts: string[];
+  /** HEAD after a clean merge (null for up_to_date/conflicts). */
+  mergeSha: string | null;
+}
+
+export async function pullBaseIntoWorktree(
+  runner: GitRunner,
+  input: { repoRoot: string; worktreePath: string; baseRef: string },
+): Promise<PullBaseResult> {
+  let source = input.baseRef;
+  const remotes = await runner(['remote'], { cwd: input.worktreePath });
+  if (remotes.code === 0 && remotes.stdout.split('\n').map((name) => name.trim()).includes('origin')) {
+    await runner(['fetch', 'origin', input.baseRef], { cwd: input.worktreePath }); // best-effort freshness
+    const remote = await runner(['rev-parse', '--verify', '--quiet', `origin/${input.baseRef}^{commit}`], { cwd: input.worktreePath });
+    if (remote.code === 0 && remote.stdout.trim()) source = `origin/${input.baseRef}`;
+  }
+  const before = (await mustGit(runner, ['rev-parse', 'HEAD'], { cwd: input.worktreePath })).trim();
+  const merge = await runner(['merge', '--no-edit', source], { cwd: input.worktreePath });
+  if (merge.code === 0) {
+    const after = (await mustGit(runner, ['rev-parse', 'HEAD'], { cwd: input.worktreePath })).trim();
+    return { status: after === before ? 'up_to_date' : 'merged', conflicts: [], mergeSha: after === before ? null : after };
+  }
+  const conflicts = await listUnmergedPaths(runner, input.worktreePath);
+  if (conflicts.length === 0) {
+    throw new WorkspaceError(`git merge ${source} failed in the worktree: ${merge.stderr.trim() || merge.stdout.trim() || 'unknown error'}`);
+  }
+  return { status: 'conflicts', conflicts, mergeSha: null };
+}
+
+/** Finalize an in-progress merge after the agent resolved every unmerged
+ *  path. Tolerates the agent committing itself (no MERGE_HEAD left): the
+ *  current tip then stands as the merge result. Returns HEAD's sha. */
+export async function completeWorktreeMerge(runner: GitRunner, worktreePath: string): Promise<string> {
+  const inProgress = await runner(['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'], { cwd: worktreePath });
+  if (inProgress.code === 0) {
+    await mustGit(runner, ['commit', '--no-edit'], { cwd: worktreePath });
+  }
+  return (await mustGit(runner, ['rev-parse', 'HEAD'], { cwd: worktreePath })).trim();
+}
+
 /** Stage and commit everything the agent left in the worktree. Refuses a
  *  worktree with unresolved merge conflicts (their markers would land on
  *  the base branch). */
