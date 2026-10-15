@@ -10,6 +10,7 @@ import { JobEngine } from './engine.js';
 import { EXECUTOR_VERSION } from './config.js';
 import { claimPairing, PairingError } from './pairing.js';
 import { registerRoutes } from './routes.js';
+import { validateJobBody } from './ops.js';
 import type { TerminalRegistry } from './terminals.js';
 import { createUpgrader, type UpgradeSpawn } from './upgrade.js';
 import { testConfig, wipeJobs } from './testkit.js';
@@ -427,6 +428,57 @@ describe('POST /api/v1/upgrade (self-upgrade op)', () => {
     expect(res.json().error).toContain('no bash here');
     const state = JSON.parse(readFileSync(upgraderPaths.stateFile, 'utf8')) as { phase: string };
     expect(state.phase).toBe('failed');
+  });
+});
+
+describe('pipeline stage-field validation (spec 2026-10-15 §3.1)', () => {
+  // validateJobBody drives both the HTTP route and the gateway dispatcher —
+  // exercising it directly keeps these cases immune to the route rate limits
+  // (the full-file run fires dozens of POSTs before this block).
+  const validate = (overrides: Record<string, unknown>) => validateJobBody(validJob(overrides));
+
+  it('accepts each stage field alone and a fully-flagged rebase-stage spec', () => {
+    expect(validate({ baseBranch: 'builder/abc-stage' }).spec?.baseBranch).toBe('builder/abc-stage');
+    expect(validate({ verifyFirst: true, verificationCommand: 'npm test' }).spec?.verifyFirst).toBe(true);
+    expect(validate({ rebaseFirst: true, verificationCommand: 'npm test' }).spec?.rebaseFirst).toBe(true);
+    expect(validate({ parkOnTurnEnd: true, verificationCommand: undefined }).spec?.parkOnTurnEnd).toBe(true);
+    const full = validate({ baseBranch: 'builder/abc-rebase', rebaseFirst: true, verificationCommand: 'npm test' }).spec;
+    expect(full).toMatchObject({ baseBranch: 'builder/abc-rebase', rebaseFirst: true });
+  });
+
+  it('legacy specs (no stage fields) stay fieldless', () => {
+    const spec = validate({});
+    expect(spec.error).toBeUndefined();
+    expect(spec.spec).not.toHaveProperty('baseBranch');
+    expect(spec.spec).not.toHaveProperty('verifyFirst');
+  });
+
+  it('rejects malformed baseBranch', () => {
+    expect(validate({ baseBranch: 5 }).error).toBeTruthy();
+    expect(validate({ baseBranch: '' }).error).toBeTruthy();
+    expect(validate({ baseBranch: 'has space' }).error).toBeTruthy();
+    expect(validate({ baseBranch: 'x'.repeat(301) }).error).toBeTruthy();
+  });
+
+  it('enforces verifyFirst ⇔ verificationCommand', () => {
+    expect(validate({ verifyFirst: true, verificationCommand: '' }).error).toContain('verificationCommand');
+    expect(validate({ verifyFirst: true, verificationCommand: undefined }).error).toContain('verificationCommand');
+  });
+
+  it('the three stage modes are mutually exclusive', () => {
+    expect(validate({ verifyFirst: true, rebaseFirst: true, verificationCommand: 'npm test' }).error).toContain('mutually exclusive');
+    expect(validate({ parkOnTurnEnd: true, verifyFirst: true, verificationCommand: 'npm test' }).error).toContain('mutually exclusive');
+    expect(validate({ parkOnTurnEnd: true, rebaseFirst: true }).error).toContain('mutually exclusive');
+  });
+
+  it('parkOnTurnEnd forbids a verificationCommand entirely', () => {
+    expect(validate({ parkOnTurnEnd: true, verificationCommand: 'npm test' }).error).toBeTruthy();
+  });
+
+  it('stage fields must be booleans when present', () => {
+    expect(validate({ verifyFirst: 'yes' }).error).toBeTruthy();
+    expect(validate({ rebaseFirst: 1 }).error).toBeTruthy();
+    expect(validate({ parkOnTurnEnd: 'true' }).error).toBeTruthy();
   });
 });
 

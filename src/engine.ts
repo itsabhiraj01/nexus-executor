@@ -122,6 +122,19 @@ export interface JobSpecInput {
   agent?: JobAgentMaterialization | null;
   attachments?: JobAttachmentInput[];
   retry?: JobRetrySpec | null;
+  /** Pipeline stage: attach to this EXISTING branch instead of cutting a new
+   *  worktree (missing branch at launch ⇒ workspace_setup_failed — a branch
+   *  is sacred, never silently re-cut). */
+  baseBranch?: string;
+  /** Pipeline stage: run verification BEFORE any agent prompt (fail ⇒ a
+   *  repair session; pass ⇒ the job ends with NO session at all). */
+  verifyFirst?: boolean;
+  /** Pipeline stage: pull the base ref into the worktree BEFORE anything
+   *  else (conflicts open a bounded repair loop). */
+  rebaseFirst?: boolean;
+  /** Pipeline stage: park waiting_for_user at turn end instead of
+   *  verifying+succeeding (a message resumes; the next turn end parks again). */
+  parkOnTurnEnd?: boolean;
 }
 
 export interface JobRow {

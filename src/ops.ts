@@ -234,6 +234,40 @@ export function validateJobBody(body: unknown): { spec?: JobSpecInput; error?: s
     }
   }
 
+  /* Pipeline stage fields (docs/superpowers/specs/2026-10-15-remote-pipelines
+   * -design.md §3.1 — the hub's stage machine drives one job per stage).
+   * Verbatim mirror: modules/builder/src/gateway-protocol.ts +
+   * nexus-gateway protocol/nexus.ts — the three must stay identical. */
+  let baseBranch: string | undefined;
+  if (input.baseBranch !== undefined && input.baseBranch !== null) {
+    if (typeof input.baseBranch !== 'string' || input.baseBranch.length > 300 || !/^[A-Za-z0-9/._-]+$/.test(input.baseBranch)) {
+      return { error: 'baseBranch must be a string ≤ 300 chars matching ^[A-Za-z0-9/._-]+$.' };
+    }
+    baseBranch = input.baseBranch;
+  }
+  const trinary = (value: unknown, key: string): boolean | string => {
+    if (value === undefined || value === null || value === false) return false;
+    if (value === true) return true;
+    return `${key} must be a boolean.`;
+  };
+  const verifyFirst = trinary(input.verifyFirst, 'verifyFirst');
+  if (typeof verifyFirst === 'string') return { error: verifyFirst };
+  const rebaseFirst = trinary(input.rebaseFirst, 'rebaseFirst');
+  if (typeof rebaseFirst === 'string') return { error: rebaseFirst };
+  const parkOnTurnEnd = trinary(input.parkOnTurnEnd, 'parkOnTurnEnd');
+  if (typeof parkOnTurnEnd === 'string') return { error: parkOnTurnEnd };
+  const modes = [verifyFirst, rebaseFirst, parkOnTurnEnd].filter(Boolean).length;
+  if (modes > 1) {
+    return { error: 'verifyFirst, rebaseFirst and parkOnTurnEnd are mutually exclusive (one job = one stage mode).' };
+  }
+  const hasVerification = typeof input.verificationCommand === 'string' && input.verificationCommand.trim().length > 0;
+  if (verifyFirst && !hasVerification) {
+    return { error: 'verifyFirst requires a non-empty verificationCommand.' };
+  }
+  if (parkOnTurnEnd && hasVerification) {
+    return { error: 'parkOnTurnEnd jobs must not carry a verificationCommand — the stage parks instead of verifying.' };
+  }
+
   let attachments: JobSpecInput['attachments'] = [];
   if (input.attachments !== undefined && input.attachments !== null) {
     if (!Array.isArray(input.attachments) || input.attachments.length > MAX_ATTACHMENTS) {
@@ -272,6 +306,10 @@ export function validateJobBody(body: unknown): { spec?: JobSpecInput; error?: s
       agent,
       attachments,
       retry,
+      ...(baseBranch !== undefined ? { baseBranch } : {}),
+      ...(verifyFirst ? { verifyFirst: true } : {}),
+      ...(rebaseFirst ? { rebaseFirst: true } : {}),
+      ...(parkOnTurnEnd ? { parkOnTurnEnd: true } : {}),
     },
   };
 }
