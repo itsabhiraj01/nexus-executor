@@ -107,6 +107,56 @@ new feasibility record, not a chore.
   newest position); the earlier "wrong position" observation was entirely
   explained by async durability.
 
+### Task 7 — container probe, real-model smoke, defaults (2026-10-15)
+
+- **Container probe:** zero install hooks and zero native bindings across
+  deepagents / langchain / @langchain/* / zod; the only `hasInstallScript`
+  packages in the whole tree are the pre-existing `node-pty` and `esbuild`
+  (via tsx) — the stack joins the executor container with
+  `npm install --ignore-scripts` unchanged (probe.test.ts pins this).
+- **Real-model smoke** (`npm run harness:smoke`, env-gated on
+  `HARNESS_SMOKE_BASE_URL`/`HARNESS_SMOKE_MODEL`; ran against local Ollama
+  `llama3.2:latest`): usage events carried REAL token counts (2016 in / 28
+  out), a mal-formed tool call (tiny-model artifact) failed as
+  `exit_nonzero` and the loop carried on, the run completed (`DONE`). That
+  run proves provider plumbing + streaming + tool wiring + failing-tool
+  tolerance end to end.
+- **Budget coherence rule (new):** the model client's HTTP `timeout` must
+  EXCEED the watchdog's `firstChunkMs`, or the client cancels first
+  (`model_error: Request timed out.` hides a watchdog-shaped problem).
+  Gate 2 must derive one from the other; smoke relaxes firstChunk to 120 s
+  and HTTP to 300 s for cold local models.
+
+## Merge strategy (Gate 2 boundary)
+
+Gate 1 landed ONLY inside `src/harness/` — the current engine still drives
+OpenCode for every job; NOTHING in the harness module is wired into job
+execution yet. Gate 2 (its own plan) flips one bolt at a time: engine slot
+behind `pairing.capabilities.harnesses` advertisement, an opt-in harness
+field on dispatch, and the result/commander protocol. Reverting the pilot
+at any point = deleting `src/harness/` + the manifest pins — no engine
+surface moved yet, by design.
+
+## Report-completion checklist (Gate 1 deliverable)
+
+- [x] Deliberation-question evidence: first/cliff risks answered by code —
+      tool kill reaps TERM-ignoring groups; watchdog kills chatty-forever
+      streams at the absolute cap; tool failures (timeout/nonzero) do NOT
+      end the loop; cancel resolves hangs via the watchdog abort race;
+      interrupts resume across a REAL Postgres restart with exactly-once
+      replies; adapter construction is failure-clean (error events, never
+      silent wedging).
+- [x] New limits with sane clamps (`limits.ts`: tool 10 s–50 min,
+      watchdog gaps, 30-min turn cap, 256 KiB output, ≤120 s tool args;
+      smoke documents the HTTP-vs-watchdog coherence rule).
+- [x] Upstream caveats encountered (all recorded above): no
+      `FakeToolCallingChatModel` in @langchain/core 1.2.17;
+      `durability:'sync'` is mandatory; `getState().tasks[].interrupts` is
+      empty for cross-instance push-task interrupts; `list()` ≠ `getTuple()`
+      on `pendingWrites`; langgraph's stream `signal` does not wake a
+      pending model call; ChatOpenAI 1.6.2 observable fields are
+      `model`/`timeout`/`clientConfig`.
+
 ## Known limits
 
 _(Finalized at Task 7 — anything not yet proven is listed here instead of
