@@ -15,8 +15,11 @@ export default defineConfig({
     // Job worktrees under data/ are full clones of the repos jobs ran on —
     // they contain the clone's OWN test suites (which need deps this
     // package does not install). Sweep leftovers would otherwise be
-    // crawled by every `npm test`. (Setting `exclude` replaces vitest's
-    // defaults, so node_modules/dist are repeated explicitly.)
-    exclude: ['**/node_modules/**', '**/dist/**', 'data/**'],
+    // crawled by every `npm test`. `scripts/` is excluded because the
+    // installer's suites are node:test files (run them with
+    // `make test-install` = `node --test scripts/`) — vitest finds no
+    // suite in them and fails the file. (Setting `exclude` replaces
+    // vitest's defaults, so node_modules/dist are repeated explicitly.)
+    exclude: ['**/node_modules/**', '**/dist/**', 'data/**', 'scripts/**'],
   },
 });
