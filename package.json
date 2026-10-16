@@ -15,7 +15,8 @@
     "test": "vitest run",
     "cli": "tsx src/cli/cli.ts",
     "pair": "tsx src/cli/cli.ts pair",
-    "harness:smoke": "tsx src/harness/smoke.ts"
+    "harness:smoke": "tsx src/harness/smoke.ts",
+    "repair": "tsx src/cli/cli.ts repair"
   },
   "bin": {
     "nexus-executor": "bin/nexus-executor"

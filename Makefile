@@ -1,6 +1,15 @@
-.PHONY: install build migrate dev test start pair docker-build docker-up docker-down clean
+.PHONY: install update db-backup deps build migrate dev test test-install start pair repair docker-build docker-up docker-down clean
 
 install:
+	bash ./install.sh $(ARGS)
+
+update:
+	bash ./install.sh $(ARGS)
+
+db-backup:
+	node scripts/database.mjs backup
+
+deps:
 	npm ci
 
 build:
@@ -15,11 +24,17 @@ dev:
 test:
 	npm test
 
+test-install:
+	node --test scripts/*.test.mjs
+
 start:
 	npm start
 
 pair:
 	npm run pair
+
+repair:
+	npm run repair
 
 docker-build:
 	docker compose build

@@ -48,8 +48,126 @@ One-way trust:
 
 ## Quickstart — bare metal
 
+### Install/update the Linux services
+
+Prerequisites: Node.js ≥22, git, npm, tmux, OpenCode V2 on `PATH`, native
+PostgreSQL server/client binaries, Python, make, and a C++ compiler.
+On Ubuntu/Debian: `sudo apt install postgresql postgresql-client build-essential python3 tmux`.
+**Docker/Podman is not required.** Run the installer as your normal user,
+not root. It creates its own PostgreSQL cluster, separate from any system
+PostgreSQL cluster. Configure OpenCode model/provider credentials separately.
+
+For an existing Nix installation, install prerequisites without sudo using
+`nix profile add nixpkgs#gcc nixpkgs#postgresql_16` (keep the PostgreSQL major
+version compatible with the source database). Ensure `~/.nix-profile/bin`
+is on `PATH`; the installer records the resolved PostgreSQL package directory.
+
+From a cloned checkout with an upstream tracking branch:
+
 ```bash
-make install                 # npm ci
+make install                 # pull latest code, build, DB, migrations, systemd
+# Or install and pair in one command:
+bash ./install.sh --gateway https://gateway.example.com --code <CODE>
+make update                  # same full-stack workflow; no re-pairing
+# Equivalent: bash ./install.sh   or   nexus-executor update
+```
+
+The installer manages **user-level** systemd units:
+
+- `opencode-executor.service`: authenticated OpenCode on `127.0.0.1:4096`.
+- `nexus-db.service`: native PostgreSQL on `127.0.0.1:5556`, with durable
+  data under `~/.local/share/nexus-executor/postgres` and a private Unix socket.
+- `nexus-executor.service`: waits for PostgreSQL, applies migrations, then
+  runs the built executor. Startup also reapplies pending migrations safely.
+
+It enables user lingering for boot startup without login. If authorization
+is required, run `sudo loginctl enable-linger "$USER"` and retry.
+Install does not install OS packages or the OpenCode binary for you.
+
+The first install generates an OpenCode password unless one is already
+configured. It preserves the password on updates and stores matching
+`OPENCODE_SERVER_PASSWORD` and `OPENCODE_TOKEN` in mode-0600 files
+`~/.config/nexus-executor/opencode.env` and `executor.env`. Database passwords
+are generated separately and preserved in `native-db.env`. The checkout's
+`.env` is preserved and updated with the same local OpenCode settings so
+manual CLI commands work too. Edit `.env`, then rerun install to refresh
+the service environment. `XDG_CONFIG_HOME` and `XDG_DATA_HOME` are respected.
+
+The workflow uses `git pull --ff-only`, refuses tracked uncommitted changes,
+builds before stopping the executor, takes a validated database backup,
+restarts native PostgreSQL, runs migrations, then restarts both applications.
+A failed backup, restore or migration prevents application restarts and
+leaves the original `.env` unchanged; fix the error and rerun. Neither database
+data nor pairing identities are deleted. Updates pull the checkout's tracked branch, not an
+arbitrary branch; repeat installs do not prompt for pairing unless `--pair`
+or `--code` is supplied.
+
+Options: `--postgres-bin DIR` (directory containing PostgreSQL tools),
+`--db-port PORT` (first install only; default 5556), `--backup-dir DIR`,
+`--external-db` (keep an existing database without provisioning a server),
+`--migrate-db` (explicit backup/restore cutover), `--no-pull` (install the
+current checkout), `--dry-run` (print the plan without changing anything).
+For example: `make install ARGS="--no-pull --external-db"`. External databases
+also get a pre-migration backup and need `pg_dump`/`pg_restore` installed.
+The installer manages a local OpenCode server, not a remote URL, and does
+not upgrade the OpenCode binary or PostgreSQL major version automatically.
+
+#### Preserve an existing database / migrate to nexus-db
+
+An existing `.env` connection is **never silently replaced**. To move its
+executor database into the separate native cluster:
+
+```bash
+# First make the existing DATABASE_URL reachable, then:
+make db-backup               # standalone backup; no service/config changes
+make install ARGS="--migrate-db"
+# For an uncommitted/local checkout: add --no-pull
+```
+
+The installer stops the local executor to quiesce its writes. Quiesce any
+other writers yourself during cutover. It dumps only the configured executor
+database (not the entire source cluster), verifies the archive catalog and
+SHA-256 checksum, initializes `nexus-db` on a different port, and restores
+with `pg_restore --single-transaction --exit-on-error`. Nonempty targets are
+rejected; no `DROP`, `--clean`, source-container stop, volume deletion or
+in-place data-directory migration is performed. Role ownership is remapped
+to the native executor role; source ACLs/cluster-wide roles are not copied.
+The source database remains intact. Only after restore and migrations
+succeed does `.env` switch to the native database.
+
+Backups live in timestamped private directories under
+`~/.local/share/nexus-executor/backups` (or `--backup-dir`), with
+`database.dump`, `manifest.json` and, when present, the original `source.env`.
+There is no automatic backup deletion. Keep another copy off the machine.
+For connection URLs requiring SSL/query options, supply a supported plain
+PostgreSQL URL or use an independently verified backup procedure first;
+this backup helper refuses query options instead of silently ignoring them.
+
+A retry after a completed restore resumes that target; it never overwrites
+it or merges subsequent source writes. Keep other writers paused until the
+cutover finishes. For rollback, stop `nexus-executor`, restore the selected
+backup's `source.env` as `.env`, then use `--external-db --no-pull` to regenerate
+service configuration against the original database. Do not discard the
+native cluster: writes after cutover are not present in the old source.
+Native clusters keep their recorded PostgreSQL major version; upgrades need
+an explicit dump/restore rather than reinitialization.
+
+The CLI is linked into `~/.local/bin`; ensure that directory is on `PATH`.
+If you pair separately after installation, restart the executor to load the
+new pairing state:
+
+```bash
+nexus-executor pair --gateway https://gateway.example.com --code <CODE>
+systemctl --user restart nexus-executor
+systemctl --user status nexus-executor opencode-executor nexus-db
+journalctl --user -u nexus-executor -f
+make test-install            # mocked install/update tests; no live DB/services
+```
+
+### Manual development setup (no systemd)
+
+```bash
+make deps                    # npm ci only, without deployment
 cp .env.example .env         # then edit DATABASE_URL, OPENCODE_*, EXECUTOR_TRANSPORT/GATEWAY_URL or HUB_URL
 make migrate                 # apply src/migrations to DATABASE_URL
 make build
@@ -93,14 +211,10 @@ dial-back bearer-token security model above describes **direct mode**.
 Full office-box/OpenCode instructions:
 [gateway setup runbook](../docs/nexus-executor-gateway-setup.md).
 
-Recommended layout: **Postgres in Podman; executor and OpenCode on the host**.
-The supplied Compose database has no published host port. Before running
-host `make` commands, add this to the `db` service in `docker-compose.yml`:
-
-```yaml
-    ports:
-      - "127.0.0.1:5544:5432"
-```
+Recommended layout: **native Postgres, executor and OpenCode under systemd**,
+using the installer above. The following is an optional manual Podman layout.
+The supplied Compose database publishes only `127.0.0.1:5555:5432`.
+Start it manually (the native installer does not manage containers):
 
 ```sh
 podman compose stop executor
@@ -112,7 +226,7 @@ podman compose port db 5432
 Wait for Postgres to accept connections, then set the host `.env`:
 
 ```ini
-DATABASE_URL=postgres://nexus_executor:nexus_executor@127.0.0.1:5544/nexus_executor
+DATABASE_URL=postgres://nexus_executor:nexus_executor@127.0.0.1:5555/nexus_executor
 ```
 
 Run `make migrate`, then pair with `nexus-executor pair --gateway
@@ -173,8 +287,8 @@ is not automatically copied into the container.
 ## Control CLI
 
 `nexus-executor` is the executor's control command (via `bin/nexus-executor`;
-`npm link` or `npm i -g` make it available on `PATH`, and `install.sh`
-provisions a machine). When run from a checkout, it **loads `<cwd>/.env`
+`npm link` makes it available on `PATH`, and `install.sh` links it in
+`~/.local/bin` and provisions user services). When run from a checkout, it **loads `<cwd>/.env`
 automatically** (Node's built-in `--env-file` semantics via
 `process.loadEnvFile`), so `./bin/nexus-executor pair` works without manually
 exporting `DATABASE_URL` etc. — matching how `make start` gets its config. An
@@ -186,6 +300,7 @@ explicitly exported variable is never overridden.
     nexus-executor pair --hub URL --code CODE       → direct transport
     nexus-executor status --json
     nexus-executor doctor --json
+    nexus-executor repair [--json] [--hold-ms N]  → diagnose gateway/hub connectivity
     nexus-executor unpair
     nexus-executor project add <name> --dir <abs-path> [--remote <url>]
     nexus-executor project list
@@ -196,10 +311,30 @@ explicitly exported variable is never overridden.
     nexus-executor logs
     nexus-executor update
 
-Install a fresh machine with:
+Install from a cloned checkout with:
 
-    curl -fsSL https://executor.example.com/install | bash
-    curl -fsSL https://executor.example.com/install | bash -s -- --gateway URL --code CODE
+    bash ./install.sh
+    bash ./install.sh --gateway URL --code CODE
+
+`nexus-executor repair` (or `make repair`) is the connectivity diagnosis for
+the gateway transport: static checks (config, identity keypair, local
+services, clock) followed by live probes of the full chain
+(executor → Cloudflare → cloudflared → Caddy → nexus-gateway → hub). Its two
+`/v1/connect` probes — one with this executor's real proof, one with
+well-shaped garbage — localize a failure without server access:
+
+| valid probe | invalid probe | verdict |
+| --- | --- | --- |
+| holds open | rejected | `healthy` |
+| closed 1011 | rejected | `hub-session-open-failure` — auth passes, the hub's session-open errors (server-side) |
+| closed 1011 | same 1011 | `hub-call-failure` — the gateway's hub call errors before/regardless of auth |
+| rejected | rejected | `identity-rejected` — re-pair with a fresh identity |
+
+It prints targeted fixes (with the exact server-side commands) and exits 1
+when something is broken, so it works in cron/scripts. The valid probe opens
+a real session for `--hold-ms` (default 3s): run it when the executor is
+idle if you are worried about a job being routed to a socket that will not
+answer. Never prints the credential or private key.
 
 ## Executor-owned projects (project registry)
 

@@ -59,9 +59,10 @@ Usage:
   nexus-executor status         show pairing + runtime status  (--json)
   nexus-executor version        print versions
   nexus-executor doctor         self-check pairing status      (--json)
+  nexus-executor repair         diagnose gateway/hub connectivity, suggest fixes (--json)
   nexus-executor config         print effective config
   nexus-executor logs           tail the service log
-  nexus-executor update         pull, build, restart (best-effort)
+  nexus-executor update         pull, build, migrate, restart user services
   nexus-executor help           show this help
 
 Run 'nexus-executor <cmd> --help' for flags.
@@ -117,6 +118,13 @@ export async function runCli(
       const text = await doctor({ argv: rest });
       print(text);
       return text;
+    }
+    case 'repair': {
+      const { repairFromCli } = await import('./repair.js');
+      const result = await repairFromCli({ argv: rest });
+      print(result.text);
+      if (!result.ok) exit(1);
+      return result.text;
     }
     case 'config': {
       const { configText } = await import('./config.js');
