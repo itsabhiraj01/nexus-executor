@@ -56,7 +56,7 @@ Usage:
   nexus-executor project list
   nexus-executor project show <name>
   nexus-executor project rm <name>
-  nexus-executor status         show pairing + runtime status  (--json)
+  nexus-executor status         pairing, gateway connection (+last error), running jobs/builds (--json)
   nexus-executor version        print versions
   nexus-executor doctor         self-check pairing status      (--json)
   nexus-executor repair         diagnose gateway/hub connectivity, suggest fixes (--json)

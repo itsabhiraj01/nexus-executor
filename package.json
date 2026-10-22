@@ -15,6 +15,7 @@
     "test": "vitest run",
     "cli": "tsx src/cli/cli.ts",
     "pair": "tsx src/cli/cli.ts pair",
+    "status": "tsx src/cli/cli.ts status",
     "harness:smoke": "tsx src/harness/smoke.ts",
     "repair": "tsx src/cli/cli.ts repair"
   },

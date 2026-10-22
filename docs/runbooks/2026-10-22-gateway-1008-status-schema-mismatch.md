@@ -111,3 +111,56 @@ journalctl --user -u nexus-executor -n 50
 
 The executor's reconnect loop never gives up — it starts passing traffic the
 moment the gateway is updated, no executor restart required.
+
+## 7. Second signature (same day, 21:30 IST): `job.get` / `terminal.list` responses
+
+After the gateway picked up the `status.get` whitelist fix (~19:07), sessions
+held — until the hub dispatched the **first job** (`3e3d4bb3`, 21:29:23). The
+hub then polls `job.get` and `terminal.list`; the service answers both through
+`handleGatewayOperation`, and the gateway 1008s the session within ~500 ms of
+the first answer. The hub re-polls at every session open ⇒ the fast-flap
+returns whenever a job or the console's terminal panel is live.
+
+Bisection (one canned response per connect; silence always held):
+
+| Answer to | Payload | Result |
+|---|---|---|
+| `terminal.list` | `{sessions: []}` | **1008** ~340 ms |
+| `terminal.list` | `{sessions: [<session incl. `tmuxClients`/`origin`>]}` | **1008** |
+| `terminal.list` | `{sessions: [<old-shape session>]}` | **1008** |
+| `terminal.list` | `{}` / `[]` / `{terminals: []}` | **1008** |
+| `job.get` | flat full body (22 fields incl. `verification`, `eventCount`) | **1008** |
+| `job.get` | flat minus `verification`/`eventCount` | **1008** |
+| — | (never answer) | held |
+
+⇒ **Any** response naming `terminal.list` is rejected — including `{}` — so the
+op itself is missing from the deployed adapter's response whitelist (same for
+the flat `job.get` body this build sends). This is the failure mode the in-tree
+warning already describes (`src/ops.ts`, `maintenance.workspaceSweep`): "the
+gateway's protocol adapter (nexus-gateway src/protocol/nexus.ts) whitelists
+operations … only answers once the adapter learns it".
+
+**Fix:** sync the gateway's protocol mirror **wholesale** with `src/ops.ts` —
+every request AND response shape, not per-op patches (the 19:07 deploy fixed
+exactly the one field the first runbook named). `src/gateway.test.ts`'s
+wire-shape assertions are the executable contract. Mirror checklist:
+`nexus-gateway src/protocol/nexus.ts` + `modules/builder/src/gateway-protocol.ts`
+must both match `src/ops.ts` / `src/gateway.ts` exactly.
+
+**Executor-side stopgap (not implemented):** the gateway tolerates silence —
+the service could drop responses for ops the adapter has not learned and
+sessions would hold (the hub would show the executor online; the job/terminal
+views would time out). Prefer the mirror sync; use this only if the gateway
+deploy must wait.
+
+## 8. Session-lease caveat (why "offline" can linger)
+
+The hub leases ONE live session per executor; the newest connect wins and the
+displaced socket is usually closed (1000). Occasionally the displaced socket is
+left ESTABLISHED but hub-side dead — the service sees no close and never
+reconnects (`journalctl` shows `opened` with no later `session lost`, but the
+hub shows "no live gateway session", and `ss -tnoi` shows the socket idle for
+hours). Remedy: `systemctl --user restart nexus-executor`. Diagnostic connects
+(`repair` probes, the bisection harnesses) count as "newest connect" — run them
+knowing they displace the service's session, and prefer `nexus-executor status`
+(which is passive: journal + DB only) for routine checks.
