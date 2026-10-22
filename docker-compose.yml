@@ -18,10 +18,11 @@ services:
 
   db:
     image: postgres:16
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: nexus_executor
-      POSTGRES_PASSWORD: nexus_executor
-      POSTGRES_DB: nexus_executor
+      POSTGRES_USER: ${NEXUS_EXECUTOR_USER:-nexus_executor}
+      POSTGRES_PASSWORD: ${NEXUS_EXECUTOR_PASSWORD:-nexus_executor}
+      POSTGRES_DB: ${NEXUS_EXECUTOR_DB:-nexus_executor}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
