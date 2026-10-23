@@ -150,6 +150,58 @@ describe('stall + timeout guards', () => {
     await engine.cancel('job-progress');
   });
 
+  it('auto-rejects a pending permission approval and defers stall judgment to the next tick', async () => {
+    await wipeJobs(pool);
+    // Every threshold would kill the zero-output tool on sight — proving
+    // the drain (not luck) is what keeps the run alive this tick.
+    const { engine, state } = stubEngine({ toolStallMs: 1, silenceStallMs: 1, toolProgressMs: 1 });
+    const job = (await engine.createJob(jobSpec('job-perm-ask'))).job;
+    const row = (await getJobByHubId(pool, 'job-perm-ask'))!;
+    const startedAgo = Date.now() - 10_000;
+    // The Planner failure shape: a `git …` tool marked running with zero
+    // output — but the real cause is the pending `ask` approval below.
+    state.messages[job.opencodeSessionId!] = [{
+      id: 'm1', type: 'assistant', finish: null, time: { created: startedAgo },
+      content: [{
+        type: 'tool', tool: 'shell',
+        state: { status: 'running', input: { command: 'git log --oneline -15' } },
+        time: { ran: startedAgo },
+      }],
+    }];
+    state.permissionRequests[job.opencodeSessionId!] = [{
+      id: 'per_1', sessionID: job.opencodeSessionId!, action: 'shell', resources: ['git log --oneline -15'],
+    }];
+
+    await engine.pollJob(row);
+
+    // Rejected with actionable feedback…
+    expect(state.permissionReplies).toEqual([
+      expect.objectContaining({
+        sessionId: job.opencodeSessionId, requestId: 'per_1', decision: 'reject',
+        message: expect.stringContaining('Unattended run'),
+      }),
+    ]);
+    // …recorded on the timeline…
+    expect(await eventTypes(pool, row.id)).toContain(EVENT.PERMISSION_REJECTED);
+    // …and the run is NOT failed on the same tick even though every stall
+    // threshold would kill the zero-output tool on sight: the rejection just
+    // changed the tool state, health is judged next tick.
+    const after = (await getJobByHubId(pool, 'job-perm-ask'))!;
+    expect(after.status).toBe('running');
+    expect(after.errorCode).toBeNull();
+
+    // Next tick nothing is pending anymore, so stall judgment resumes — the
+    // same stale fixture now stalls as designed. Survival above was the
+    // drain's early return, not luck.
+    await engine.pollJob((await getJobByHubId(pool, 'job-perm-ask'))!);
+    const after2 = (await getJobByHubId(pool, 'job-perm-ask'))!;
+    expect(after2.status).toBe('failed');
+    expect(after2.errorCode).toBe('agent_stalled');
+    // The drain stayed a no-op this tick — no second rejection recorded.
+    expect(state.permissionReplies).toHaveLength(1);
+    await engine.cancel('job-perm-ask');
+  });
+
   it('fails a silent in-flight turn after the silence threshold', async () => {
     await wipeJobs(pool);
     const { engine, state } = stubEngine({ toolStallMs: 0, silenceStallMs: 1_000, toolProgressMs: 0 });

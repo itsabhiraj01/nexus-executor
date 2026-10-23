@@ -58,6 +58,28 @@ describe('client', () => {
     await expect(client.interrupt('ses_1')).resolves.toBeUndefined();
   });
 
+  it('lists pending permission approvals and rejects them with feedback', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      if (calls.length === 1) {
+        return new Response(JSON.stringify({ data: [{ id: 'per_1', action: 'shell', resources: ['git log'] }] }), { status: 200 });
+      }
+      return new Response(null, { status: 204 }); // the reply endpoint: 204, no body
+    }) as typeof fetch;
+    const client = createOpenCodeClient({ baseUrl: 'http://stub', token: 's3cret', fetchImpl });
+    await expect(client.listPermissionRequests('ses_1')).resolves.toEqual([
+      { id: 'per_1', action: 'shell', resources: ['git log'] },
+    ]);
+    await client.replyPermission('ses_1', 'per_1', 'reject', 'Unattended run');
+    expect(calls[0]).toMatchObject({ url: 'http://stub/api/session/ses_1/permission' });
+    expect(calls[1]).toMatchObject({ url: 'http://stub/api/session/ses_1/permission/per_1/reply' });
+    expect(calls[1]!.init.headers).toMatchObject({
+      authorization: `Basic ${Buffer.from('opencode:s3cret').toString('base64')}`,
+    });
+    expect(JSON.parse(String(calls[1]!.init.body))).toEqual({ decision: 'reject', message: 'Unattended run' });
+  });
+
   it('raises OpenCodeError with the status on failures', async () => {
     const client = createOpenCodeClient({
       baseUrl: 'http://stub',

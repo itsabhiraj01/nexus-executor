@@ -24,6 +24,7 @@ import {
   type OpenCodeClient,
   type OpenCodeMessage,
   type OpenCodeMessageError,
+  type OpenCodePermissionRequest,
 } from './opencode.js';
 import {
   isModelPolicyDenial, registerModelPolicy, ModelPolicyError, type ExecutorModelPolicy,
@@ -260,6 +261,7 @@ export const EVENT = {
   TOOL_CALL_STARTED: 'TOOL_CALL_STARTED',
   TOOL_CALL_FINISHED: 'TOOL_CALL_FINISHED',
   TOOL_CALL_FAILED: 'TOOL_CALL_FAILED',
+  PERMISSION_REJECTED: 'PERMISSION_REJECTED',
   AGENT_IDLE: 'AGENT_IDLE',
   AGENT_ASKED_USER: 'AGENT_ASKED_USER',
   USER_INPUT_REQUESTED: 'USER_INPUT_REQUESTED',
@@ -451,11 +453,17 @@ export function rebaseConflictPrompt(conflicts: readonly string[], baseRef: stri
   ].join('\n');
 }
 
+/** The feedback an auto-rejected approval carries: why it died, how to fix. */
+export const PERMISSION_REJECT_FEEDBACK =
+  'Unattended run — no human is here to approve this, so it was denied. ' +
+  'Commands this agent may run must be pre-allowed in its persona permission map.';
+
 /** The stall failure reason (mirrors the hub's wording, minus the
  *  OpenCode-version specifics). */
 export function stallFailureReason(summary: string, interrupted?: boolean): string {
   return [
     `Agent stalled — ${summary}. This matches the known OpenCode wedge (a tool call marked running never executes; a nudge cannot help — the stuck turn never reads messages, only an interrupt unsticks it).`,
+    'Pending permission approvals are auto-rejected in unattended runs, so an unanswered `ask` cannot be the cause.',
     interrupted
       ? 'The OpenCode session was interrupted and the job failed so it can be retried; completed turns stay checkpointed on the job\'s branch.'
       : 'The job failed so it can be retried; completed turns stay checkpointed on the job\'s branch.',
@@ -1307,6 +1315,13 @@ export class JobEngine {
     }
 
     if (job.status === 'running') {
+      // Answer any permission approvals FIRST: an `ask` nobody answers is a
+      // wedge that looks exactly like a lost tool dispatch (see the drain's
+      // doc comment), and rejecting it unblocks the turn within one tick.
+      // When something was rejected the tool state just changed under this
+      // tick's message snapshot — judge health on the NEXT tick, never fail
+      // the run on the stale view of a turn we just unstuck.
+      if (await this.rejectPendingPermissions(job) > 0) return;
       const stalled = detectStall(messages, {
         now, toolStallMs: this.config.toolStallMs, silenceStallMs: this.config.silenceStallMs,
       });
@@ -1661,6 +1676,45 @@ export class JobEngine {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Fail closed on pending permission approvals. A persona rule resolving to
+   * `ask` blocks its tool forever in an unattended run — the wedge the stall
+   * detector used to report as "the call never executed" (it never spawned:
+   * it was waiting for an approval no one would ever answer). Rejecting turns
+   * it into an immediate `permission.rejected` tool error the model can adapt
+   * to, and the timeline records every rejection. Runs every poll tick, well
+   * under the stall thresholds. Best effort: a listing failure just means the
+   * next tick retries. Returns how many were rejected.
+   */
+  private async rejectPendingPermissions(job: JobRow): Promise<number> {
+    if (!this.client || !job.opencodeSessionId) return 0;
+    let pending: OpenCodePermissionRequest[];
+    try {
+      pending = await this.client.listPermissionRequests(job.opencodeSessionId);
+    } catch {
+      return 0;
+    }
+    for (const request of pending) {
+      try {
+        await this.client!.replyPermission(job.opencodeSessionId!, request.id, 'reject', PERMISSION_REJECT_FEEDBACK);
+      } catch {
+        // Already answered (a reject clears every pending request in the
+        // session, so later ids 404) — nothing left to do for this one.
+        continue;
+      }
+      const what = request.resources?.length
+        ? `${request.action ?? 'tool'}: ${request.resources.join(', ').slice(0, 120)}`
+        : (request.action ?? 'tool');
+      await appendJobEvent(this.pool, {
+        jobId: job.id,
+        eventType: EVENT.PERMISSION_REJECTED,
+        summary: `Auto-rejected an unattended \`${what}\` approval request — no human is here to approve it.`,
+        payload: { requestId: request.id, action: request.action ?? null, resources: request.resources ?? [] },
+      });
+    }
+    return pending.length;
   }
 
   private async mergeMetadata(jobId: string, patch: Record<string, unknown>): Promise<void> {

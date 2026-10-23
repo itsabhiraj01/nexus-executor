@@ -73,8 +73,14 @@ export function renderPolicyBlock(providers: readonly string[]): Record<string, 
 }
 
 /** Merge the policy into an existing opencode.json document (pure): the
- *  policy REPLACES any existing `experimental.policies` and preserves every
- *  other key. */
+ *  statements land under BOTH keys — the stabilized top-level `policies`
+ *  (current OpenCode spelling) and the compat `experimental.policies`
+ *  (pre-stabilization, still honored) — REPLACING any existing policy
+ *  arrays and preserving every other key. A service that reads only one of
+ *  the two is fenced either way (the office-agent incident 2026-10-22 was
+ *  exactly such a version skew), and the canary proves whichever key the
+ *  running build honors. Replacement, never union: an additive merge would
+ *  let a stale allow survive and silently widen the fence. */
 export function mergePolicyIntoConfig(existing: unknown, providers: readonly string[]): Record<string, unknown> {
   const base = existing && typeof existing === 'object' && !Array.isArray(existing)
     ? existing as Record<string, unknown>
@@ -82,12 +88,14 @@ export function mergePolicyIntoConfig(existing: unknown, providers: readonly str
   const experimental = base.experimental && typeof base.experimental === 'object' && !Array.isArray(base.experimental)
     ? base.experimental as Record<string, unknown>
     : {};
+  const statements = renderPolicyBlock(providers).policies;
   return {
     $schema: 'https://opencode.ai/config.json',
     ...base,
+    policies: statements,
     experimental: {
       ...experimental,
-      ...renderPolicyBlock(providers),
+      policies: statements,
     },
   };
 }

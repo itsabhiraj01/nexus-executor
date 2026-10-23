@@ -131,6 +131,25 @@ export interface OpenCodeSessionInfo {
   location?: { directory?: string } | null;
 }
 
+/**
+ * A pending tool-permission approval (a persona rule resolving to `ask`).
+ * Unattended runs MUST answer these: a request nobody replies to wedges the
+ * turn — the tool never executes and the stall watchdog eventually kills the
+ * job ("the call never executed" was exactly this).
+ */
+export interface OpenCodePermissionRequest {
+  id: string;
+  sessionID?: string;
+  action?: string;
+  resources?: string[];
+  /** The tool's proposed "allow always" patterns — unused when rejecting. */
+  save?: string[];
+  message?: string;
+}
+
+/** The three approval replies (V2 `Permission.Reply`). */
+export type OpenCodePermissionDecision = 'once' | 'always' | 'reject';
+
 export function createOpenCodeClient(config: OpenCodeClientConfig) {
   const base = config.baseUrl.replace(/\/+$/, '');
   const doFetch = config.fetchImpl ?? fetch;
@@ -219,6 +238,28 @@ export function createOpenCodeClient(config: OpenCodeClientConfig) {
     async getMessages(sessionId: string): Promise<OpenCodeMessage[]> {
       const out = await request<{ data: OpenCodeMessage[] }>(`/api/session/${encodeURIComponent(sessionId)}/message`);
       return out.data ?? [];
+    },
+    /** Pending permission approvals for a session (empty when none). */
+    async listPermissionRequests(sessionId: string): Promise<OpenCodePermissionRequest[]> {
+      const out = await request<{ data?: OpenCodePermissionRequest[] }>(
+        `/api/session/${encodeURIComponent(sessionId)}/permission`);
+      return out.data ?? [];
+    },
+    /**
+     * Answer one approval — `once` / `always` / `reject`, with optional
+     * feedback a rejection surfaces to the model. The endpoint answers 204
+     * with an empty body (like the interrupt), so this must not parse JSON.
+     * Rejecting one request rejects every other pending request in the
+     * session, so callers re-list (or tolerate 404s) when draining.
+     */
+    async replyPermission(
+      sessionId: string, requestId: string,
+      decision: OpenCodePermissionDecision, message?: string,
+    ): Promise<void> {
+      await request(
+        `/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(requestId)}/reply`,
+        { method: 'POST', body: JSON.stringify(message ? { decision, message } : { decision }) },
+      );
     },
   };
 }

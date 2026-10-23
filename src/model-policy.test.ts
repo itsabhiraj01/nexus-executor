@@ -28,27 +28,37 @@ describe('renderPolicyBlock', () => {
 });
 
 describe('mergePolicyIntoConfig', () => {
-  it('preserves unrelated config roots while REPLACING a stale policy block', () => {
+  it('preserves unrelated config roots while REPLACING both policy keys', () => {
     const existing = {
       $schema: 'https://opencode.ai/config.json',
       mcp: { db: { type: 'local', command: ['npx', 'srv'] } },
+      // A stale allow under EITHER spelling must not survive — an additive
+      // union would silently widen the fence.
+      policies: [{ effect: 'allow', action: 'provider.use', resource: 'stale-top' }],
       experimental: { policies: [{ effect: 'allow', action: 'provider.use', resource: 'stale' }], other: true },
     };
     const merged = mergePolicyIntoConfig(existing, ['astra']) as {
-      mcp: unknown; experimental: { policies: unknown[]; other: boolean };
+      mcp: unknown; policies: unknown[];
+      experimental: { policies: unknown[]; other: boolean };
     };
     expect(merged.mcp).toEqual(existing.mcp);
     expect(merged.experimental.other).toBe(true);
-    // The stale allow is gone: the run's policy is the whole enforcement
-    // intent — an additive union would silently widen it.
-    expect(merged.experimental.policies).toEqual([
+    const statements = [
       { effect: 'deny', action: 'provider.use', resource: '*' },
       { effect: 'allow', action: 'provider.use', resource: 'astra' },
-    ]);
+    ];
+    // BOTH keys carry the same statements: the stabilized top-level
+    // `policies` (current OpenCode spelling) and the compat
+    // `experimental.policies` (pre-stabilization). A service that reads
+    // only one of the two is fenced either way — the office-agent incident
+    // (2026-10-22, `model_policy_failed`) was exactly such a skew.
+    expect(merged.policies).toEqual(statements);
+    expect(merged.experimental.policies).toEqual(statements);
   });
 
   it('tolerates non-object documents (treated as a fresh config)', () => {
     expect(mergePolicyIntoConfig('garbage', ['astra'])).toMatchObject({
+      policies: expect.any(Array),
       experimental: { policies: expect.any(Array) },
     });
   });
@@ -61,10 +71,11 @@ describe('writeModelPolicyConfig', () => {
       await writeFile(join(dir, 'opencode.json'), JSON.stringify({ mcp: { x: { type: 'remote', url: 'https://m' } } }));
       await writeModelPolicyConfig(dir, ['astra']);
       const written = JSON.parse(await readFile(join(dir, 'opencode.json'), 'utf8')) as {
-        mcp: unknown; experimental: { policies: unknown[] };
+        mcp: unknown; policies: unknown[]; experimental: { policies: unknown[] };
       };
       expect(written.mcp).toEqual({ x: { type: 'remote', url: 'https://m' } });
       expect(written.experimental.policies).toHaveLength(2);
+      expect(written.policies).toEqual(written.experimental.policies);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

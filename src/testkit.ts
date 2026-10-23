@@ -2,7 +2,11 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Pool } from 'pg';
 import type { ExecutorConfig } from './config.js';
-import { createOpenCodeClient, type ModelRef, type OpenCodeClient, type OpenCodeMessage } from './opencode.js';
+import {
+  createOpenCodeClient,
+  type ModelRef, type OpenCodeClient, type OpenCodeMessage,
+  type OpenCodePermissionDecision, type OpenCodePermissionRequest,
+} from './opencode.js';
 import { execGit } from './workspace.js';
 
 /**
@@ -74,6 +78,10 @@ export interface StubState {
   /** The full message list per session — tests mutate it between polls. */
   messages: Record<string, OpenCodeMessage[]>;
   models: Array<{ id: string; name: string; providerID?: string }>;
+  /** Pending permission approvals per session (`permission: ask` wedges). */
+  permissionRequests: Record<string, OpenCodePermissionRequest[]>;
+  /** Every reply the client sent, in order. */
+  permissionReplies: Array<{ sessionId: string; requestId: string; decision: OpenCodePermissionDecision; message?: string }>;
 }
 
 /**
@@ -86,6 +94,7 @@ export function makeStubClient(): { client: OpenCodeClient; state: StubState } {
   const state: StubState = {
     sessions: [], prompts: [], interrupts: [], modelSwitches: [], messages: {},
     models: [{ id: 'open-large', name: 'Open Large', providerID: 'litellm' }],
+    permissionRequests: {}, permissionReplies: [],
   };
   const json = (data: unknown, status = 200): Response =>
     new Response(JSON.stringify({ data }), { status, headers: { 'content-type': 'application/json' } });
@@ -127,11 +136,28 @@ export function makeStubClient(): { client: OpenCodeClient; state: StubState } {
       if (!state.messages[interruptMatch[1]!]) return json({ error: 'unknown session' }, 404);
       state.interrupts.push(interruptMatch[1]!);
       return new Response(null, { status: 204 });
-    }
-    const messageMatch = /\/api\/session\/([^/]+)\/message$/.exec(url);
+    }    const messageMatch = /\/api\/session\/([^/]+)\/message$/.exec(url);
     if (method === 'GET' && messageMatch) {
       if (!state.messages[messageMatch[1]!]) return json({ error: 'unknown session' }, 404);
       return json(state.messages[messageMatch[1]!]);
+    }
+    const permissionListMatch = /\/api\/session\/([^/]+)\/permission$/.exec(url);
+    if (method === 'GET' && permissionListMatch) {
+      if (!state.messages[permissionListMatch[1]!]) return json({ error: 'unknown session' }, 404);
+      return json(state.permissionRequests[permissionListMatch[1]!] ?? []);
+    }
+    const permissionReplyMatch = /\/api\/session\/([^/]+)\/permission\/([^/]+)\/reply$/.exec(url);
+    if (method === 'POST' && permissionReplyMatch) {
+      const sessionId = permissionReplyMatch[1]!;
+      const requestId = permissionReplyMatch[2]!;
+      if (!state.messages[sessionId]) return json({ error: 'unknown session' }, 404);
+      const pending = state.permissionRequests[sessionId] ?? [];
+      if (!pending.some((request) => request.id === requestId)) return json({ error: 'not found' }, 404);
+      const body = JSON.parse(String(init!.body)) as { decision: OpenCodePermissionDecision; message?: string };
+      state.permissionReplies.push({ sessionId, requestId, decision: body.decision, message: body.message });
+      // Mirrors the real service: one reply settles EVERY pending request.
+      state.permissionRequests[sessionId] = [];
+      return new Response(null, { status: 204 });
     }
     if (method === 'GET' && /\/api\/model/.test(url)) {
       return json(state.models);
