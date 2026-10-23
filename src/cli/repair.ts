@@ -6,8 +6,11 @@ import { parseArgs } from 'node:util';
 import WebSocket from 'ws';
 import { Client } from 'pg';
 import { EXECUTOR_VERSION, loadConfig, type ExecutorConfig } from '../config.js';
+import { createPool } from '../db.js';
 import { buildConnectHeaders, readGatewayIdentity, type GatewayIdentity } from '../gateway.js';
+import { GATEWAY_PROTOCOL_VERSION, handleGatewayOperation, type RouteDeps } from '../ops.js';
 import { readCliState } from '../pairing/state.js';
+import { createUpgrader } from '../upgrade.js';
 
 /**
  * `nexus-executor repair` — diagnose the full connectivity chain
@@ -27,6 +30,10 @@ import { readCliState } from '../pairing/state.js';
  *       gateway→hub link, or the hub's gateway tables fail to read).
  *   valid → rejected
  *     ⇒ this executor's identity is stale/revoked — re-pair.
+ *   valid → open for the whole hold window, ANSWERED session → 1008 fast close
+ *     ⇒ schema mismatch: the gateway's EXACT field whitelist rejects the
+ *       status.get payload this build sends — the executor is newer than
+ *       the deployed nexus-gateway (protocol mirrors out of step).
  *   valid → open for the whole hold window
  *     ⇒ the chain is healthy end to end.
  *
@@ -35,7 +42,11 @@ import { readCliState } from '../pairing/state.js';
  * not to disturb a healthy service loop, which reconnects on its own if
  * the hub leases the session to the probe). The probe never answers
  * gateway requests: run it when the executor is idle if you are worried
- * about a job being routed to a socket that will not reply.
+ * about a job being routed to a socket that will not reply. When (and only
+ * when) that silent probe holds, a THIRD probe dials and answers status.get
+ * with the payload the service really sends — the silent probe alone cannot
+ * see a whitelist rejection, because the gateway only grades what the
+ * executor ANSWERS.
  *
  * Exit code 0 = healthy (verdict `healthy`, no failed checks); 1 = fixable
  * findings. `--json` emits the structured report.
@@ -43,6 +54,7 @@ import { readCliState } from '../pairing/state.js';
 
 const RUNBOOK = 'docs/runbooks/2026-10-13-gateway-1011-hub-failure.md';
 const REPAIR_RUNBOOK = 'docs/runbooks/2026-10-08-gateway-executor-auth-failure.md';
+const SCHEMA_RUNBOOK = 'docs/runbooks/2026-10-22-gateway-1008-status-schema-mismatch.md';
 /** The hub rejects connect proofs outside this window (mirrors its tolerance). */
 const PROOF_WINDOW_MS = 120_000;
 /** systemd user units the native installer owns. */
@@ -72,6 +84,9 @@ export interface ProbeOutcome {
   heldMs: number;
   /** Held open for the whole probe window — the healthy signature. */
   stable: boolean;
+  /** Answered probe only: how many gateway requests were actually answered.
+   *  Zero means the gateway sent nothing — the payload was never graded. */
+  responses?: number;
 }
 
 /** The POST /v1/enroll route probe (malformed body, expects 400). */
@@ -92,6 +107,7 @@ export type RepairVerdict =
   | 'identity-rejected'
   | 'hub-call-failure'
   | 'hub-session-open-failure'
+  | 'gateway-schema-mismatch'
   | 'inconclusive';
 
 export interface RepairReport {
@@ -101,7 +117,7 @@ export interface RepairReport {
   transport: 'gateway' | 'direct' | null;
   checks: RepairCheck[];
   route: RouteOutcome | null;
-  probes: { valid: ProbeOutcome | null; invalid: ProbeOutcome | null };
+  probes: { valid: ProbeOutcome | null; invalid: ProbeOutcome | null; answered: ProbeOutcome | null };
   verdict: RepairVerdict;
   diagnosis: string;
   fixes: string[];
@@ -121,6 +137,10 @@ export interface RepairDeps {
   lookup?: (host: string) => Promise<{ address: string }>;
   exec?: typeof execFileSync;
   databaseCheck?: (databaseUrl: string) => Promise<{ ok: boolean; detail: string }>;
+  /** The answered probe's responder. Defaults to the real gateway dispatcher
+   *  (src/ops.ts handleGatewayOperation) so the probe sends the exact payload
+   *  the service loop sends — the whitelist grades fields, not values. */
+  statusAnswer?: (operation: string, payload: unknown) => Promise<unknown>;
 }
 
 // ---------------------------------------------------------------- probes
@@ -201,6 +221,87 @@ export async function probeConnect(
 }
 
 /**
+ * The ANSWERED probe — probeConnect's twin for the one failure a silent
+ * socket cannot see. The hub queues status.get polls and flushes them at
+ * every session open; the gateway's protocol adapter grades the RESPONSES
+ * against an exact field whitelist (nexus-gateway src/protocol/nexus.ts)
+ * and closes the session (1008) on the first schema violation. So this
+ * probe answers exactly like the service loop's responder (src/gateway.ts
+ * handleRequest) and reports what the gateway does next: held = the
+ * payload passed; fast 1008 = the whitelist rejected it.
+ */
+export async function probeAnsweredConnect(
+  url: string,
+  headers: Record<string, string>,
+  answer: (operation: string, payload: unknown) => Promise<unknown>,
+  opts: ProbeConnectOptions = {},
+): Promise<ProbeOutcome> {
+  const Ws = opts.webSocketImpl ?? WebSocket;
+  const holdMs = opts.holdMs ?? 3000;
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  return await new Promise<ProbeOutcome>((resolve) => {
+    let opened = false;
+    let openedAt = 0;
+    let httpStatus: number | null = null;
+    let socketError: string | null = null;
+    let settled = false;
+    let responses = 0;
+    let timer: NodeJS.Timeout | undefined;
+    let holdTimer: NodeJS.Timeout | undefined;
+    const ws = new Ws(url, { headers, maxPayload: 1024 * 1024 });
+    const finish = (partial: Partial<ProbeOutcome>): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(holdTimer);
+      try { ws.terminate(); } catch { /* already gone */ }
+      resolve({
+        opened,
+        closeCode: partial.closeCode ?? null,
+        closeReason: partial.closeReason ?? '',
+        httpStatus,
+        error: partial.error ?? socketError,
+        heldMs: opened ? Math.max(0, Date.now() - openedAt) : 0,
+        stable: partial.stable === true,
+        responses,
+      });
+    };
+    timer = setTimeout(() => finish({ error: `probe timed out after ${timeoutMs}ms` }), timeoutMs);
+    ws.on('open', () => {
+      opened = true;
+      openedAt = Date.now();
+      holdTimer = setTimeout(() => finish({ stable: true }), holdMs);
+    });
+    ws.on('error', (error: Error) => {
+      socketError = error.message;
+      const match = /Unexpected server response: (\d{3})/.exec(error.message);
+      if (match) httpStatus = Number(match[1]);
+    });
+    ws.on('close', (code: number, reason: Buffer) => finish({ closeCode: code, closeReason: reason.toString('utf8') }));
+    ws.on('message', (data: Buffer | Buffer[]) => {
+      // Mirror src/gateway.ts handleRequest: answer canonical requests with
+      // the {ok,result} envelope, ignore anything else (never throw).
+      void (async () => {
+        try {
+          const buffer = Array.isArray(data) ? Buffer.concat(data) : data;
+          const envelope = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(buffer)) as Record<string, unknown>;
+          if (envelope.version !== GATEWAY_PROTOCOL_VERSION || envelope.type !== 'request') return;
+          if (typeof envelope.id !== 'string' || typeof envelope.operation !== 'string') return;
+          const payload = await answer(envelope.operation, envelope.payload);
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({
+              version: GATEWAY_PROTOCOL_VERSION, type: 'response', id: envelope.id,
+              operation: envelope.operation, payload,
+            }));
+            responses++;
+          }
+        } catch { /* one bad message must not end the probe */ }
+      })();
+    });
+  });
+}
+
+/**
  * Connect headers with well-shaped GARBAGE: canonical nonce/proof lengths,
  * a credential that cannot exist. The gateway's shape checks pass and the
  * hub's verifier rejects it — which is exactly what the differential needs
@@ -234,8 +335,9 @@ export function classifyRepair(args: {
   route: RouteOutcome | null;
   valid: ProbeOutcome | null;
   invalid: ProbeOutcome | null;
+  answered?: ProbeOutcome | null;
 }): RepairVerdict {
-  const { transport, hasIdentity, gatewayUrl, route, valid, invalid } = args;
+  const { transport, hasIdentity, gatewayUrl, route, valid, invalid, answered } = args;
   if (transport && transport !== 'gateway') return 'direct-transport';
   if (!hasIdentity) return 'not-paired';
   if (!gatewayUrl) return 'misconfigured';
@@ -243,7 +345,15 @@ export function classifyRepair(args: {
   if (route && route.status !== null && route.status >= 500) return 'gateway-origin-down';
   if (route?.error) return 'network-unreachable';
   if (!valid) return 'inconclusive';
-  if (valid.stable) return 'healthy';
+  if (valid.stable) {
+    // A silent session holding proves auth + session-open, but not that the
+    // gateway accepts what this build ANSWERS: the protocol adapter grades
+    // status.get responses against an exact field whitelist and 1008s the
+    // session on the first schema violation (executor newer than the
+    // deployed nexus-gateway). Only the answered probe can see that.
+    if (answered && answered.opened && !answered.stable && answered.closeCode === 1008) return 'gateway-schema-mismatch';
+    return 'healthy';
+  }
   if (valid.httpStatus === 401 || valid.httpStatus === 403) return 'identity-rejected';
   // The gateway's clean auth denial: close 1008 "authentication_failed"
   // (the signature executor 65548050 produced on 2026-10-08).
@@ -286,6 +396,8 @@ export function verdictDiagnosis(verdict: RepairVerdict, evidence: { valid: Prob
       return `Both probes failed identically (${evidence.valid ? fmtProbe(evidence.valid) : 'n/a'}) — the gateway's hub call errors before/regardless of authentication: the hub is down, the gateway→hub link is broken, or the hub's gateway tables fail to read. Server-side problem; this executor's pairing is fine.`;
     case 'hub-session-open-failure':
       return 'The hub verified this executor\'s proof (garbage credentials are rejected cleanly) but the connect call then errors — the gateway closes with 1011 (hub_failure). The hub\'s session-open path is broken (e.g. the builder gateway tables / migration 020); this executor and its pairing are fine.';
+    case 'gateway-schema-mismatch':
+      return 'Auth and session-open are fine — the silent session holds — but the gateway grades this build\'s status.get ANSWERS against an exact field whitelist (nexus-gateway src/protocol/nexus.ts) and closes the session with 1008 on the first schema violation. The executor is NEWER than the deployed nexus-gateway: its status payload carries fields the gateway\'s mirror does not know (src/ops.ts opStatus warns about exactly this). Pairing is NOT the problem; the protocol mirrors are out of step.';
     case 'inconclusive':
       return 'No known failure signature matched — capture the server-side evidence (runbook §4) and compare it against the decision table (§5).';
   }
@@ -350,6 +462,13 @@ export function verdictFixes(verdict: RepairVerdict, ctx: { gatewayUrl: string |
         `  psql "$HUB_DATABASE_URL" -c "SELECT version FROM platform.schema_migrations WHERE module_id = 'builder' ORDER BY version;"`,
         '  # expect 020_executor_gateway.sql; if missing, back up the hub DB and run its npm run migrate',
         `Details: ${RUNBOOK} §4–5`,
+      ];
+    case 'gateway-schema-mismatch':
+      return [
+        'The executor speaks a NEWER revision of nexus.executor.v1 than the deployed nexus-gateway. The three protocol mirrors must match (src/ops.ts, modules/builder/src/gateway-protocol.ts, nexus-gateway src/protocol/nexus.ts) — deploy the hub monorepo\'s matching gateway build on the server, then:',
+        '  sudo systemctl restart nexus-gateway',
+        '  journalctl -u nexus-gateway -n 50 --no-pager     # confirm a clean boot',
+        `Then re-run \`nexus-executor repair\` here — the answered probe must hold. Until the gateway is updated the executor cannot hold a session (jobs queue but never dispatch). Details: ${SCHEMA_RUNBOOK}`,
       ];
     case 'inconclusive':
       return [`Capture the server-side evidence in ${RUNBOOK} §4 and compare against its decision table (§5).`];
@@ -567,6 +686,27 @@ function invalidProbeCheck(valid: ProbeOutcome | null, invalid: ProbeOutcome | n
   return { ...base, status: 'pass', detail: `${fmtProbe(invalid)} — the auth layer rejects bad credentials cleanly (the valid proof gets further)` };
 }
 
+function answeredProbeCheck(answered: ProbeOutcome | null): RepairCheck {
+  const base = { id: 'connect-answered', section: 'session probes' as const, label: 'connect answered' };
+  if (!answered) {
+    return { ...base, status: 'skip', detail: 'not run — only meaningful when the silent session holds' };
+  }
+  if (answered.stable) {
+    if (!answered.responses) {
+      return { ...base, status: 'warn', detail: `${fmtProbe(answered)} — no gateway requests arrived; the payload was never graded` };
+    }
+    return { ...base, status: 'pass', detail: `${fmtProbe(answered)} after answering ${answered.responses} request(s) — the gateway accepted our status.get responses` };
+  }
+  if (answered.closeCode === 1008) {
+    return {
+      ...base, status: 'fail',
+      detail: `${fmtProbe(answered)} after answering status.get — the gateway rejected this build's payload`,
+      fix: `Deploy the matching nexus-gateway (protocol mirrors) and restart it on the server — see ${SCHEMA_RUNBOOK}`,
+    };
+  }
+  return { ...base, status: 'warn', detail: `${fmtProbe(answered)} — inconclusive` };
+}
+
 // ---------------------------------------------------------- orchestration
 
 export interface RepairCliOptions {
@@ -583,7 +723,7 @@ export async function repairFromCli(opts: RepairCliOptions): Promise<RepairResul
     },
   });
   const holdMs = Math.max(500, Number.parseInt(String(values['hold-ms'] ?? '3000'), 10) || 3000);
-  const deps: Required<RepairDeps> = {
+  const deps: Required<Omit<RepairDeps, 'statusAnswer'>> & Pick<RepairDeps, 'statusAnswer'> = {
     fetchImpl: fetch,
     webSocketImpl: WebSocket,
     lookup: dnsLookup,
@@ -623,6 +763,7 @@ export async function repairFromCli(opts: RepairCliOptions): Promise<RepairResul
 
   let valid: ProbeOutcome | null = null;
   let invalid: ProbeOutcome | null = null;
+  let answered: ProbeOutcome | null = null;
   if (gatewayUrl && identity) {
     const wsBase = gatewayUrl.replace(/^http/, 'ws');
     const probeOptions = { webSocketImpl: deps.webSocketImpl, holdMs, timeoutMs: holdMs + 12_000 };
@@ -634,10 +775,23 @@ export async function repairFromCli(opts: RepairCliOptions): Promise<RepairResul
       detail: fmtProbe(valid),
     });
     checks.push(invalidProbeCheck(valid, invalid));
+    // The answered probe only makes sense once a silent session holds —
+    // and it must answer with the REAL payload (fields, not values).
+    const responder = deps.statusAnswer
+      ? { answer: deps.statusAnswer, close: async () => {} }
+      : config ? makeStatusResponder(config) : null;
+    if (valid.stable && responder) {
+      try {
+        answered = await probeAnsweredConnect(`${wsBase}/v1/connect`, buildConnectHeaders(identity), responder.answer, probeOptions);
+      } finally {
+        await responder.close().catch(() => undefined);
+      }
+    }
+    checks.push(answeredProbeCheck(answered));
   }
 
   const transport = config?.transport ?? state?.transport ?? null;
-  const verdict = classifyRepair({ transport, hasIdentity: identity !== null, gatewayUrl, route, valid, invalid });
+  const verdict = classifyRepair({ transport, hasIdentity: identity !== null, gatewayUrl, route, valid, invalid, answered });
   const diagnosis = verdictDiagnosis(verdict, { valid, invalid });
   const fixes = [
     ...verdictFixes(verdict, { gatewayUrl, identityPath }),
@@ -652,7 +806,7 @@ export async function repairFromCli(opts: RepairCliOptions): Promise<RepairResul
     transport,
     checks,
     route,
-    probes: { valid, invalid },
+    probes: { valid, invalid, answered },
     verdict,
     diagnosis,
     fixes,
@@ -700,6 +854,28 @@ function renderText(report: RepairReport): string {
   }
   lines.push('');
   return lines.join('\n');
+}
+
+/**
+ * The production responder for the answered probe: the REAL gateway
+ * dispatcher (src/ops.ts handleGatewayOperation) over a short-lived pool +
+ * upgrader, so the probe sends the same envelope the service loop sends.
+ * The gateway whitelist grades FIELDS — job counts and uptime may differ,
+ * the key set must not.
+ */
+function makeStatusResponder(config: ExecutorConfig): {
+  answer: (operation: string, payload: unknown) => Promise<unknown>;
+  close: () => Promise<void>;
+} {
+  const pool = createPool(config.databaseUrl);
+  const upgrader = createUpgrader({ config });
+  // Only status.get is expected during the probe window; it reads
+  // pool/config/client/startedAt/upgrader — engine/registry stay unused.
+  const routeDeps = { pool, config, client: null, startedAt: Date.now(), upgrader } as unknown as RouteDeps;
+  return {
+    answer: (operation, payload) => handleGatewayOperation(routeDeps, operation, payload),
+    close: async () => { await pool.end(); },
+  };
 }
 
 /** The real database check: connect + SELECT 1 with a short timeout. */

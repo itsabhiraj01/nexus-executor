@@ -6,9 +6,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { buildConnectHeaders, type GatewayIdentity } from '../gateway.js';
+import { GATEWAY_PROTOCOL_VERSION } from '../ops.js';
 import {
   buildInvalidConnectHeaders,
   classifyRepair,
+  probeAnsweredConnect,
   probeConnect,
   repairFromCli,
   sameFailureSignature,
@@ -20,20 +22,34 @@ import {
 /**
  * `nexus-executor repair` — the classification table is the product: the
  * differential between a valid proof and well-shaped garbage localizes a
- * 1011 without server access. Everything here is hermetic (scripted
- * sockets, injected fetch/exec/db) — no network, no live database.
+ * 1011 without server access, and the answered probe localizes the 1008
+ * schema mismatch (the gateway grading what the executor ANSWERS). Everything
+ * here is hermetic (scripted sockets, injected fetch/exec/db) — no network,
+ * no live database.
  */
 
 class ScriptedSocket extends EventEmitter {
   /** One behavior per constructed socket, consumed in dial order. */
   static queue: Array<(ws: ScriptedSocket) => void> = [];
+  /** Every constructed socket, for asserting what the probe sent back. */
+  static constructed: ScriptedSocket[] = [];
+  readyState = 1;
+  readonly OPEN = 1;
+  sent: string[] = [];
   constructor(public url: string, public opts: { headers?: Record<string, string> }) {
     super();
+    ScriptedSocket.constructed.push(this);
     const behavior = ScriptedSocket.queue.shift();
     if (behavior) queueMicrotask(() => behavior(this));
   }
+  send(data: string): void { this.sent.push(data); }
   terminate(): void { /* the probe calls this after settling; nothing to do */ }
 }
+
+/** The hub's poll, flushed at every session open — what the probes must answer. */
+const STATUS_GET = JSON.stringify({
+  version: GATEWAY_PROTOCOL_VERSION, type: 'request', id: 'req-1', operation: 'status.get', payload: {},
+});
 
 function makeIdentity(): GatewayIdentity {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519');
@@ -54,6 +70,7 @@ const savedEnv = new Map<string, string | undefined>();
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'nexus-repair-test-'));
   for (const key of ENV_KEYS) savedEnv.set(key, process.env[key]);
+  ScriptedSocket.constructed = [];
 });
 
 afterEach(() => {
@@ -95,6 +112,19 @@ function hermeticDeps(overrides: Partial<RepairDeps> = {}): RepairDeps {
     lookup: async () => ({ address: '203.0.113.7' }),
     exec: ((_command: string, _args: string[]) => 'active\n') as unknown as typeof execFileSync,
     databaseCheck: async () => ({ ok: true, detail: 'SELECT 1 ok (injected)' }),
+    // A status.get envelope with today's field set (incl. `upgrade`) — the
+    // shape the service sends and the gateway whitelist grades.
+    statusAnswer: async () => ({
+      ok: true,
+      result: {
+        ok: true, name: 'test-executor', version: '1.0.0', paired: true,
+        opencode: { configured: false, baseUrl: null },
+        jobs: { active: 0, queued: 0, total: 0 },
+        capabilities: { jobRetries: true },
+        upgrade: { phase: 'idle' },
+        uptimeSeconds: 1,
+      },
+    }),
     ...overrides,
   };
 }
@@ -153,6 +183,41 @@ it('probeConnect reports stable when the session holds', async () => {
   expect(outcome.stable).toBe(true);
 });
 
+it('probeAnsweredConnect answers status.get and records what the gateway did next', async () => {
+  ScriptedSocket.queue = [
+    (ws) => {
+      ws.emit('open');
+      ws.emit('message', Buffer.from(STATUS_GET));
+      setTimeout(() => ws.emit('close', 1008, Buffer.from('')), 20); // whitelist verdict
+    },
+  ];
+  const outcome = await probeAnsweredConnect(
+    'wss://gw.example.com/v1/connect', {},
+    async () => ({ ok: true, result: { upgrade: { phase: 'idle' } } }),
+    { webSocketImpl: ScriptedSocket as unknown as typeof WebSocket, holdMs: 500, timeoutMs: 1000 },
+  );
+  expect(outcome.opened).toBe(true);
+  expect(outcome.closeCode).toBe(1008);
+  expect(outcome.stable).toBe(false);
+  // The response mirrors src/gateway.ts handleRequest — same envelope as the service sends.
+  const sent = JSON.parse(ScriptedSocket.constructed[0]!.sent[0]!) as Record<string, unknown>;
+  expect(sent).toEqual({
+    version: GATEWAY_PROTOCOL_VERSION, type: 'response', id: 'req-1', operation: 'status.get',
+    payload: { ok: true, result: { upgrade: { phase: 'idle' } } },
+  });
+});
+
+it('probeAnsweredConnect holds when the gateway accepts the payload', async () => {
+  ScriptedSocket.queue = [
+    (ws) => { ws.emit('open'); ws.emit('message', Buffer.from(STATUS_GET)); }, // never closed
+  ];
+  const outcome = await probeAnsweredConnect(
+    'wss://gw.example.com/v1/connect', {}, async () => ({ ok: true, result: {} }),
+    { webSocketImpl: ScriptedSocket as unknown as typeof WebSocket, holdMs: 200, timeoutMs: 1000 },
+  );
+  expect(outcome.stable).toBe(true);
+});
+
 it('probeConnect captures the HTTP status of a rejected upgrade', async () => {
   ScriptedSocket.queue = [
     (ws) => {
@@ -185,6 +250,11 @@ it('classifies the verdict table', () => {
     ...over,
   });
   expect(classifyRepair(args({ valid: stableProbe }))).toBe('healthy');
+  // A silent session holding says nothing about what the gateway thinks of
+  // this build's ANSWERS: 1008 right after answering = whitelist rejection.
+  expect(classifyRepair(args({ valid: stableProbe, answered: auth1008() }))).toBe('gateway-schema-mismatch');
+  expect(classifyRepair(args({ valid: stableProbe, answered: stableProbe }))).toBe('healthy');
+  expect(classifyRepair(args({ valid: stableProbe, answered: null }))).toBe('healthy');
   expect(classifyRepair(args({ valid: auth1008(), invalid: null }))).toBe('identity-rejected');
   expect(classifyRepair(args({ valid: { ...fast1011(), opened: false, closeCode: 1006, httpStatus: 401 }, invalid: null }))).toBe('identity-rejected');
   expect(classifyRepair(args({}))).toBe('hub-session-open-failure');          // valid 1011, invalid rejected
@@ -208,12 +278,33 @@ it('diagnoses a healthy chain end to end', async () => {
   ScriptedSocket.queue = [
     (ws) => ws.emit('open'), // valid proof: holds
     (ws) => { ws.emit('open'); setTimeout(() => ws.emit('close', 1008, Buffer.from('authentication_failed')), 10); },
+    (ws) => { ws.emit('open'); ws.emit('message', Buffer.from(STATUS_GET)); }, // answered: accepted
   ];
   const result = await repairFromCli({ argv: ['--hold-ms', '200'], deps: hermeticDeps() });
   expect(result.report.verdict).toBe('healthy');
   expect(result.ok).toBe(true);
   expect(result.report.checks.filter((c) => c.status === 'fail')).toEqual([]);
   expect(result.text).toContain('diagnosis: healthy');
+});
+
+it('diagnoses the 1008 schema mismatch: silent session holds, answered session rejected', async () => {
+  writeFixtures(makeIdentity());
+  ScriptedSocket.queue = [
+    (ws) => ws.emit('open'), // valid (silent) proof: holds — auth and session-open are fine
+    (ws) => { ws.emit('open'); setTimeout(() => ws.emit('close', 1008, Buffer.from('authentication_failed')), 10); },
+    (ws) => { // answered: graded by the gateway's whitelist → 1008
+      ws.emit('open');
+      ws.emit('message', Buffer.from(STATUS_GET));
+      setTimeout(() => ws.emit('close', 1008, Buffer.from('')), 15);
+    },
+  ];
+  const result = await repairFromCli({ argv: ['--hold-ms', '200'], deps: hermeticDeps() });
+  expect(result.report.verdict).toBe('gateway-schema-mismatch');
+  expect(result.ok).toBe(false);
+  const answeredCheck = result.report.checks.find((c) => c.id === 'connect-answered');
+  expect(answeredCheck?.status).toBe('fail');
+  expect(result.report.probes.answered?.closeCode).toBe(1008);
+  expect(result.text).toContain('nexus-gateway');
 });
 
 it('diagnoses the live 1011 signature: auth passes, session-open fails', async () => {
@@ -262,6 +353,7 @@ it('emits a machine-readable report with --json', async () => {
   ScriptedSocket.queue = [
     (ws) => ws.emit('open'),
     (ws) => { ws.emit('open'); setTimeout(() => ws.emit('close', 1008, Buffer.from('authentication_failed')), 10); },
+    (ws) => { ws.emit('open'); ws.emit('message', Buffer.from(STATUS_GET)); }, // answered: accepted
   ];
   const result = await repairFromCli({ argv: ['--json', '--hold-ms', '200'], deps: hermeticDeps() });
   const parsed = JSON.parse(result.text) as { verdict: string; ok: boolean; checks: unknown[] };
