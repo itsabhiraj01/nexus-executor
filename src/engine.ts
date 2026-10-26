@@ -13,7 +13,7 @@ import {
   evaluateToolProgress,
   fallbackPrompt,
   finalAssistantText,
-  isModelLimitError,
+  isModelFallbackError,
   lastAssistant,
   messageComplete,
   messageToEvents,
@@ -1169,9 +1169,9 @@ export class JobEngine {
         // the newest assistant row — re-polled, it must NOT fail the job.
         // (The hub gets this from its intermediate agent_finished state.)
         if (job.metadata.lastFallbackMessageId === last.id) return;
-        // Usage-limit errors walk the model priority list IN the session —
+        // Usage-limit and provider 401/403 errors walk the agent's chain IN the session —
         // the conversation carries the whole task, the next model continues.
-        // Only the final model's limit (or a non-limit error) fails the job.
+        // Only an exhausted chain (or an ineligible error) fails the job.
         const fell = await this.maybeModelFallback(job, last).catch((error) => {
           this.onError(error);
           return false;
@@ -1346,10 +1346,10 @@ export class JobEngine {
   }
 
   /**
-   * Automatic model fallback: when a completed turn ended in a usage-limit
+   * Automatic model fallback: when a completed turn ended in a usage-limit or provider auth
    * error and the job's model priority list still has a next entry, switch
    * the session to it and re-enter the SAME conversation instead of
-   * failing. Returns false when the error is not a limit, no model is left,
+   * failing. Returns false when the error is ineligible, no model is left,
    * or this errored turn was already handled (one fallback per turn — the
    * worker's next poll then fails the job, where the in-job retry budget
    * applies). Mirrors the hub's fallbackForModelLimit.
@@ -1357,7 +1357,7 @@ export class JobEngine {
   private async maybeModelFallback(job: JobRow, message: OpenCodeMessage): Promise<boolean> {
     if (!this.client || !job.opencodeSessionId) return false;
     const error: OpenCodeMessageError = message.error ?? { message: message.finish ?? '' };
-    if (!isModelLimitError(error)) return false;
+    if (!isModelFallbackError(error)) return false;
     const meta = job.metadata;
     if (meta.lastFallbackMessageId === message.id) return false;
     const priority = (job.spec.models ?? [])
@@ -1372,7 +1372,7 @@ export class JobEngine {
     const previous = priority[modelIndex] ?? null;
     const previousName = previous ? `${previous.providerID}/${previous.modelID}` : (job.model || null);
     const nextName = `${next.providerID}/${next.modelID}`;
-    const prompt = fallbackPrompt(previousName, nextName);
+    const prompt = fallbackPrompt(previousName, nextName, error);
 
     await this.client.switchModel(job.opencodeSessionId, next);
     const sent = await this.client.prompt(job.opencodeSessionId, prompt);
@@ -1384,7 +1384,7 @@ export class JobEngine {
       `UPDATE executor.jobs SET model = $2, updated_at = NOW() WHERE id = $1`, [job.id, nextName]);
     await appendJobEvent(this.pool, {
       jobId: job.id, eventType: EVENT.MODEL_FALLBACK,
-      summary: `Model fallback after a usage-limit error: ${previousName ?? 'the previous model'} → ${nextName}.`,
+      summary: `Model fallback after a provider error: ${previousName ?? 'the previous model'} → ${nextName}.`,
       payload: { from: previousName, to: nextName, reason: agentErrorSummary(error) },
     });
     await appendJobEvent(this.pool, {

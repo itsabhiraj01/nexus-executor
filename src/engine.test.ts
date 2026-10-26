@@ -1060,6 +1060,46 @@ describe('workspace retention', () => {
 });
 
 describe('model fallback', () => {
+  it('preserves configured order across consecutive mixed provider failures', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({ jobId: 'mixed-auth', models: ['litellm/a', 'litellm/b', 'openai/c'] }));
+    for (const [index, status] of [401, 403, 429].entries()) {
+      ctx.stub.messages[job.opencodeSessionId!] = [{
+        id: `mixed-${index}`, type: 'assistant', finish: 'error',
+        error: { type: status === 429 ? 'provider.rate_limit' : 'provider.auth', status, message: `Provider HTTP ${status}` },
+        content: [], time: { created: Date.now() + index },
+      }];
+      await ctx.engine.pollJob((await getJobByHubId(pool, 'mixed-auth'))!);
+    }
+    expect(ctx.stub.modelSwitches).toEqual([
+      { sessionId: job.opencodeSessionId, model: { providerID: 'litellm', modelID: 'b' } },
+      { sessionId: job.opencodeSessionId, model: { providerID: 'openai', modelID: 'c' } },
+    ]);
+    const row = (await getJobByHubId(pool, 'mixed-auth'))!;
+    expect(row.status).toBe('failed');
+    const { rows: events } = await pool.query<{ payload: { reason: string } }>(
+      `SELECT payload FROM executor.job_events WHERE job_id = $1 AND event_type = 'MODEL_FALLBACK' ORDER BY sequence_number`, [row.id]);
+    expect(events).toHaveLength(2);
+    expect(events[0]!.payload.reason).toContain('Provider HTTP 401');
+    expect(events[1]!.payload.reason).toContain('Provider HTTP 403');
+  });
+
+  it('never falls back on a policy denial, even when it carries HTTP 403', async () => {
+    const ctx = makeEngine({ retryMaxAttempts: 4 });
+    const job = await runningJob(ctx, spec({ jobId: 'deny-auth', models: ['litellm/open-large', 'kimi/k2'] }));
+    ctx.stub.messages[job.opencodeSessionId!] = [{
+      id: 'm-denied', type: 'assistant', finish: 'error',
+      error: { type: 'provider.no-route', status: 403, message: 'Model unavailable: blocked by policy' },
+      content: [], time: { created: Date.now() },
+    }];
+    await ctx.engine.pollJob((await getJobByHubId(pool, 'deny-auth'))!);
+    const row = (await getJobByHubId(pool, 'deny-auth'))!;
+    expect(row.status).toBe('failed');
+    expect(row.errorCode).toBe('model_policy_blocked');
+    expect(ctx.stub.modelSwitches).toHaveLength(0);
+    expect(await eventTypes(pool, row.id)).not.toContain('MODEL_FALLBACK');
+  });
+
   it('switches to the next priority model on a usage-limit error and continues in the SAME session', async () => {
     const ctx = makeEngine();
     const job = await runningJob(ctx, spec({
@@ -1102,17 +1142,30 @@ describe('model fallback', () => {
     expect(dead.errorCode).toBe('agent_error');
   });
 
-  it('auth-shaped errors never fall back (a missing key cannot be fixed by switching)', async () => {
+  it.each([401, 403])('provider auth %s walks the configured chain in the same session', async (status) => {
     const ctx = makeEngine();
-    const job = await runningJob(ctx, spec({ jobId: 'job-auth-fail', models: ['litellm/open-large', 'kimi/k2'] }));
+    const jobId = `auth-${status}`;
+    const job = await runningJob(ctx, spec({ jobId, models: ['litellm/open-large', 'kimi/k2'] }));
     ctx.stub.messages[job.opencodeSessionId!] = [{
       id: 'm-auth', type: 'assistant', finish: 'error',
-      error: { type: 'provider.auth', status: 401, message: 'No api key passed in.' },
+      error: { type: 'provider.auth', status, message: 'Provider request failed.' },
       content: [], time: { created: Date.now() },
     }];
-    await ctx.engine.pollJob((await getJobByHubId(pool, 'job-auth-fail'))!);
-    expect(ctx.stub.modelSwitches).toHaveLength(0);
-    expect((await getJobByHubId(pool, 'job-auth-fail'))!.status).toBe('failed');
+    await ctx.engine.pollJob((await getJobByHubId(pool, jobId))!);
+    expect(ctx.stub.modelSwitches).toEqual([{ sessionId: job.opencodeSessionId, model: { providerID: 'kimi', modelID: 'k2' } }]);
+    expect((await getJobByHubId(pool, jobId))!.status).toBe('running');
+    expect(ctx.stub.prompts.at(-1)!.sessionId).toBe(job.opencodeSessionId);
+    expect(ctx.stub.prompts.at(-1)!.text).not.toContain('usage limit');
+    await ctx.engine.pollJob((await getJobByHubId(pool, jobId))!);
+    expect(ctx.stub.modelSwitches).toHaveLength(1);
+    ctx.stub.messages[job.opencodeSessionId!] = [{
+      id: 'm-auth-final', type: 'assistant', finish: 'error',
+      error: { type: 'provider.auth', status, message: 'Provider request failed again.' },
+      content: [], time: { created: Date.now() + 1 },
+    }];
+    await ctx.engine.pollJob((await getJobByHubId(pool, jobId))!);
+    expect((await getJobByHubId(pool, jobId))!.status).toBe('failed');
+    expect(ctx.stub.modelSwitches).toHaveLength(1);
   });
 });
 

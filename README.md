@@ -495,8 +495,12 @@ dispatch, else `EXECUTOR_RETRY_MAX`); the timeline narrates
 `remote_retry_exhausted` with the attempt counting on the summary — the hub
 folds that without re-retrying (it pinned the budget at dispatch; only
 infrastructure losses and pre-0.2.0 executors get the hub's own cross-run
-retry). A turn dying on a provider usage limit switches to the next model
-of the dispatch's priority list instead (`MODEL_FALLBACK`, once per limit).
+retry). A turn dying on a provider usage limit or HTTP 401/403 switches to
+the next model of the assigned agent's dispatched chain in configured
+order, continuing in the same session (`MODEL_FALLBACK`, once per failed
+turn, with the original error recorded). An exhausted or single-model
+chain follows normal failure/retry handling. Provider-policy denials
+(`provider.no-route`) never trigger fallback or retry.
 Event types follow the hub's builder vocabulary
 (`SESSION_CREATED`, `PROMPT_SENT`, `AGENT_MESSAGE`, `TOOL_CALL_*`,
 `VERIFICATION_*`, `EXECUTION_*`, `WORKTREE_*`, …) so the hub can render

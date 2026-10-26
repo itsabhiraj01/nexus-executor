@@ -7,6 +7,8 @@ import {
   detectStall,
   evaluateToolProgress,
   finalAssistantText,
+  fallbackPrompt,
+  isModelFallbackError,
   lastAssistant,
   messageComplete,
   messageToEvents,
@@ -20,6 +22,31 @@ import {
 function assistant(id: string, parts: OpenCodeMessage['content'], extra: Partial<OpenCodeMessage> = {}): OpenCodeMessage {
   return { id, type: 'assistant', content: parts, finish: 'stop', time: { created: Date.now() }, ...extra };
 }
+
+describe('model fallback eligibility', () => {
+  it.each([401, 403])('accepts provider HTTP %s in structured and string form', (status) => {
+    expect(isModelFallbackError({ type: 'provider.auth', status, message: 'Provider request failed' })).toBe(true);
+    expect(isModelFallbackError(`Provider request failed with HTTP ${status} (provider.auth ${status})`)).toBe(true);
+    expect(isModelFallbackError({ message: `Provider request failed with HTTP ${status}` })).toBe(true);
+  });
+
+  it('preserves limits and excludes policy denials and unrelated errors', () => {
+    expect(isModelFallbackError({ status: 429 })).toBe(true);
+    expect(isModelFallbackError({ type: 'provider.no-route', status: 403, message: 'quota' })).toBe(false);
+    expect(isModelFallbackError('provider.no-route HTTP 403')).toBe(false);
+    expect(isModelFallbackError({ status: 403, message: 'Model unavailable: blocked by policy' })).toBe(false);
+    expect(isModelFallbackError({ status: 500, message: 'internal error' })).toBe(false);
+    expect(isModelFallbackError('permission denied')).toBe(false);
+    expect(isModelFallbackError(null)).toBe(false);
+  });
+
+  it('describes auth failures without claiming a usage limit', () => {
+    const prompt = fallbackPrompt('a/first', 'b/second', { type: 'provider.auth', status: 403 });
+    expect(prompt).toContain('authentication or authorization');
+    expect(prompt).not.toContain('usage limit');
+    expect(prompt).toContain('Continue the task above');
+  });
+});
 
 describe('client', () => {
   it('sends HTTP Basic auth derived from the token', async () => {

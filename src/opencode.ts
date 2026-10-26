@@ -436,10 +436,8 @@ const AUTH_ERROR = /\bauth\b|api.?key|unauthorized|forbidden|permission/i;
  * Providers phrase this differently (429s, quota exhaustion, spent credits),
  * and OpenCode reports message errors either structured
  * (`{type:'provider.rate_limit', status:429, message:…}`) or as plain
- * strings. Auth/config failures (401/403, missing keys) are deliberately
- * excluded — switching models cannot fix a missing credential, and a
- * fallback would only hide the misconfiguration. Over-matching is cheap (a
- * model switch); under-matching degrades to the normal fail path.
+ * strings. Auth failures are not limits; isModelFallbackError separately
+ * admits provider 401/403 so another configured model can continue.
  */
 export function isModelLimitError(error: OpenCodeMessageError | null | undefined): boolean {
   if (error == null) return false;
@@ -453,14 +451,26 @@ export function isModelLimitError(error: OpenCodeMessageError | null | undefined
   return typeof error.message === 'string' ? LIMIT_MESSAGE.test(error.message) : false;
 }
 
-/** The prompt sent after an automatic model fallback: the session carries
- *  the whole task history (including the failed turn's partial work), so
- *  the next model only needs to be told to pick the task up. */
-export function fallbackPrompt(previous: string | null, next: string): string {
+/** Fallback eligibility is broader than quota classification, but never policy denial. */
+export function isModelFallbackError(error: OpenCodeMessageError | null | undefined): boolean {
+  if (error == null) return false;
+  const text = typeof error === 'string' ? error : `${error.type ?? ''} ${error.message ?? ''}`;
+  // Policy denials must never be mistaken for provider authentication failures.
+  if (/provider\.no-route|no model is available|model unavailable:/i.test(text)) return false;
+  if (typeof error !== 'string' && (error.status === 401 || error.status === 403)) return true;
+  if (/\b(?:HTTP(?: status)?[ :]*|provider\.auth[ :]+)(?:401|403)\b/i.test(text)) return true;
+  return isModelLimitError(error);
+}
+
+/** Continue the same conversation rather than replaying the original task. */
+export function fallbackPrompt(previous: string | null, next: string, error?: OpenCodeMessageError): string {
+  const reason = error != null && !isModelLimitError(error)
+    ? 'encountered a provider authentication or authorization failure'
+    : 'hit its usage limit';
   return [
     previous
-      ? `The model ${previous} hit its usage limit and could not finish the previous turn.`
-      : 'The previous model hit its usage limit and could not finish the previous turn.',
+      ? `The model ${previous} ${reason} and could not finish the previous turn.`
+      : `The previous model ${reason} and could not finish the previous turn.`,
     `You are now running as ${next}.`,
     '',
     'Continue the task above from where it stands — finish any incomplete work and end your turn with the usual summary.',
