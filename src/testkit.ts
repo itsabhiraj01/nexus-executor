@@ -8,6 +8,22 @@ import {
   type OpenCodePermissionDecision, type OpenCodePermissionRequest,
 } from './opencode.js';
 import { execGit } from './workspace.js';
+import { JobEngine, getJobByHubId, type JobEngineOptions, type JobSpecInput } from './engine.js';
+
+/** Lifecycle fixtures explicitly finish admission; acceptance/concurrency
+ * regressions use the production JobEngine directly. */
+export class LaunchedJobEngine extends JobEngine {
+  constructor(private readonly options: JobEngineOptions) { super(options); }
+  override async createJob(spec: JobSpecInput) {
+    const accepted = await super.createJob(spec);
+    await this.admitQueued();
+    return { ...accepted, job: (await getJobByHubId(this.options.pool, spec.jobId))! };
+  }
+  override async admitQueued() {
+    await super.admitQueued();
+    await this.drain();
+  }
+}
 
 /**
  * Test-only helpers shared by the worker/engine suites. NOT part of the

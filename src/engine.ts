@@ -1,7 +1,7 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Pool } from 'pg';
+import { Client, type Pool } from 'pg';
 import type { ExecutorConfig } from './config.js';
 import type { SqlExecutor } from './db.js';
 import {
@@ -39,6 +39,7 @@ import {
   materializeJobAttachments,
   mergeJobBranch,
   prepareWorktree,
+  protectJobConfig,
   pullBaseIntoWorktree,
   removeJobWorkspace,
   resolveBaseRef,
@@ -394,29 +395,30 @@ export async function appendJobEvent(db: SqlExecutor, input: {
   messageId?: string | null;
 }): Promise<number> {
   for (let attempt = 0; attempt < 5; attempt++) {
-    const bumped = await db.query<{ event_seq: string | number }>(`
+    try {
+      const inserted = await db.query<{ sequence_number: string | number }>(`
+      WITH bumped AS (
       UPDATE executor.jobs SET
         event_seq = GREATEST(
           event_seq,
           (SELECT COALESCE(MAX(sequence_number), 0) FROM executor.job_events WHERE job_id = $1)) + 1,
         updated_at = NOW()
-      WHERE id = $1
-      RETURNING event_seq`, [input.jobId]);
-    const sequence = Number(bumped.rows[0]?.event_seq ?? 0);
-    if (!sequence) throw new Error(`Job ${input.jobId} disappeared while appending an event`);
-    try {
-      await db.query(`
+      WHERE id = $1 AND (status NOT IN ('failed', 'succeeded', 'cancelled') OR $2 = ANY($7::text[]))
+      RETURNING event_seq)
         INSERT INTO executor.job_events (job_id, sequence_number, event_type, source, summary, payload, message_id)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)`, [
+        SELECT $1, event_seq, $2, $3, $4, $5::jsonb, $6 FROM bumped RETURNING sequence_number`, [
         input.jobId,
-        sequence,
         input.eventType,
         input.source ?? 'executor',
         input.summary.slice(0, SUMMARY_LIMIT),
         JSON.stringify(capPayload(input.payload)),
         input.messageId ?? null,
+        [EVENT.EXECUTION_SUCCEEDED, EVENT.EXECUTION_FAILED, EVENT.EXECUTION_CANCELLED,
+          EVENT.WORKTREE_MERGED, EVENT.WORKTREE_MERGE_FAILED, EVENT.WORKTREE_DEPLOYED,
+          EVENT.WORKTREE_DEPLOY_FAILED, EVENT.WORKSPACE_CLEANED, EVENT.WORKSPACE_RETENTION_VIOLATION],
       ]);
-      return sequence;
+      // Stale lifecycle work must not append after the terminal EOF marker.
+      return Number(inserted.rows[0]?.sequence_number ?? 0);
     } catch (error) {
       if ((error as { code?: string }).code === '23505' && attempt < 4) continue;
       throw error;
@@ -479,6 +481,7 @@ export function jobShortId(hubJobId: string): string {
 const MAX_VERIFICATION_ATTEMPTS = 3;
 const MAX_REBASE_ROUNDS = 3;
 const SEEN_IDS_CAP = 500;
+class AttemptInterrupted extends Error {}
 
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
@@ -505,6 +508,9 @@ export class JobEngine {
   private readonly nowFn: () => number;
   private readonly onError: (error: unknown) => void;
   private readonly verifyingJobs = new Set<string>();
+  private readonly launchingJobs = new Set<string>();
+  private readonly commands = new Map<string, AbortController>();
+  private readonly deadlines = new Map<string, { attempt: number; timer: ReturnType<typeof setTimeout> }>();
   /** Detached verification cycles — tests drain them via `drain()`. */
   private readonly pending = new Set<Promise<unknown>>();
   /** Retention-sweep throttle: the tick is seconds; the sweep is hourly. */
@@ -524,7 +530,7 @@ export class JobEngine {
   }
 
   async drain(): Promise<void> {
-    await Promise.all([...this.pending]);
+    while (this.pending.size) await Promise.all([...this.pending]);
   }
 
   private track(work: Promise<unknown>): void {
@@ -556,35 +562,22 @@ export class JobEngine {
       return { job: existing, created: false };
     }
     const job = rowToJob(inserted.rows[0]);
-    await this.admitOne(job);
-    return { job: (await getJobByHubId(this.pool, spec.jobId))!, created: true };
-  }
-
-  /**
-   * Admit one freshly created job: launch it when the OpenCode service is
-   * configured and a slot is free (counting OTHER occupants — this job is
-   * already in the created state), otherwise park it queued.
-   */
-  private async admitOne(job: JobRow): Promise<void> {
+    // Durable acceptance: the worker owns launch, including after a restart.
     if (!this.client) {
       await this.queueJob(job, 'OpenCode is not configured — the job waits queued.');
-      return;
+      return { job: (await getJobByHubId(this.pool, spec.jobId))!, created: true };
     }
-    const { rows } = await this.pool.query<{ n: number }>(`
-      SELECT count(*)::int AS n FROM executor.jobs
-      WHERE status IN ('created', 'running', 'verifying') AND id <> $1`, [job.id]);
-    if ((rows[0]?.n ?? 0) >= this.config.maxParallelJobs) {
-      await this.queueJob(job, 'Queued behind running jobs.');
-      return;
-    }
-    await this.launchJob(job);
+    return { job, created: true };
   }
 
   private async queueJob(job: JobRow, summary: string): Promise<void> {
     const { rowCount } = await this.pool.query(
-      `UPDATE executor.jobs SET status = 'queued', version = version + 1, updated_at = NOW()
+      `UPDATE executor.jobs SET status = 'queued', started_at = NULL, version = version + 1, updated_at = NOW()
        WHERE id = $1 AND status = 'created'`, [job.id]);
     if (rowCount) {
+      const deadline = this.deadlines.get(job.id);
+      if (deadline) clearTimeout(deadline.timer);
+      this.deadlines.delete(job.id);
       await appendJobEvent(this.pool, {
         jobId: job.id, eventType: EVENT.EXECUTION_STATUS_CHANGED, summary,
       });
@@ -596,32 +589,14 @@ export class JobEngine {
    * insert and launch) and promote queued jobs while slots are free.
    */
   async admitQueued(): Promise<void> {
-    const { rows: countRows } = await this.pool.query<{ n: number }>(`
-      SELECT count(*)::int AS n FROM executor.jobs WHERE status IN ('created', 'running', 'verifying')`);
-    let free = this.config.maxParallelJobs - (countRows[0]?.n ?? 0);
     const { rows } = await this.pool.query<DbJobRow>(`
       SELECT * FROM executor.jobs WHERE status IN ('created', 'queued')
         AND (retry_backoff_until IS NULL OR retry_backoff_until <= NOW())
         ORDER BY created_at ASC LIMIT 25`);
     for (const raw of rows) {
       const job = rowToJob(raw);
-      if (job.status === 'created') {
-        if (job.opencodeSessionId) {
-          // Crashed after the session was made but before running: resume.
-          await this.pool.query(
-            `UPDATE executor.jobs SET status = 'running', started_at = COALESCE(started_at, NOW()), version = version + 1, updated_at = NOW()
-             WHERE id = $1 AND status = 'created'`, [job.id]);
-        } else if (this.client) {
-          // Crashed pre-launch; the created row already occupies its slot.
-          await this.launchJob(job).catch((error) => this.onError(error));
-        } else {
-          await this.queueJob(job, 'OpenCode is not configured — the job waits queued.');
-        }
-        continue;
-      }
-      if (!this.client || free <= 0) continue;
-      free -= 1;
-      await this.launchJob(job).catch((error) => this.onError(error));
+      if (!this.client) await this.queueJob(job, 'OpenCode is not configured — the job waits queued.');
+      else this.track(this.launchJob(job));
     }
   }
 
@@ -715,11 +690,10 @@ export class JobEngine {
     return { branch, path, baseSha };
   }
 
-  /** Attach the job's worktree to an EXISTING named branch (pipeline stages):
-   * reuse a live worktree already on the branch when one exists anywhere,
-   * otherwise add a fresh one. Missing branch ⇒ workspace_setup_failed with
-   * the spec's actionable sentence — the branch is sacred, never re-cut. */
-  private async attachNamedBranch(repoRoot: string, baseBranch: string): Promise<{ branch: string; path: string; baseSha: string }> {
+  /** Attach an EXISTING stage branch in a fresh per-job location. A previous
+   * executor-owned, idle, clean worktree is retained detached. Missing branch
+   * ⇒ workspace_setup_failed — a stage branch is sacred, never re-cut. */
+  private async attachNamedBranch(repoRoot: string, baseBranch: string, jobId: string): Promise<{ branch: string; path: string; baseSha: string }> {
     const probe = await this.git(['rev-parse', '--verify', '--quiet', `${baseBranch}^{commit}`], { cwd: repoRoot });
     if (probe.code !== 0 || !probe.stdout.trim()) {
       throw Object.assign(
@@ -727,7 +701,7 @@ export class JobEngine {
         { code: 'workspace_setup_failed' },
       );
     }
-    const preferred = join(this.config.workspaceRoot, 'worktrees', baseBranch.replace(/[/::]/g, '-'));
+    const preferred = join(this.config.workspaceRoot, 'worktrees', `stage-${jobId}`);
     if (existsSync(preferred)) {
       const onBranch = await this.git(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: preferred });
       if (onBranch.stdout.trim() === baseBranch) return { branch: baseBranch, path: preferred, baseSha: probe.stdout.trim() };
@@ -735,15 +709,29 @@ export class JobEngine {
     await this.git(['worktree', 'prune'], { cwd: repoRoot });
     const added = await this.git(['worktree', 'add', preferred, baseBranch], { cwd: repoRoot });
     if (added.code !== 0) {
-      // A branch may be checked out in only ONE worktree: if another stage's
-      // live worktree already holds it, reuse that path instead of failing.
-      if ((added.stderr || added.stdout).includes('already checked out')) {
+      // Each stage needs a fresh OpenCode location AND fresh generated config.
+      // Leave the old worktree on disk detached; never reuse its cached catalog.
+      if (/already (checked out|used by worktree)/.test(added.stderr || added.stdout)) {
         const listed = await this.git(['worktree', 'list', '--porcelain'], { cwd: repoRoot });
         for (const block of listed.stdout.split('\n\n')) {
           const path = /^worktree (.+)$/m.exec(block)?.[1];
           const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
           if (branch === baseBranch && path && existsSync(path)) {
-            return { branch: baseBranch, path, baseSha: probe.stdout.trim() };
+            const known = await this.pool.query('SELECT id FROM executor.jobs WHERE worktree_path = $1', [path]);
+            if (!known.rowCount) throw Object.assign(new Error('The branch is checked out outside an executor-owned stage.'), { code: 'workspace_setup_failed' });
+            const active = await this.pool.query(`SELECT id FROM executor.jobs WHERE worktree_path = $1
+              AND status IN ('created', 'running', 'verifying') AND id <> $2`, [path, jobId]);
+            const dirty = await this.git(['status', '--porcelain'], { cwd: path });
+            if (active.rowCount || dirty.code !== 0 || dirty.stdout.trim()) {
+              throw Object.assign(new Error('The previous stage is active or has uncommitted changes; finish it before handing off the branch.'), { code: 'workspace_setup_failed' });
+            }
+            const detached = await this.git(['checkout', '--detach'], { cwd: path });
+            if (detached.code !== 0) throw new Error(detached.stderr);
+            const fresh = await this.git(['worktree', 'add', preferred, baseBranch], { cwd: repoRoot });
+            if (fresh.code !== 0) throw new Error(fresh.stderr);
+            await this.pool.query(`UPDATE executor.jobs SET metadata = metadata || $2::jsonb
+              WHERE worktree_path = $1 AND id <> $3`, [path, JSON.stringify({ supersededBy: jobId }), jobId]);
+            return { branch: baseBranch, path: preferred, baseSha: probe.stdout.trim() };
           }
         }
       }
@@ -765,6 +753,153 @@ export class JobEngine {
    * only deleted by the hub's explicit merge op.
    */
   async launchJob(job: JobRow): Promise<void> {
+    if (!this.client || this.launchingJobs.has(job.id) || this.launchingJobs.size >= this.config.maxParallelJobs) return;
+    this.launchingJobs.add(job.id);
+    // Dedicated connections keep long launches from exhausting the query pool.
+    const owner = new Client(this.pool.options);
+    let locked = false;
+    try {
+      await owner.connect();
+      // Connection-scoped ownership releases automatically on process death.
+      locked = (await owner.query<{ locked: boolean }>(
+        'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [job.id])).rows[0]!.locked;
+      if (!locked) return;
+      await owner.query('BEGIN');
+      await owner.query("SELECT pg_advisory_xact_lock(hashtextextended('executor-admission', 0))");
+      // Serialize eligibility with cancel/terminal transitions, not only with
+      // other admissions. No unconditional write may follow an unlocked read.
+      const selected = await owner.query<DbJobRow>('SELECT * FROM executor.jobs WHERE id = $1 FOR UPDATE', [job.id]);
+      const current = selected.rows[0] ? rowToJob(selected.rows[0]) : null;
+      if (!current || !['created', 'queued'].includes(current.status) ||
+          (current.retryBackoffUntil && current.retryBackoffUntil.getTime() > Date.now())) {
+        await owner.query('COMMIT');
+        return;
+      }
+      const count = await owner.query<{ n: number }>(`SELECT count(*)::int AS n FROM executor.jobs
+        WHERE id <> $1 AND (status IN ('running', 'verifying') OR (status = 'created' AND started_at IS NOT NULL))`, [job.id]);
+      if (count.rows[0]!.n >= this.config.maxParallelJobs) {
+        await owner.query("UPDATE executor.jobs SET status = 'queued', started_at = NULL WHERE id = $1", [job.id]);
+        await owner.query('COMMIT');
+        return;
+      }
+      await owner.query(`UPDATE executor.jobs SET status = 'created', started_at = COALESCE(started_at, NOW()),
+        metadata = metadata || $2::jsonb, updated_at = NOW() WHERE id = $1`, [job.id, JSON.stringify({ launchToken: randomUUID() })]);
+      await owner.query('COMMIT');
+      job = (await getJobByHubId(owner, job.hubJobId))!;
+      if (!await this.isCurrent(job)) return;
+      this.armDeadline(job);
+      await this.launchOwned(job, owner);
+    } finally {
+      await owner.query('ROLLBACK').catch(() => {});
+      // Closing releases both ownership locks even after a broken connection.
+      await owner.end();
+      this.launchingJobs.delete(job.id);
+    }
+  }
+
+  private async isCurrent(job: JobRow): Promise<boolean> {
+    const current = await getJobByHubId(this.pool, job.hubJobId);
+    return !!current && current.attemptCount === job.attemptCount &&
+      (!job.metadata.launchToken || current.metadata.launchToken === job.metadata.launchToken) &&
+      !TERMINAL_STATUSES.includes(current.status) && current.status !== 'queued';
+  }
+
+  private async promptCurrent(job: JobRow, sessionId: string, text: string) {
+    if (!await this.isCurrent(job)) throw new AttemptInterrupted('Job no longer owns this attempt');
+    const sent = await this.client!.prompt(sessionId, text);
+    if (!await this.isCurrent(job)) {
+      // Covers cancellation racing the remote prompt request/response.
+      await this.client!.interrupt(sessionId).catch(() => {});
+      throw new AttemptInterrupted('Job interrupted during prompt dispatch');
+    }
+    return sent;
+  }
+
+  private armDeadline(job: JobRow): void {
+    if (!job.startedAt || this.config.jobTimeoutMs <= 0) return;
+    const previous = this.deadlines.get(job.id);
+    if (previous?.attempt === job.attemptCount) return;
+    if (previous) clearTimeout(previous.timer);
+    const timer = setTimeout(() => {
+      this.deadlines.delete(job.id);
+      this.track((async () => {
+        const current = await getJobByHubId(this.pool, job.hubJobId);
+        if (current && current.attemptCount === job.attemptCount && ['created', 'running', 'verifying'].includes(current.status)) {
+          await this.failJob(job.id, 'execution_timeout', 'Job timed out: exceeded its execution deadline.', { interrupt: true, expectedAttempt: job.attemptCount });
+        }
+      })());
+    }, Math.max(1, this.config.jobTimeoutMs - (this.now() - job.startedAt.getTime())));
+    timer.unref();
+    this.deadlines.set(job.id, { attempt: job.attemptCount, timer });
+  }
+
+  private async runCommand(job: JobRow) {
+    const controller = new AbortController();
+    this.commands.set(job.id, controller);
+    // Also observe cancellations issued by another executor process. Never
+    // let an old command repair or finish a newer attempt.
+    let checking = false;
+    const watch = setInterval(() => {
+      if (checking) return;
+      checking = true;
+      void this.isCurrent(job).then((current) => { if (!current) controller.abort(); })
+        .catch(() => controller.abort()).finally(() => { checking = false; });
+    }, 250);
+    this.armDeadline(job);
+    try {
+      const result = await runJobCommand(job.verificationCommand, job.worktreePath, jobEnv(), controller.signal);
+      // Abort is never a verification failure eligible for a repair prompt.
+      if (controller.signal.aborted) throw new AttemptInterrupted('Verification command cancelled');
+      return result;
+    } finally {
+      clearInterval(watch);
+      if (this.commands.get(job.id) === controller) this.commands.delete(job.id);
+    }
+  }
+
+  private async prepareSession(job: JobRow): Promise<ModelRef | null> {
+    const { spec, worktreePath } = job;
+    if (spec.agent) {
+      try { await materializeJobAgent(this.git, worktreePath, spec.agent); }
+      catch (error) { throw Object.assign(new Error(String(error)), { code: 'workspace_setup_failed' }); }
+      await appendJobEvent(this.pool, {
+        jobId: job.id, eventType: EVENT.AGENT_APPLIED,
+        summary: `Agent "${spec.agent.name}" materialized natively on the job worktree (${spec.agent.opencodeAgent}).`,
+        payload: { agent: spec.agent.opencodeAgent, name: spec.agent.name, mcp: spec.agent.mcp ? 'written' : 'none', tier: 'native' },
+      });
+    }
+    if (spec.modelPolicy && job.metadata.modelPolicyDir !== worktreePath) {
+      let registration: { canary: string | null };
+      try {
+        await protectJobConfig(this.git, worktreePath, ['opencode.json']);
+        registration = await registerModelPolicy(this.client!, worktreePath, spec.modelPolicy.providers);
+      } catch (error) {
+        throw Object.assign(new ModelPolicyError(String(error)), { code: 'model_policy_failed' });
+      }
+      await this.mergeMetadata(job.id, { modelPolicyDir: worktreePath });
+      await appendJobEvent(this.pool, {
+        jobId: job.id, eventType: EVENT.MODEL_POLICY,
+        summary: 'Model policy enforced on the job worktree.',
+        payload: { providers: spec.modelPolicy.providers, models: spec.modelPolicy.models, canary: registration.canary, directory: worktreePath },
+      });
+    }
+    const priority = (spec.models ?? []).map(parseModelRef).filter((entry): entry is ModelRef => entry !== null);
+    const index = Math.min(Math.max(0, typeof job.metadata.modelIndex === 'number' ? job.metadata.modelIndex : 0), Math.max(0, priority.length - 1));
+    const model = priority[index] ?? null;
+    if (spec.modelPolicy && (!model || !spec.modelPolicy.providers.includes(model.providerID))) {
+      throw Object.assign(new ModelPolicyError('The job model is absent or outside its model policy.'), { code: 'model_policy_failed' });
+    }
+    return model;
+  }
+
+  private async launchOwned(job: JobRow, owner: SqlExecutor): Promise<void> {
+    if (job.opencodeSessionId) {
+      // Never duplicate a session/prompt after an ambiguous dispatch crash.
+      // Poll the persisted session; the independent deadline bounds a session
+      // whose prompt did not reach OpenCode before the process died.
+      await this.pool.query("UPDATE executor.jobs SET status = 'running' WHERE id = $1 AND status = 'created' AND attempt_count = $2", [job.id, job.attemptCount]);
+      return;
+    }
     const fromStatus = job.status;
     const isRetry = job.attemptCount > 1;
     const retryState = (job.metadata.retryState ?? null) as { code?: string; reason?: string; committed?: boolean } | null;
@@ -774,7 +909,17 @@ export class JobEngine {
       const spec = job.spec;
       repoRoot = await this.resolveRepoRoot(spec);
       const baseRef = await resolveBaseRef(this.git, repoRoot, this.config.baseRef);
-      if (isRetry && job.branch) {
+      if (!await this.isCurrent(job)) return;
+      if (spec.baseBranch) {
+        const common = await this.git(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: repoRoot });
+        if (common.code !== 0) throw new Error(common.stderr);
+        const lock = await owner.query<{ locked: boolean }>('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [`branch:${common.stdout.trim()}:${spec.baseBranch}`]);
+        if (!lock.rows[0]!.locked) {
+          await this.queueJob(job, 'Waiting for the previous stage to finish launch.');
+          return;
+        }
+      }
+      if (job.branch) {
         prepared = await this.resumeWorkspace(repoRoot, job);
         if (prepared.path !== job.worktreePath) {
           await this.pool.query(
@@ -785,7 +930,7 @@ export class JobEngine {
         prepared = spec.baseBranch
           // Pipeline stage: attach to the stage's named branch (spec §4) —
           // a branch is sacred, never silently re-cut.
-          ? await this.attachNamedBranch(repoRoot, spec.baseBranch)
+          ? await this.attachNamedBranch(repoRoot, spec.baseBranch, job.id)
           : await prepareWorktree(
             this.git,
             { repoRoot, worktreeRoot: join(this.config.workspaceRoot, 'worktrees') },
@@ -808,6 +953,7 @@ export class JobEngine {
 
       // Any fresh launch supersedes a rebase-repair state left by a
       // previous attempt (the retry re-attaches and replays the step).
+      if (!await this.isCurrent(job)) return;
       if (job.metadata.pendingRebaseRepair === true) {
         await this.mergeMetadata(job.id, { pendingRebaseRepair: false, rebaseRounds: 0 });
       }
@@ -837,7 +983,8 @@ export class JobEngine {
           jobId: job.id, eventType: EVENT.VERIFICATION_STARTED,
           summary: `Running \`${job.verificationCommand}\``, payload: { command: job.verificationCommand },
         });
-        const result = await runJobCommand(job.verificationCommand, prepared.path, jobEnv());
+        const result = await this.runCommand({ ...job, worktreePath: prepared.path });
+        if (!await this.isCurrent(job)) return;
         const verifyMeta = JSON.stringify({
           verification: { attempts, exitCode: result.code, outputTail: result.output.slice(-4000) },
         });
@@ -850,17 +997,7 @@ export class JobEngine {
             summary: `Verification passed (attempt ${attempts}).`,
             payload: { attempt: attempts, command: job.verificationCommand, output: result.output },
           });
-          const { rowCount } = await this.pool.query(
-            `UPDATE executor.jobs SET status = 'succeeded', summary = 'Verification passed before any agent turn.',
-               finished_at = NOW(), version = version + 1, updated_at = NOW()
-             WHERE id = $1 AND status = $2`, [job.id, fromStatus]);
-          if (rowCount) {
-            await appendJobEvent(this.pool, {
-              jobId: job.id, eventType: EVENT.EXECUTION_SUCCEEDED,
-              summary: 'Verification passed before any agent turn.',
-              payload: { summary: 'Verification passed before any agent turn.', verifyFirst: true },
-            });
-          }
+          await this.succeedJob(job, 'Verification passed before any agent turn.');
           return;
         }
         await appendJobEvent(this.pool, {
@@ -892,75 +1029,9 @@ export class JobEngine {
         }
       }
 
-      // Native persona (hub ≥ nativeAgents capability): give the job's
-      // worktree the persona as a real OpenCode project agent — its skills
-      // section and MCP servers reach remote runs exactly like local ones.
-      // MUST land before the model-policy canary below: that probe opens
-      // the directory's first session, and OpenCode freezes a location's
-      // project-agent catalog at its first session.
-      if (spec.agent && this.client) {
-        try {
-          await materializeJobAgent(this.git, prepared.path, spec.agent);
-        } catch (error) {
-          throw Object.assign(new Error(error instanceof Error ? error.message : String(error)), { code: 'workspace_setup_failed' });
-        }
-        await appendJobEvent(this.pool, {
-          jobId: job.id, eventType: EVENT.AGENT_APPLIED,
-          summary: `Agent "${spec.agent.name}" materialized natively on the job worktree (${spec.agent.opencodeAgent}).`,
-          payload: { agent: spec.agent.opencodeAgent, name: spec.agent.name, mcp: spec.agent.mcp ? 'written' : 'none', tier: 'native' },
-        });
-      }
-
-      // The model policy fence: the hub ships the job's agents' provider
-      // allow-list; write it into the job's worktree ONCE (OpenCode
-      // directory config is sticky) and prove it denies a real out-of-
-      // policy model BEFORE the session starts — a service that cannot
-      // enforce it fails the job (retries skip the re-proof on the SAME
-      // directory; a reattached different worktree gets re-fenced).
-      if (spec.modelPolicy && this.client) {
-        const registeredDir = typeof job.metadata.modelPolicyDir === 'string' ? job.metadata.modelPolicyDir : '';
-        if (registeredDir !== prepared.path) {
-          let registration: { canary: string | null };
-          try {
-            registration = await registerModelPolicy(this.client, prepared.path, spec.modelPolicy.providers);
-          } catch (error) {
-            const reason = error instanceof Error ? error.message : String(error);
-            throw Object.assign(new ModelPolicyError(reason), { code: 'model_policy_failed' });
-          }
-          await this.pool.query(
-            `UPDATE executor.jobs SET metadata = metadata || $2::jsonb, version = version + 1, updated_at = NOW()
-             WHERE id = $1 AND status = $3`, [job.id, JSON.stringify({ modelPolicyDir: prepared.path }), fromStatus]);
-          await appendJobEvent(this.pool, {
-            jobId: job.id, eventType: EVENT.MODEL_POLICY,
-            summary: `Model policy enforced on the job worktree (providers: ${spec.modelPolicy.providers.join(', ')})${registration.canary ? ` — proven by denying ${registration.canary}` : ''}.`,
-            payload: { providers: spec.modelPolicy.providers, models: spec.modelPolicy.models, canary: registration.canary, directory: prepared.path },
-          });
-        }
-      }
-
-      // The model: the spec's priority list AT the position any usage-limit
-      // fallback walked to (the position is job-wide, surviving attempts).
-      const priority = (spec.models ?? [])
-        .map((entry) => parseModelRef(entry))
-        .filter((entry): entry is ModelRef => entry !== null);
-      const modelIndex = Math.min(
-        Math.max(0, typeof job.metadata.modelIndex === 'number' ? job.metadata.modelIndex : 0),
-        Math.max(0, priority.length - 1),
-      );
-      const modelRef = priority[modelIndex] ?? null;
-      // A fenced job must never run an out-of-policy model: the chain the
-      // hub ships lives inside the policy by construction — refuse loudly
-      // if the two ever disagree (a hand-edited spec), never fall back to
-      // the service default behind the fence's back.
-      if (spec.modelPolicy && modelRef && !spec.modelPolicy.providers.includes(modelRef.providerID)) {
-        throw Object.assign(
-          new ModelPolicyError(
-            `the job's model ${modelRef.providerID}/${modelRef.modelID} is outside its model policy (providers: ${spec.modelPolicy.providers.join(', ')})`,
-          ),
-          { code: 'model_policy_failed' },
-        );
-      }
-      const composed = promptOverride ?? await this.composePrompt(spec, attachmentsDir, attachmentFiles);
+      const modelRef = await this.prepareSession({ ...job, worktreePath: prepared.path });
+      const originalPrompt = await this.composePrompt(spec, attachmentsDir, attachmentFiles);
+      const composed = promptOverride ? `${originalPrompt}\n\n${promptOverride}` : originalPrompt;
       const prompt = isRetry && !promptOverride
         ? [
             retryPreamble({
@@ -973,6 +1044,7 @@ export class JobEngine {
             composed,
           ].join('\n\n')
         : composed;
+      if (!await this.isCurrent(job)) return;
       const session = await this.client!.createSession({
         title: job.title || `Job ${job.hubJobId}`,
         directory: prepared.path,
@@ -985,6 +1057,10 @@ export class JobEngine {
       const modelEcho = session.model?.id
         ? `${session.model.providerID ?? ''}/${session.model.id}`
         : (modelRef ? `${modelRef.providerID}/${modelRef.modelID}` : '');
+      if (!await this.isCurrent(job)) {
+        await this.client!.interrupt(session.id).catch(() => {});
+        return;
+      }
       await this.pool.query(
         `UPDATE executor.jobs SET opencode_session_id = $2, model = $3,
            retry_backoff_until = NULL, metadata = metadata - 'retryState',
@@ -1006,7 +1082,8 @@ export class JobEngine {
         });
       }
 
-      const sent = await this.client!.prompt(session.id, prompt);
+      if (!await this.isCurrent(job)) return;
+      const sent = await this.promptCurrent(job, session.id, prompt);
       await appendJobEvent(this.pool, {
         jobId: job.id, eventType: EVENT.PROMPT_SENT,
         summary: prompt.slice(0, SUMMARY_LIMIT), payload: { text: prompt, promptMessageId: sent.id },
@@ -1020,9 +1097,11 @@ export class JobEngine {
       });
     } catch (error) {
       const rawCode = (error as { code?: string }).code;
+      if (error instanceof AttemptInterrupted) return;
+      if (!await this.isCurrent(job)) return;
       const code = rawCode === 'workspace_setup_failed' || rawCode === 'model_policy_failed'
         ? rawCode : 'session_setup_failed';
-      await this.failJob(job.id, code, error instanceof Error ? error.message : String(error), { interrupt: false });
+      await this.failAttempt(job, code, error instanceof Error ? error.message : String(error), { interrupt: false });
       // The workspace is NEVER removed here. The engine performs no
       // implicit deletion: a failed attempt's branch and worktree stay on
       // disk so the retry resumes them (deleting the first attempt's
@@ -1066,6 +1145,11 @@ export class JobEngine {
 
   /** One worker sweep: admit, poll active sessions, sweep verification timeouts. */
   async tick(): Promise<void> {
+    // Arm ALL deadlines before any external I/O; a hung messages request or
+    // repeated fallback cannot prevent another job's deadline from firing.
+    const active = await this.pool.query<DbJobRow>(`SELECT * FROM executor.jobs
+      WHERE status IN ('created', 'running', 'verifying') AND started_at IS NOT NULL`);
+    for (const raw of active.rows) this.armDeadline(rowToJob(raw));
     await this.admitQueued().catch((error) => this.onError(error));
     const { rows } = await this.pool.query<DbJobRow>(`
       SELECT * FROM executor.jobs
@@ -1085,7 +1169,7 @@ export class JobEngine {
       const job = rowToJob(raw);
       if (this.verifyingJobs.has(job.id)) continue;
       if (!job.worktreePath || !existsSync(job.worktreePath)) {
-        await this.failJob(job.id, 'verification_failed',
+        await this.failAttempt(job, 'verification_failed',
           'The job workspace is gone — the verification cycle cannot resume.').catch((error) => this.onError(error));
         continue;
       }
@@ -1095,13 +1179,13 @@ export class JobEngine {
     if (this.config.jobTimeoutMs > 0) {
       const { rows: stuck } = await this.pool.query<DbJobRow>(`
         SELECT * FROM executor.jobs
-        WHERE status = 'verifying' AND started_at IS NOT NULL
+        WHERE status IN ('created', 'running', 'verifying') AND started_at IS NOT NULL
           AND started_at < NOW() - ($1 || ' milliseconds')::interval`,
         [String(this.config.jobTimeoutMs)]);
       for (const raw of stuck) {
         const job = rowToJob(raw);
         await this.interruptSession(job);
-        await this.failJob(job.id, 'execution_timeout',
+        await this.failAttempt(job, 'execution_timeout',
           `Job timed out after ${Math.round(this.config.jobTimeoutMs / 60_000)} minutes.`);
       }
     }
@@ -1109,6 +1193,21 @@ export class JobEngine {
   }
 
   async pollJob(job: JobRow): Promise<void> {
+    const owner = new Client(this.pool.options);
+    try {
+      await owner.connect();
+      const lock = await owner.query<{ locked: boolean }>('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [job.id]);
+      if (!lock.rows[0]!.locked || !await this.isCurrent(job)) return;
+      await this.pollOwned(job);
+    } finally { await owner.end(); }
+  }
+
+  private async pollOwned(job: JobRow): Promise<void> {
+    if (job.status !== 'waiting_for_user' && job.startedAt && this.config.jobTimeoutMs > 0 &&
+        this.now() - job.startedAt.getTime() >= this.config.jobTimeoutMs) {
+      await this.failAttempt(job, 'execution_timeout', 'Job timed out: exceeded its execution deadline.');
+      return;
+    }
     if (!this.client || !job.opencodeSessionId) return;
     let messages: OpenCodeMessage[];
     try {
@@ -1188,15 +1287,15 @@ export class JobEngine {
             summary: agentErrorSummary(last.error ?? 'provider policy denied the model'),
             payload: { reason: agentErrorSummary(last.error ?? 'provider policy denied the model') },
           });
-          await this.failJob(
-            job.id, 'model_policy_blocked',
+          await this.failAttempt(
+            job, 'model_policy_blocked',
             `The job's model policy blocked the agent's turn: ${agentErrorSummary(last.error ?? { message: last.finish ?? 'unknown error' })}. Only the assigned agents' own model chains may run — the fix belongs on the agent's models hub-side.`,
             { interrupt: false },
           );
           return;
         }
         await this.interruptSession(job);
-        await this.failJob(job.id, 'agent_error', agentErrorSummary(last.error ?? { message: last.finish ?? 'unknown error' }), { interrupt: false });
+        await this.failAttempt(job, 'agent_error', agentErrorSummary(last.error ?? { message: last.finish ?? 'unknown error' }), { interrupt: false });
         return;
       }
       if (asksUserForInput(last)) {
@@ -1254,14 +1353,14 @@ export class JobEngine {
               summary: `Rebase conflicts remain after ${rounds} repair rounds: ${unmerged.join(', ')}.`,
               payload: { baseRef, conflicts: unmerged, rounds },
             });
-            await this.failJob(
-              job.id, 'merge_conflict',
+            await this.failAttempt(
+              job, 'merge_conflict',
               `Pulling ${baseRef} into the worktree still conflicts after ${rounds} repair round(s): ${unmerged.join(', ')}`,
               { interrupt: false },
             );
           } else {
             const text = rebaseConflictPrompt(unmerged, baseRef);
-            await this.client!.prompt(job.opencodeSessionId!, text);
+            await this.promptCurrent(job, job.opencodeSessionId!, text);
             await appendJobEvent(this.pool, {
               jobId: job.id, eventType: EVENT.REPAIR_REQUESTED,
               summary: `Rebase conflict repair, round ${rounds + 1}.`,
@@ -1278,9 +1377,11 @@ export class JobEngine {
         if (job.spec.parkOnTurnEnd) {
           await this.mergeMetadata(job.id, { lastPromotedMessageId: last.id });
           const text = finalAssistantText(last);
+          // The hub consumes this as the full plan, not a timeline preview.
+          // Only event summaries should be capped by SUMMARY_LIMIT.
           const parked = await this.pool.query(
             `UPDATE executor.jobs SET status = 'waiting_for_user', summary = $2, version = version + 1, updated_at = NOW()
-             WHERE id = $1 AND status = 'running'`, [job.id, text.slice(0, SUMMARY_LIMIT)]);
+             WHERE id = $1 AND status = 'running'`, [job.id, text]);
           if (parked.rowCount) {
             await appendJobEvent(this.pool, {
               jobId: job.id, eventType: EVENT.EXECUTION_STATUS_CHANGED,
@@ -1334,12 +1435,12 @@ export class JobEngine {
       const found = stalled ?? progress.stalled;
       if (found) {
         const interrupted = await this.interruptSession(job);
-        await this.failJob(job.id, 'agent_stalled', stallFailureReason(found.summary, interrupted), { interrupt: false });
+        await this.failAttempt(job, 'agent_stalled', stallFailureReason(found.summary, interrupted), { interrupt: false });
         return;
       }
       if (this.config.jobTimeoutMs > 0 && job.startedAt && now - job.startedAt.getTime() >= this.config.jobTimeoutMs) {
         await this.interruptSession(job);
-        await this.failJob(job.id, 'execution_timeout',
+        await this.failAttempt(job, 'execution_timeout',
           `Job timed out after ${Math.round(this.config.jobTimeoutMs / 60_000)} minutes.`, { interrupt: false });
       }
     }
@@ -1375,7 +1476,7 @@ export class JobEngine {
     const prompt = fallbackPrompt(previousName, nextName, error);
 
     await this.client.switchModel(job.opencodeSessionId, next);
-    const sent = await this.client.prompt(job.opencodeSessionId, prompt);
+    const sent = await this.promptCurrent(job, job.opencodeSessionId, prompt);
     await this.mergeMetadata(job.id, {
       modelIndex: modelIndex + 1,
       lastFallbackMessageId: message.id,
@@ -1446,26 +1547,34 @@ export class JobEngine {
     if (!this.client) {
       throw new EngineError(503, 'OpenCode is not configured on this executor — cannot repair rebase conflicts.');
     }
-    const text = rebaseConflictPrompt(conflicts, baseRef);
+    const repair = rebaseConflictPrompt(conflicts, baseRef);
+    const text = job.opencodeSessionId ? repair : `${await this.composePrompt(job.spec, '', [])}\n\n${repair}`;
     let sessionId = job.opencodeSessionId;
     if (!sessionId) {
+      const model = await this.prepareSession(job);
+      if (!await this.isCurrent(job)) return;
       const session = await this.client.createSession({
         title: job.title || `Job ${job.hubJobId}`,
         directory: job.worktreePath,
         agent: job.spec.agent?.opencodeAgent ?? null,
-        model: parseModelRef(job.model) ?? null,
+        model,
       });
       sessionId = session.id;
       await this.pool.query(
-        `UPDATE executor.jobs SET opencode_session_id = $2, version = version + 1, updated_at = NOW()
-         WHERE id = $1`, [job.id, sessionId]);
+        `UPDATE executor.jobs SET opencode_session_id = $2, model = $4, version = version + 1, updated_at = NOW()
+         WHERE id = $1 AND status IN ('created', 'running', 'waiting_for_user') AND attempt_count = $3`,
+        [job.id, sessionId, job.attemptCount, model ? `${model.providerID}/${model.modelID}` : '']);
       await appendJobEvent(this.pool, {
         jobId: job.id, eventType: EVENT.SESSION_CREATED,
         summary: `Session ${sessionId} (rebase repair)`,
         payload: { sessionId, directory: job.worktreePath, model: job.model, reason: 'rebase_repair' },
       });
     }
-    const sent = await this.client.prompt(sessionId, text);
+    if (!await this.isCurrent(job)) {
+      await this.client.interrupt(sessionId).catch(() => {});
+      return;
+    }
+    const sent = await this.promptCurrent(job, sessionId, text);
     await appendJobEvent(this.pool, {
       jobId: job.id, eventType: EVENT.REPAIR_REQUESTED,
       summary: 'Rebase conflict resolution requested.',
@@ -1474,7 +1583,7 @@ export class JobEngine {
     await this.pool.query(`
       UPDATE executor.jobs SET status = 'running', started_at = COALESCE(started_at, NOW()),
         version = version + 1, updated_at = NOW()
-      WHERE id = $1 AND status <> 'running'`, [job.id]);
+      WHERE id = $1 AND status IN ('created', 'waiting_for_user') AND attempt_count = $2`, [job.id, job.attemptCount]);
     await appendJobEvent(this.pool, {
       jobId: job.id, eventType: EVENT.EXECUTION_STATUS_CHANGED, summary: 'Rebase conflict repair running.',
     });
@@ -1485,6 +1594,7 @@ export class JobEngine {
   async rebaseJob(hubJobId: string): Promise<{ status: 'up_to_date' | 'merged' | 'conflicts_repairing'; conflicts?: string[]; mergeSha?: string }> {
     const job = await getJobByHubId(this.pool, hubJobId);
     if (!job) throw new EngineError(404, `Unknown job ${hubJobId}.`);
+    if (job.metadata.supersededBy) throw new EngineError(409, 'This stage handed its branch to a newer stage.');
     if (!job.worktreePath || !existsSync(job.worktreePath) || TERMINAL_STATUSES.includes(job.status)) {
       throw new EngineError(409, `Job ${hubJobId} has no live worktree — re-dispatch the rebase stage with rebaseFirst instead.`);
     }
@@ -1503,9 +1613,17 @@ export class JobEngine {
   private async runVerification(job: JobRow): Promise<void> {
     if (this.verifyingJobs.has(job.id)) return;
     this.verifyingJobs.add(job.id);
+    const owner = new Client(this.pool.options);
     try {
+      await owner.connect();
+      // A poll may have just dispatched this detached cycle while still
+      // holding ownership. Wait for it, then re-read the durable state.
+      await owner.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [job.id]);
+      const current = await getJobByHubId(owner, job.hubJobId);
+      if (!current || current.status !== 'verifying' || current.attemptCount !== job.attemptCount) return;
       const attempts = job.verificationAttemptCount + 1;
-      const result = await runJobCommand(job.verificationCommand, job.worktreePath, jobEnv());
+      const result = await this.runCommand(job);
+      if (!await this.isCurrent(job)) return;
       const meta = JSON.stringify({
         verification: { attempts, exitCode: result.code, outputTail: result.output.slice(-4000) },
       });
@@ -1517,7 +1635,7 @@ export class JobEngine {
         });
         await this.pool.query(
           `UPDATE executor.jobs SET verification_attempt_count = $2, metadata = metadata || $3::jsonb, updated_at = NOW()
-           WHERE id = $1 AND status = 'verifying'`, [job.id, attempts, meta]);
+           WHERE id = $1 AND status = 'verifying' AND attempt_count = $4`, [job.id, attempts, meta, job.attemptCount]);
         let summary = '';
         try {
           const fresh = await this.client!.getMessages(job.opencodeSessionId!);
@@ -1534,14 +1652,15 @@ export class JobEngine {
       });
       const { rowCount } = await this.pool.query(
         `UPDATE executor.jobs SET verification_attempt_count = $2, metadata = metadata || $3::jsonb, updated_at = NOW()
-         WHERE id = $1 AND status = 'verifying'`, [job.id, attempts, meta]);
+         WHERE id = $1 AND status = 'verifying' AND attempt_count = $4`, [job.id, attempts, meta, job.attemptCount]);
       if (!rowCount) return;
       if (attempts < MAX_VERIFICATION_ATTEMPTS) {
+        if (!await this.isCurrent(job)) return;
         const repair = repairPrompt(job.verificationCommand, result);
         try {
-          await this.client!.prompt(job.opencodeSessionId!, repair);
+          await this.promptCurrent(job, job.opencodeSessionId!, repair);
         } catch (error) {
-          await this.failJob(job.id, 'agent_error',
+          await this.failAttempt(job, 'agent_error',
             `The repair prompt could not be sent: ${error instanceof Error ? error.message : String(error)}`, { interrupt: false });
           return;
         }
@@ -1551,29 +1670,61 @@ export class JobEngine {
         });
         await this.pool.query(
           `UPDATE executor.jobs SET status = 'running', version = version + 1, updated_at = NOW()
-           WHERE id = $1 AND status = 'verifying'`, [job.id]);
+           WHERE id = $1 AND status = 'verifying' AND attempt_count = $2`, [job.id, job.attemptCount]);
       } else {
-        await this.failJob(job.id, 'verification_failed',
+        await this.failAttempt(job, 'verification_failed',
           `Verification failed ${attempts} times. Last exit code ${result.code}. Output tail: ${result.output.slice(-2000)}`,
           { interrupt: false });
       }
+    } catch (error) {
+      if (!(error instanceof AttemptInterrupted)) throw error;
     } finally {
+      await owner.end();
       this.verifyingJobs.delete(job.id);
     }
   }
 
   /* ── Terminal transitions ──────────────────────────────────────────── */
 
+  private async failAttempt(job: JobRow, code: string, reason: string, options = { interrupt: true }): Promise<void> {
+    if (!await this.isCurrent(job)) return;
+    await this.failJob(job.id, code, reason, { ...options, expectedAttempt: job.attemptCount });
+  }
+
+  private async terminalTransition(jobId: string, status: 'succeeded' | 'failed' | 'cancelled', summary: string, code: string | null, expectedAttempt?: number): Promise<JobRow | null> {
+    const db = await this.pool.connect();
+    try {
+      await db.query('BEGIN');
+      const result = await db.query<DbJobRow>(`UPDATE executor.jobs SET status = $2,
+        summary = CASE WHEN $2 = 'succeeded' THEN $3 ELSE summary END,
+        error_code = CASE WHEN $2 = 'failed' THEN $4 ELSE error_code END,
+        failure_reason = CASE WHEN $2 = 'failed' THEN $3 ELSE failure_reason END,
+        finished_at = NOW(), version = version + 1, updated_at = NOW()
+        WHERE id = $1 AND status NOT IN ('failed', 'succeeded', 'cancelled')
+          AND ($5::int IS NULL OR attempt_count = $5) RETURNING *`,
+      [jobId, status, summary, code, expectedAttempt ?? null]);
+      const job = result.rows[0] ? rowToJob(result.rows[0]) : null;
+      if (job) await appendJobEvent(db, {
+        jobId, eventType: status === 'succeeded' ? EVENT.EXECUTION_SUCCEEDED : status === 'failed' ? EVENT.EXECUTION_FAILED : EVENT.EXECUTION_CANCELLED,
+        summary: summary || `Job ${status}.`,
+        payload: status === 'failed' ? { code, reason: summary, attempts: job.attemptCount, maxAttempts: job.maxAttempts,
+          retryExhausted: RETRYABLE_ERROR_CODES.has(code!) && job.attemptCount >= job.maxAttempts } : { summary },
+      });
+      await db.query('COMMIT');
+      if (job) {
+        const deadline = this.deadlines.get(jobId);
+        if (deadline) clearTimeout(deadline.timer);
+        this.deadlines.delete(jobId);
+      }
+      return job;
+    } catch (error) {
+      await db.query('ROLLBACK');
+      throw error;
+    } finally { db.release(); }
+  }
+
   private async succeedJob(job: JobRow, summary: string): Promise<void> {
-    const { rowCount } = await this.pool.query(`
-      UPDATE executor.jobs SET status = 'succeeded', summary = $2, finished_at = NOW(),
-        version = version + 1, updated_at = NOW()
-      WHERE id = $1 AND status IN ('running', 'verifying')`, [job.id, summary]);
-    if (!rowCount) return;
-    await appendJobEvent(this.pool, {
-      jobId: job.id, eventType: EVENT.EXECUTION_SUCCEEDED,
-      summary: summary.slice(0, SUMMARY_LIMIT) || 'Job succeeded.', payload: { summary },
-    });
+    await this.terminalTransition(job.id, 'succeeded', summary, null, job.attemptCount);
   }
 
   /**
@@ -1586,12 +1737,18 @@ export class JobEngine {
    * attempt's workspace is checkpointed first (best effort), so the next
    * attempt's preamble can truthfully point at the branch.
    */
-  async failJob(jobId: string, code: string, reason: string, options: { interrupt: boolean } = { interrupt: true }): Promise<void> {
+  async failJob(jobId: string, code: string, reason: string, options: { interrupt: boolean; expectedAttempt?: number } = { interrupt: true }): Promise<void> {
+    const initial = (await this.pool.query<DbJobRow>('SELECT * FROM executor.jobs WHERE id = $1', [jobId])).rows[0];
+    if (!initial || TERMINAL_STATUSES.includes(initial.status as JobStatus) ||
+        (options.expectedAttempt !== undefined && initial.attempt_count !== options.expectedAttempt)) return;
+    options = { ...options, expectedAttempt: initial.attempt_count };
+    this.commands.get(jobId)?.abort();
     if (RETRYABLE_ERROR_CODES.has(code)) {
       const current = (await this.pool.query<DbJobRow>(
         `SELECT * FROM executor.jobs WHERE id = $1`, [jobId])).rows[0];
       if (current && !TERMINAL_STATUSES.includes(current.status as JobStatus)) {
         const job = rowToJob(current);
+        if (job.attemptCount !== options.expectedAttempt) return;
         if (job.attemptCount < job.maxAttempts) {
           // Safety net: sweep the failed attempt's leftovers onto the branch,
           // or the next attempt's "continue from the committed work" preamble
@@ -1610,6 +1767,7 @@ export class JobEngine {
           const { rows } = await this.pool.query<DbJobRow>(`
             UPDATE executor.jobs SET
               status = 'queued',
+              started_at = NULL,
               attempt_count = $2,
               retry_backoff_until = NOW() + ($3 || ' minutes')::interval,
               opencode_session_id = NULL,
@@ -1618,11 +1776,12 @@ export class JobEngine {
               metadata = metadata || $6::jsonb,
               version = version + 1,
               updated_at = NOW()
-            WHERE id = $1 AND NOT status = ANY($7::text[]) AND attempt_count < max_attempts
+            WHERE id = $1 AND NOT status = ANY($7::text[]) AND attempt_count < max_attempts AND attempt_count = $8
             RETURNING *`, [
             jobId, nextAttempt, String(delayMinutes), code, reason.slice(0, 4000),
             JSON.stringify({ retryState: { code, reason: reason.slice(0, 500), committed } }),
             TERMINAL_STATUSES,
+            job.attemptCount,
           ]);
           if (rows[0]) {
             // The update cleared the session id; release the old turn so
@@ -1639,31 +1798,14 @@ export class JobEngine {
             });
             return;
           }
-          // The UPDATE lost a race with a terminal transition — fall
-          // through to the terminal write, which no-ops the same way.
+          // A racing retry/terminal transition won; never fail its successor.
+          return;
         }
       }
     }
-    const { rows } = await this.pool.query<DbJobRow>(`
-      UPDATE executor.jobs SET status = 'failed', error_code = $2, failure_reason = $3, finished_at = NOW(),
-        version = version + 1, updated_at = NOW()
-      WHERE id = $1 AND NOT status = ANY($4::text[])
-      RETURNING *`, [jobId, code, reason.slice(0, 4000), TERMINAL_STATUSES]);
-    if (!rows[0]) return;
-    const failed = rowToJob(rows[0]);
+    const failed = await this.terminalTransition(jobId, 'failed', reason.slice(0, 4000), code, options.expectedAttempt);
+    if (!failed) return;
     if (options.interrupt) await this.interruptSession(failed);
-    // `retryExhausted` tells the hub (and any reader) that the in-job
-    // budget ran out on a retryable class — the failure is final, not a
-    // first stumble.
-    const retryExhausted = RETRYABLE_ERROR_CODES.has(code) && failed.attemptCount >= failed.maxAttempts;
-    await appendJobEvent(this.pool, {
-      jobId, eventType: EVENT.EXECUTION_FAILED,
-      summary: reason.slice(0, SUMMARY_LIMIT) || 'Job failed.',
-      payload: {
-        code, reason: reason.slice(0, 4000),
-        attempts: failed.attemptCount, maxAttempts: failed.maxAttempts, retryExhausted,
-      },
-    });
   }
 
   /** Interrupt the job's OpenCode session, best effort. Returns whether the
@@ -1729,6 +1871,7 @@ export class JobEngine {
   async sendMessage(hubJobId: string, text: string): Promise<JobRow> {
     const job = await getJobByHubId(this.pool, hubJobId);
     if (!job) throw new EngineError(404, `Unknown job ${hubJobId}.`);
+    if (job.metadata.supersededBy) throw new EngineError(409, 'This stage handed its branch to a newer stage.');
     if (TERMINAL_STATUSES.includes(job.status)) {
       throw new EngineError(409, `Job is ${job.status} — it cannot take new messages.`);
     }
@@ -1736,7 +1879,7 @@ export class JobEngine {
       throw new EngineError(409, 'This job has no active OpenCode session.');
     }
     try {
-      await this.client.prompt(job.opencodeSessionId, text);
+      await this.promptCurrent(job, job.opencodeSessionId, text);
     } catch (error) {
       throw new EngineError(502, error instanceof Error ? error.message : String(error));
     }
@@ -1762,15 +1905,9 @@ export class JobEngine {
     const job = await getJobByHubId(this.pool, hubJobId);
     if (!job) return null;
     if (TERMINAL_STATUSES.includes(job.status)) return job;
+    await this.terminalTransition(job.id, 'cancelled', 'Job cancelled by the hub.', null);
+    this.commands.get(job.id)?.abort();
     await this.interruptSession(job);
-    const { rowCount } = await this.pool.query(`
-      UPDATE executor.jobs SET status = 'cancelled', finished_at = NOW(), version = version + 1, updated_at = NOW()
-      WHERE id = $1 AND NOT status = ANY($2::text[])`, [job.id, TERMINAL_STATUSES]);
-    if (rowCount) {
-      await appendJobEvent(this.pool, {
-        jobId: job.id, eventType: EVENT.EXECUTION_CANCELLED, summary: 'Job cancelled by the hub.',
-      });
-    }
     return (await getJobByHubId(this.pool, hubJobId))!;
   }
 
@@ -1780,6 +1917,7 @@ export class JobEngine {
   async verifyNow(hubJobId: string): Promise<JobRow> {
     const job = await getJobByHubId(this.pool, hubJobId);
     if (!job) throw new EngineError(404, `Unknown job ${hubJobId}.`);
+    if (job.metadata.supersededBy) throw new EngineError(409, 'This stage handed its branch to a newer stage.');
     if (['created', 'queued', 'running', 'waiting_for_user'].includes(job.status)) {
       throw new EngineError(409, `Cannot verify a ${job.status} job.`);
     }
@@ -1790,10 +1928,17 @@ export class JobEngine {
     if (this.verifyingJobs.has(job.id)) {
       throw new EngineError(409, 'A verification is already running for this job.');
     }
+    if (job.status === 'verifying') {
+      // Recovery adopts the existing generation without resetting its clock
+      // or counters; database ownership excludes a live remote worker.
+      this.track(this.runVerification(job));
+      return job;
+    }
     const { rowCount } = await this.pool.query(
       `UPDATE executor.jobs SET status = 'verifying', verification_attempt_count = 0,
+         attempt_count = attempt_count + 1, started_at = NOW(), finished_at = NULL,
          version = version + 1, updated_at = NOW()
-       WHERE id = $1 AND status IN ('failed', 'succeeded', 'verifying')`, [job.id]);
+       WHERE id = $1 AND status IN ('failed', 'succeeded') AND attempt_count = $2`, [job.id, job.attemptCount]);
     if (!rowCount) {
       throw new EngineError(409, `Job moved while verifying — it is no longer ${job.status}.`);
     }
@@ -1810,6 +1955,7 @@ export class JobEngine {
   async mergeJob(hubJobId: string): Promise<Record<string, unknown>> {
     const job = await getJobByHubId(this.pool, hubJobId);
     if (!job) throw new EngineError(404, `Unknown job ${hubJobId}.`);
+    if (job.metadata.supersededBy) throw new EngineError(409, 'This stage handed its branch to a newer stage.');
     if (job.status !== 'succeeded' || !job.branch) {
       throw new EngineError(409, 'Only a succeeded job with a branch can merge.');
     }
@@ -1908,7 +2054,7 @@ export class JobEngine {
    */
   private async removeWorkspace(repoRoot: string, job: JobRow): Promise<void> {
     if (!job.worktreePath || !job.branch) return;
-    await removeJobWorkspace(this.git, { repoRoot, path: job.worktreePath, branch: job.branch })
+    await removeJobWorkspace(this.git, { repoRoot, path: job.worktreePath, branch: job.branch, deleteBranch: !job.metadata.supersededBy })
       .catch((error) => this.onError(error));
   }
 

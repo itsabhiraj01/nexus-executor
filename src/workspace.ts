@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -641,12 +641,25 @@ async function excludePatterns(runner: GitRunner, worktreePath: string, patterns
  * registration that runs afterwards merges its policies on top of it.
  * Idempotent — retries re-materialize on the re-attached worktree.
  */
+/** Generated launch configuration is execution state, never branch content.
+ * Ignore new files; protect already-tracked files in this worktree's index. */
+export async function protectJobConfig(runner: GitRunner, worktreePath: string, files: readonly string[]): Promise<void> {
+  await excludePatterns(runner, worktreePath, files.map((file) => `/${file}`));
+  for (const file of files) {
+    const tracked = await runner(['ls-files', '--error-unmatch', '--', file], { cwd: worktreePath });
+    if (tracked.code !== 0) continue;
+    const protectedFile = await runner(['update-index', '--skip-worktree', '--', file], { cwd: worktreePath });
+    if (protectedFile.code !== 0) throw new WorkspaceError(`Cannot protect generated configuration ${file}: ${protectedFile.stderr}`);
+  }
+}
+
 export async function materializeJobAgent(
   runner: GitRunner,
   worktreePath: string,
   agent: JobAgentMaterialization,
 ): Promise<{ opencodeAgent: string; mcp: 'none' | 'written' }> {
   await excludePatterns(runner, worktreePath, agent.mcp ? ['/.opencode/agents/', '/opencode.json'] : ['/.opencode/agents/']);
+  await protectJobConfig(runner, worktreePath, [`.opencode/agents/${agent.opencodeAgent}.md`, ...(agent.mcp ? ['opencode.json'] : [])]);
   const dir = join(worktreePath, '.opencode', 'agents');
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, `${agent.opencodeAgent}.md`), agent.markdown, 'utf8');
@@ -698,20 +711,43 @@ export interface CommandResult {
 
 const OUTPUT_TAIL_LIMIT = 8_000;
 
-/** Run one verification command (`sh -c …`) in a directory with the
- *  allowlist env. 512 KB output ceiling; the TAIL is kept for reports. */
-export async function runJobCommand(command: string, cwd: string, env: NodeJS.ProcessEnv): Promise<CommandResult> {
-  try {
-    const { stdout, stderr } = await execFileAsync('sh', ['-c', command], {
-      cwd,
-      env,
-      timeout: 3_600_000,
-      maxBuffer: 512 * 1024,
+// The IPC pipe is an owner-liveness fence: even SIGKILL of the executor
+// closes it. The supervisor kills its own process group on disconnect,
+// preventing an orphan verifier from writing into a recovered attempt.
+const COMMAND_SUPERVISOR = `
+const { spawn } = require('node:child_process');
+process.on('disconnect', () => { try { process.kill(-process.pid, 'SIGKILL'); } catch {} });
+const child = spawn('sh', ['-c', process.argv[1]], { stdio: ['ignore', 'inherit', 'inherit'] });
+child.on('error', (error) => { console.error(error.message); process.exit(1); });
+child.on('exit', (code) => process.exit(code ?? 1));
+`;
+
+/** Run one verification command (`sh -c …`) with the allowlist env,
+ * an owner-supervised process group and a bounded output tail. */
+export async function runJobCommand(command: string, cwd: string, env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<CommandResult> {
+  if (signal?.aborted) return { code: 1, output: 'Command cancelled.' };
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ['-e', COMMAND_SUPERVISOR, '--', command], {
+      cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
-    return { code: 0, output: `${stdout}\n${stderr}`.trim().slice(-OUTPUT_TAIL_LIMIT) };
-  } catch (error) {
-    const err = error as { code?: unknown; stdout?: string; stderr?: string; message?: string; killed?: boolean };
-    const output = `${err.stdout ?? ''}\n${err.stderr ?? ''}\n${err.message ?? ''}`.trim().slice(-OUTPUT_TAIL_LIMIT);
-    return { code: typeof err.code === 'number' ? err.code : 1, output: err.killed ? `${output}\n(command timed out)`.trim() : output };
-  }
+    let output = '';
+    const capture = (chunk: Buffer) => { output = (output + chunk.toString()).slice(-OUTPUT_TAIL_LIMIT); };
+    child.stdout!.on('data', capture);
+    child.stderr!.on('data', capture);
+    const stop = () => {
+      // Kill the entire group, including grandchildren holding output pipes.
+      if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already exited */ } }
+    };
+    const timeout = setTimeout(stop, 3_600_000);
+    signal?.addEventListener('abort', stop, { once: true });
+    const finish = (code: number, error = '') => {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', stop);
+      resolve({ code, output: (output + error).trim().slice(-OUTPUT_TAIL_LIMIT) });
+    };
+    child.on('error', (error) => finish(1, error.message));
+    // A shell may leave background descendants holding the output pipes.
+    child.on('exit', stop);
+    child.on('close', (code) => finish(code ?? 1));
+  });
 }

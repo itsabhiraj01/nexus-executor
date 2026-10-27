@@ -1,4 +1,4 @@
-import { randomBytes, generateKeyPairSync, sign as ed25519Sign } from 'node:crypto';
+import { createHash, randomBytes, generateKeyPairSync, sign as ed25519Sign } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -35,6 +35,52 @@ const PROOF_AUDIENCE = 'NEXUS-GATEWAY-CONNECT v1';
 const MAX_MESSAGE_BYTES = 48 * 1024 * 1024;
 const MAX_IN_FLIGHT = 16;
 const STABLE_SESSION_MS = 30_000;
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(',')}}`;
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** Process-scoped replay window, deliberately outside the socket lifecycle.
+ * Pending operations are never evicted. Completed replies expire after 15m
+ * or under the 256-entry/32MiB cap; restart durability is not claimed. */
+export class GatewayRequestCache {
+  private readonly entries = new Map<string, { fingerprint: string; result: Promise<unknown>; completedAt: number | null; bytes: number }>();
+  private prune(): void {
+    let bytes = [...this.entries.values()].reduce((sum, entry) => sum + entry.bytes, 0);
+    for (const [id, entry] of this.entries) {
+      if (entry.completedAt === null) continue;
+      if (Date.now() - entry.completedAt < 900_000 && this.entries.size < 256 && bytes < 32 * 1024 * 1024) continue;
+      this.entries.delete(id);
+      bytes -= entry.bytes;
+    }
+  }
+  async run(id: string, operation: string, payload: unknown, execute: () => Promise<unknown>): Promise<unknown> {
+    this.prune();
+    const fingerprint = createHash('sha256').update(canonical([operation, payload])).digest('hex');
+    const existing = this.entries.get(id);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) return { ok: false, status: 409, error: 'Request ID was already used with a different operation or payload.' };
+      return existing.result;
+    }
+    if (this.entries.size >= 256) return { ok: false, status: 503, error: 'Executor replay window is full of pending requests.' };
+    const entry = { fingerprint, result: Promise.resolve<unknown>(undefined), completedAt: null as number | null, bytes: 0 };
+    entry.result = Promise.resolve().then(execute).catch(() => ({ ok: false, error: 'Executor failed to produce the response.', status: 500 })).then((result) => {
+      const serialized = JSON.stringify(result);
+      entry.bytes = Buffer.byteLength(serialized);
+      entry.completedAt = Date.now();
+      // Do not retain enormous responses; cache a stable failure instead.
+      if (entry.bytes > 32 * 1024 * 1024) {
+        entry.bytes = 128;
+        return { ok: false, status: 500, error: 'Executor response exceeds the replay limit.' };
+      }
+      return result;
+    });
+    this.entries.set(id, entry);
+    return entry.result;
+  }
+}
 
 export function readGatewayIdentity(config: Pick<ExecutorConfig, 'gatewayIdentityPath'>): GatewayIdentity | null {
   const path = config.gatewayIdentityPath;
@@ -150,6 +196,7 @@ export async function runGatewayLoop(deps: RouteDeps, config: ExecutorConfig, op
   const wsBase = config.gatewayUrl!.replace(/^http/, 'ws');
   let attempt = 0;
   let inFlight = 0;
+  const replay = new GatewayRequestCache();
 
   while (!stopped()) {
     const ws = new Ws(`${wsBase}/v1/connect`, {
@@ -204,7 +251,8 @@ export async function runGatewayLoop(deps: RouteDeps, config: ExecutorConfig, op
       if (typeof envelope.operation !== 'string') return;
       id = envelope.id;
       operation = envelope.operation;
-      const result = await handleGatewayOperation(depsArg, operation, envelope.payload);
+      const result = await replay.run(id, operation, envelope.payload,
+        () => handleGatewayOperation(depsArg, envelope.operation as string, envelope.payload));
       const response = JSON.stringify({
         version: GATEWAY_PROTOCOL_VERSION, type: 'response', id, operation, payload: result,
       });

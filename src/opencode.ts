@@ -158,6 +158,7 @@ export function createOpenCodeClient(config: OpenCodeClientConfig) {
     try {
       res = await doFetch(`${base}${path}`, {
         ...init,
+        signal: AbortSignal.timeout(30_000),
         headers: {
           'content-type': 'application/json',
           ...(config.token ? authHeader(config.token) : {}),
@@ -203,6 +204,7 @@ export function createOpenCodeClient(config: OpenCodeClientConfig) {
     async switchModel(sessionId: string, model: ModelRef): Promise<void> {
       const res = await doFetch(`${base}/api/session/${encodeURIComponent(sessionId)}/model`, {
         method: 'POST',
+        signal: AbortSignal.timeout(30_000),
         headers: {
           'content-type': 'application/json',
           ...(config.token ? authHeader(config.token) : {}),

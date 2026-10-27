@@ -7,7 +7,7 @@ import type { ExecutorConfig } from './config.js';
 import { createPool, runModuleMigrations, defaultMigrationsDir } from './db.js';
 import { EVENT, JobEngine, getJobByHubId, type JobSpecInput } from './engine.js';
 import type { OpenCodeMessage } from './opencode.js';
-import { makeRepo, makeStubClient, testConfig, wipeJobs, eventTypes } from './testkit.js';
+import { LaunchedJobEngine, makeRepo, makeStubClient, testConfig, wipeJobs, eventTypes } from './testkit.js';
 import { execGit } from './workspace.js';
 import { startWorker } from './worker.js';
 
@@ -44,7 +44,7 @@ function jobSpec(jobId: string, overrides: Partial<JobSpecInput> = {}): JobSpecI
 function stubEngine(overrides: Partial<ExecutorConfig> = {}) {
   const { client, state } = makeStubClient();
   const errors: unknown[] = [];
-  const engine = new JobEngine({
+  const engine = new LaunchedJobEngine({
     pool,
     config: { ...config, ...overrides },
     client,

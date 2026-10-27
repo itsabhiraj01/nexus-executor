@@ -5,6 +5,7 @@ import { unlinkSync, existsSync, readdirSync } from 'node:fs';
 import { enrollGateway, runGatewayLoop } from './gateway.js';
 import type { ExecutorConfig } from './config.js';
 import type { RouteDeps } from './ops.js';
+import * as operations from './ops.js';
 
 vi.mock('node:timers/promises', () => ({ setTimeout: vi.fn(async () => {}) }));
 
@@ -80,4 +81,43 @@ it('sends EXECUTOR_NAME in the enrollment body', async () => {
   await enrollGateway(config, { fetchImpl: fakeFetch });
   expect(captured.name).toBe('office-pc');
   if (existsSync(config.gatewayIdentityPath)) unlinkSync(config.gatewayIdentityPath);
+});
+
+it('coalesces a mutation across socket loss and replays its completed reply on another connection', async () => {
+  const config = nextConfig();
+  await enrollGateway(config, { fetchImpl: (async () => new Response(JSON.stringify({ credential: 'test', executorId: 'id' }))) as typeof fetch });
+  let complete!: (value: { ok: true }) => void;
+  const mutate = vi.spyOn(operations, 'handleGatewayOperation').mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
+  let connections = 0;
+  let stopped = false;
+  const replies: unknown[] = [];
+  const request = Buffer.from(JSON.stringify({ version: operations.GATEWAY_PROTOCOL_VERSION, type: 'request', id: 'stable-mutation', operation: 'job.message', payload: { jobId: 'job', text: 'continue' } }));
+  class Socket extends EventEmitter {
+    readonly OPEN = 1;
+    readyState = 1;
+    constructor() {
+      super();
+      const connection = ++connections;
+      queueMicrotask(() => {
+        this.emit('open');
+        this.emit('message', request);
+        if (connection === 1) {
+          this.readyState = 3;
+          this.emit('close', 1006, Buffer.from('lost'));
+        } else if (connection === 2) queueMicrotask(() => complete({ ok: true }));
+      });
+    }
+    send(response: string) {
+      if (this.readyState !== this.OPEN) throw new Error('closed socket');
+      replies.push(JSON.parse(response));
+      if (connections === 3) stopped = true;
+      this.readyState = 3;
+      this.emit('close', 1000, Buffer.from('reconnect'));
+    }
+  }
+  await runGatewayLoop({} as RouteDeps, config, { logger: { info: vi.fn(), warn: vi.fn() }, webSocketImpl: Socket as unknown as typeof WebSocket, isStopped: () => stopped });
+  expect(connections).toBe(3);
+  expect(mutate).toHaveBeenCalledTimes(1);
+  expect(replies).toHaveLength(2);
+  expect(replies[0]).toEqual(replies[1]);
 });

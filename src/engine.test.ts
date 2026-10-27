@@ -1,8 +1,8 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import type { Pool } from 'pg';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { Client, type Pool } from 'pg';
 import type { ExecutorConfig } from './config.js';
 import { createPool, runModuleMigrations, defaultMigrationsDir } from './db.js';
 import {
@@ -22,7 +22,7 @@ import {
   type OpenCodeClient,
   type OpenCodeMessage,
 } from './opencode.js';
-import { countEvents, eventTypes, makeRepo, makeStubClient, testConfig, TEST_AUTHOR } from './testkit.js';
+import { LaunchedJobEngine, countEvents, eventTypes, makeRepo, makeStubClient, testConfig, TEST_AUTHOR } from './testkit.js';
 import { commitJobChanges, execGit, listUnmergedPaths } from './workspace.js';
 
 let pool: Pool;
@@ -59,7 +59,7 @@ interface Ctx {
 
 function makeEngine(overrides: Partial<ExecutorConfig> = {}): Ctx {
   const stubbed = makeStubClient();
-  const engine = new JobEngine({
+  const engine = new LaunchedJobEngine({
     pool,
     config: { ...config, ...overrides },
     client: stubbed.client,
@@ -89,13 +89,107 @@ async function runningJob(ctx: Ctx, input: JobSpecInput): Promise<JobRow> {
   const { job, created } = await ctx.engine.createJob(input);
   expect(created).toBe(true);
   const launched = (await getJobByHubId(pool, input.jobId))!;
-  expect(launched.status).toBe('running');
+  expect(launched.status, launched.failureReason ?? undefined).toBe('running');
   expect(launched.opencodeSessionId).toBeTruthy();
   void job;
   return launched;
 }
 
 describe('launch', () => {
+  it('does not resurrect cancellation racing between admission eligibility and its write', async () => {
+    const ctx = makeEngine();
+    const engine = new JobEngine({ pool, config, client: ctx.client });
+    const other = new JobEngine({ pool, config, client: ctx.client });
+    const accepted = await engine.createJob(spec({ jobId: 'cancel-admission-race' }));
+    const query = Client.prototype.query;
+    let cancel: Promise<unknown> | undefined;
+    let finished = false;
+    const spy = vi.spyOn(Client.prototype, 'query').mockImplementation(function (this: Client, ...args: any[]) {
+      const sql = args[0];
+      if (typeof sql === 'string' && sql.includes('SELECT count(*)::int AS n FROM executor.jobs') && sql.includes('id <> $1')) {
+        return (async () => {
+          cancel = other.cancel(accepted.job.hubJobId).finally(() => { finished = true; });
+          // Either old/unlocked admission lets cancel commit, or the fixed
+          // row lock makes cancel wait. Both schedules resume deterministically.
+          await expect.poll(async () => {
+            if (finished) return true;
+            const locks = await pool.query(`SELECT 1 FROM pg_stat_activity
+              WHERE datname = current_database() AND wait_event = 'transactionid'
+                AND query LIKE '%UPDATE executor.jobs SET status = $2%'`);
+            return !!locks.rowCount;
+          }).toBe(true);
+          return query.apply(this, args as any);
+        })() as any;
+      }
+      return query.apply(this, args as any);
+    });
+    try {
+      await engine.launchJob(accepted.job);
+      await cancel;
+      expect((await getJobByHubId(pool, accepted.job.hubJobId))!.status).toBe('cancelled');
+    } finally { spy.mockRestore(); }
+  });
+  it('commits terminal status and its final event atomically', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({ jobId: 'terminal-atomic' }));
+    await pool.query(`CREATE FUNCTION executor.reject_terminal_test() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.event_type = 'EXECUTION_CANCELLED' THEN RAISE EXCEPTION 'terminal event rejected'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER reject_terminal_test BEFORE INSERT ON executor.job_events FOR EACH ROW EXECUTE FUNCTION executor.reject_terminal_test()`);
+    try {
+      await expect(ctx.engine.cancel(job.hubJobId)).rejects.toThrow('terminal event rejected');
+      expect((await getJobByHubId(pool, job.hubJobId))!.status).toBe('running');
+    } finally {
+      await pool.query('DROP TRIGGER reject_terminal_test ON executor.job_events; DROP FUNCTION executor.reject_terminal_test()');
+      await ctx.engine.cancel(job.hubJobId);
+    }
+  });
+  it('accepts durably before launching and excludes competing launchers', async () => {
+    const ctx = makeEngine();
+    ctx.engine = new JobEngine({ pool, config, client: ctx.client });
+    const accepted = await ctx.engine.createJob(spec({ jobId: 'async-exclusive' }));
+    expect(accepted.job.status).toBe('created');
+    expect(ctx.stub.sessions).toHaveLength(0);
+    const competitor = new JobEngine({ pool, config, client: ctx.client });
+    await Promise.all([ctx.engine.launchJob(accepted.job), competitor.launchJob(accepted.job)]);
+    expect(ctx.stub.sessions).toHaveLength(1);
+    await ctx.engine.cancel('async-exclusive');
+  });
+
+  it('bounds forgotten sessions before the messages 404 early return', async () => {
+    const ctx = makeEngine({ jobTimeoutMs: 60_000 });
+    const job = await runningJob(ctx, spec({ jobId: 'forgotten-deadline' }));
+    await pool.query("UPDATE executor.jobs SET started_at = NOW() - interval '1 hour' WHERE id = $1", [job.id]);
+    ctx.client.getMessages = async () => { throw new OpenCodeError('forgotten', 404); };
+    await ctx.engine.pollJob((await getJobByHubId(pool, job.hubJobId))!);
+    expect((await getJobByHubId(pool, job.hubJobId))!.errorCode).toBe('execution_timeout');
+  });
+
+  it('dispatches while verifyFirst runs, and cancellation kills its process group without a repair', async () => {
+    const ctx = makeEngine();
+    const engine = new JobEngine({ pool, config, client: ctx.client });
+    const accepted = await engine.createJob(spec({ jobId: 'verify-first-cancel', verifyFirst: true,
+      verificationCommand: "sh -c 'echo $$ > command.pid; sleep 60'" }));
+    expect(accepted.job.status).toBe('created');
+    await engine.admitQueued();
+    await expect.poll(async () => {
+      const row = (await getJobByHubId(pool, accepted.job.hubJobId))!;
+      return row.worktreePath && existsSync(join(row.worktreePath, 'command.pid'));
+    }).toBe(true);
+    const second = await engine.createJob(spec({ jobId: 'while-verifying' }));
+    await engine.admitQueued();
+    await expect.poll(async () => (await getJobByHubId(pool, second.job.hubJobId))!.status).toBe('running');
+    const row = (await getJobByHubId(pool, accepted.job.hubJobId))!;
+    const pid = Number(readFileSync(join(row.worktreePath, 'command.pid'), 'utf8'));
+    // A different engine/process can cancel through the durable row.
+    await ctx.engine.cancel(row.hubJobId);
+    await engine.drain();
+    expect((await getJobByHubId(pool, row.hubJobId))!.status).toBe('cancelled');
+    expect(() => process.kill(pid, 0)).toThrow();
+    expect((await eventTypes(pool, row.id))).not.toContain(EVENT.REPAIR_REQUESTED);
+    expect(ctx.stub.sessions).toHaveLength(1);
+    await engine.cancel(second.job.hubJobId);
+  });
+
   it('cuts a worktree, creates the session in it, and sends the composed prompt', async () => {
     const ctx = makeEngine();
     const job = await runningJob(ctx, spec({ jobId: 'job-launch-1', title: 'Launch me', models: ['litellm/open-large'] }));
@@ -566,7 +660,7 @@ describe('in-job retries', () => {
         ? Promise.reject(new OpenCodeError('OpenCode /api/session failed: 401 {"message":"Authentication required"}', 401))
         : base.client.createSession(input),
     };
-    const engine = new JobEngine({
+    const engine = new LaunchedJobEngine({
       pool,
       config: { ...config, retryMaxAttempts: 2, retryDelayMinutes: 0 },
       client: flaky,
@@ -719,6 +813,25 @@ describe('native personas (model-policy era spec fields)', () => {
 });
 
 describe('pipeline stages — baseBranch (spec §4)', () => {
+  it('keeps injected policy and MCP out of tracked project config and later stages', async () => {
+    const repo = await makeRepo(join(root, 'tracked-config-repo'));
+    const original = '{"default_agent":"build"}\n';
+    writeFileSync(join(repo, 'opencode.json'), original);
+    await execGit(['add', 'opencode.json'], { cwd: repo });
+    await execGit(['commit', '-m', 'project config'], { cwd: repo, env: TEST_AUTHOR });
+    await execGit(['branch', 'staged'], { cwd: repo });
+    const ctx = makeEngine();
+    const first = await runningJob(ctx, spec({ jobId: 'tracked-stage-one', project: { localPath: repo }, baseBranch: 'staged',
+      models: ['litellm/open-large'], modelPolicy: { agents: [], providers: ['litellm'], models: ['litellm/open-large'] },
+      agent: { name: 'Stage', opencodeAgent: 'stage-persona', markdown: 'Stage persona', mcp: { mcp: { servers: { stageOnly: { url: 'https://example.invalid' } } } } },
+    }));
+    await commitJobChanges(execGit, { path: first.worktreePath, message: 'stage checkpoint' });
+    expect((await execGit(['show', 'HEAD:opencode.json'], { cwd: first.worktreePath })).stdout).toBe(original);
+    await ctx.engine.cancel(first.hubJobId);
+    const second = await runningJob(ctx, spec({ jobId: 'tracked-stage-two', project: { localPath: repo }, baseBranch: 'staged' }));
+    expect(readFileSync(join(second.worktreePath, 'opencode.json'), 'utf8')).toBe(original);
+    await ctx.engine.cancel(second.hubJobId);
+  });
   it('attaches onto a pre-existing baseBranch instead of cutting a job-* branch', async () => {
     const ctx = makeEngine();
     await execGit(['branch', 'builder/stage-plan'], { cwd: repoRoot });
@@ -734,12 +847,19 @@ describe('pipeline stages — baseBranch (spec §4)', () => {
     await ctx.engine.cancel('job-basebranch');
   });
 
-  it('reuses the same worktree when a second stage job names the same baseBranch', async () => {
+  it('uses a fresh location and clean config for each stage on the same branch', async () => {
     const ctx = makeEngine();
     await execGit(['branch', 'builder/stage-code'], { cwd: repoRoot });
     const first = await runningJob(ctx, spec({ jobId: 'job-stage-a', baseBranch: 'builder/stage-code' }));
+    await ctx.engine.cancel('job-stage-a');
+    await execGit(['config', 'core.excludesFile', '/dev/null'], { cwd: first.worktreePath });
+    // Generated persona files are git-excluded, not stage source code.
+    const gitDir = await execGit(['rev-parse', '--git-common-dir'], { cwd: first.worktreePath });
+    writeFileSync(join(gitDir.stdout.trim(), 'info', 'exclude'), '/opencode.json\n');
+    writeFileSync(join(first.worktreePath, 'opencode.json'), '{"mcp":{"servers":{"stale":{}}}}');
     const second = await runningJob(ctx, spec({ jobId: 'job-stage-b', baseBranch: 'builder/stage-code' }));
-    expect(second.worktreePath).toBe(first.worktreePath);
+    expect(second.worktreePath).not.toBe(first.worktreePath);
+    expect(existsSync(join(second.worktreePath, 'opencode.json'))).toBe(false);
     expect(second.branch).toBe('builder/stage-code');
     await ctx.engine.cancel('job-stage-a');
     await ctx.engine.cancel('job-stage-b');
@@ -758,24 +878,25 @@ describe('pipeline stages — baseBranch (spec §4)', () => {
 });
 
 describe('pipeline stages — parkOnTurnEnd (spec §4)', () => {
-  it('parks waiting_for_user with the final summary instead of succeeding (stage_gate)', async () => {
+  it('parks waiting_for_user with the complete plan, not a 200-character preview (stage_gate)', async () => {
     const ctx = makeEngine();
     const job = await runningJob(ctx, spec({ jobId: 'job-park', parkOnTurnEnd: true }));
     const now = Date.now();
-    ctx.stub.messages[job.opencodeSessionId!] = [done('m-park', 'The plan is ready.', now)];
+    const plan = `## Findings\n\n${'Detailed implementation steps.\n'.repeat(200)}\n## Verification\nRun the regression tests.`;
+    ctx.stub.messages[job.opencodeSessionId!] = [done('m-park', plan, now)];
     await ctx.engine.pollJob((await getJobByHubId(pool, 'job-park'))!);
     await ctx.engine.drain();
 
     const row = (await getJobByHubId(pool, 'job-park'))!;
     expect(row.status).toBe('waiting_for_user');
-    expect(row.summary).toBe('The plan is ready.');
+    expect(row.summary).toBe(plan);
     const types = await eventTypes(pool, row.id);
     expect(types).not.toContain(EVENT.EXECUTION_SUCCEEDED);
     const { rows: gate } = await pool.query<{ payload: { reason?: string; summary?: string } }>(
       `SELECT payload FROM executor.job_events WHERE job_id = $1 AND event_type = $2 ORDER BY sequence_number DESC LIMIT 1`,
       [row.id, EVENT.EXECUTION_STATUS_CHANGED]);
     expect(gate[0]!.payload.reason).toBe('stage_gate');
-    expect(gate[0]!.payload.summary).toBe('The plan is ready.');
+    expect(gate[0]!.payload.summary).toBe(plan);
     await ctx.engine.cancel('job-park');
   });
 
@@ -825,6 +946,7 @@ describe('pipeline stages — verifyFirst (spec §4)', () => {
     const ctx = makeEngine();
     await ctx.engine.createJob(spec({
       jobId: 'job-vf-fail', verifyFirst: true, verificationCommand: 'false',
+      prompt: 'Prompt-tier persona: preserve standing rules, memory, and skills.',
     }));
     let row = (await getJobByHubId(pool, 'job-vf-fail'))!;
     expect({ status: row.status, code: row.errorCode, reason: row.failureReason }).toEqual({
@@ -834,6 +956,7 @@ describe('pipeline stages — verifyFirst (spec §4)', () => {
     expect(ctx.stub.sessions).toHaveLength(1);
     expect(ctx.stub.prompts).toHaveLength(1);
     expect(ctx.stub.prompts[0]!.text).toContain('The verification command `false` failed with exit code');
+    expect(ctx.stub.prompts[0]!.text).toContain('Prompt-tier persona: preserve standing rules, memory, and skills.');
     expect(ctx.stub.prompts[0]!.text).toContain('make the verification command pass');
     let types = await eventTypes(pool, row.id);
     expect(types).toContain(EVENT.VERIFICATION_FAILED);
@@ -892,12 +1015,25 @@ describe('pipeline stages — rebaseFirst + job.rebase (spec §3.2/§4)', () => 
     writeFileSync(join(repoRoot, 'README.md'), '# main version\n');
     try {
       const ctx = makeEngine({ baseRef: 'side-conflict' });
-      const job = await runningJob(ctx, spec({ jobId: 'job-rb-conflict', rebaseFirst: true }));
+      const create = ctx.client.createSession.bind(ctx.client);
+      ctx.client.createSession = async (input) => {
+        expect(readFileSync(join(input.directory!, '.opencode/agents/repairer.md'), 'utf8')).toContain('Resolve conflicts safely.');
+        expect(JSON.parse(readFileSync(join(input.directory!, 'opencode.json'), 'utf8')).policies).toBeTruthy();
+        return create(input);
+      };
+      const job = await runningJob(ctx, spec({ jobId: 'job-rb-conflict', rebaseFirst: true, prompt: 'Standing rules, memory, and skill instructions must survive initial repair.',
+        models: ['litellm/open-large'],
+        modelPolicy: { agents: [], providers: ['litellm'], models: ['litellm/open-large'] },
+        agent: { name: 'Repairer', opencodeAgent: 'repairer', markdown: 'Resolve conflicts safely.', mcp: null },
+      }));
       // Conflict → lazy repair session on the conflict prompt.
       expect(ctx.stub.sessions).toHaveLength(1);
+      expect(ctx.stub.sessions[0]).toMatchObject({ agent: 'repairer', model: { providerID: 'litellm', modelID: 'open-large' } });
+      expect(job.model).toBe('litellm/open-large');
       expect(ctx.stub.prompts).toHaveLength(1);
       expect(ctx.stub.prompts[0]!.text).toContain('merge conflicts');
       expect(ctx.stub.prompts[0]!.text).toContain('README.md');
+      expect(ctx.stub.prompts[0]!.text).toContain('Standing rules, memory, and skill instructions must survive initial repair.');
       const types1 = await eventTypes(pool, job.id);
       expect(types1).toContain(EVENT.REBASE_CONFLICTS);
       expect(types1).not.toContain(EVENT.PROMPT_SENT);
@@ -927,7 +1063,11 @@ describe('pipeline stages — rebaseFirst + job.rebase (spec §3.2/§4)', () => 
     writeFileSync(join(repoRoot, 'README.md'), '# main stuck\n');
     try {
       const ctx = makeEngine({ baseRef: 'side-stuck' });
-      const job = await runningJob(ctx, spec({ jobId: 'job-rb-stuck', rebaseFirst: true }));
+      const job = await runningJob(ctx, spec({ jobId: 'job-rb-stuck', rebaseFirst: true,
+        prompt: 'Prompt-tier persona: preserve standing rules, memory, and skills.',
+      }));
+      expect(ctx.stub.sessions[0]!.agent).toBeNull();
+      expect(ctx.stub.prompts[0]!.text).toContain('Prompt-tier persona: preserve standing rules, memory, and skills.');
       const sessionId = job.opencodeSessionId!;
       for (const round of [1, 2, 3]) {
         ctx.stub.messages[sessionId] = [done(`m-stuck-${round}`, `Round ${round} did not help.`, Date.now() + round)];
@@ -1172,17 +1312,19 @@ describe('model fallback', () => {
 describe('verification reclaim', () => {
   it('re-adopts a detached verifying cycle after a restart (fresh engine, same row)', async () => {
     const ctx = makeEngine();
-    const job = await runningJob(ctx, spec({ jobId: 'job-verify-reclaim', verificationCommand: 'true' }));
+    const job = await runningJob(ctx, spec({ jobId: 'job-verify-reclaim', verificationCommand: 'echo ran >> verifier-count; sleep 0.1' }));
     // Simulate the crash: the row sits `verifying` with NO detached cycle
     // anywhere (the fresh engine below owns an empty in-memory set).
     await pool.query(`UPDATE executor.jobs SET status = 'verifying' WHERE hub_job_id = 'job-verify-reclaim'`);
 
     const restarted = makeEngine();
-    await restarted.engine.tick();
-    await restarted.engine.drain();
+    const competing = makeEngine();
+    await Promise.all([restarted.engine.tick(), competing.engine.tick()]);
+    await Promise.all([restarted.engine.drain(), competing.engine.drain()]);
 
     const row = (await getJobByHubId(pool, 'job-verify-reclaim'))!;
     expect(row.status).toBe('succeeded');
+    expect(readFileSync(join(row.worktreePath, 'verifier-count'), 'utf8')).toBe('ran\n');
     const types = await eventTypes(pool, row.id);
     expect(types).toContain(EVENT.VERIFICATION_PASSED);
     void job;
