@@ -1,5 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -609,6 +610,75 @@ export interface JobAgentMaterialization {
   markdown: string;
   /** Full opencode.json MCP fragment, or null when the persona has no servers. */
   mcp: Record<string, unknown> | null;
+  skills?: JobSkillMaterialization[];
+}
+
+export interface JobSkillMaterialization {
+  id: string;
+  files: { path: string; dataBase64: string }[];
+  sha256: string;
+}
+
+/** Validate both wire contents and the digest before touching a worktree. */
+export function validateJobSkills(value: unknown): JobSkillMaterialization[] {
+  if (!Array.isArray(value) || value.length > 20) throw new WorkspaceError('Invalid job skills count');
+  let total = 0;
+  const ids = new Set<string>();
+  return value.map((entry: unknown) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new WorkspaceError('Invalid job skill');
+    const skill = entry as Record<string, unknown>;
+    if (typeof skill.id !== 'string' || skill.id.length > 64 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skill.id) || ids.has(skill.id)) throw new WorkspaceError('Invalid or duplicate skill id');
+    ids.add(skill.id);
+    if (!Array.isArray(skill.files) || !skill.files.length || skill.files.length > 50) throw new WorkspaceError('Invalid skill files');
+    const paths = new Set<string>();
+    const hash = createHash('sha256');
+    const files = skill.files.map((item: unknown) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) throw new WorkspaceError('Invalid skill file');
+      const file = item as Record<string, unknown>;
+      if (typeof file.path !== 'string' || file.path.length > 300 || file.path.split('/').length > 3 || !file.path.split('/').every(part => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part) && part !== '..') || paths.has(file.path)) throw new WorkspaceError('Invalid or duplicate skill path');
+      paths.add(file.path);
+      if (typeof file.dataBase64 !== 'string' || file.dataBase64.length > 1_400_000 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(file.dataBase64)) throw new WorkspaceError('Invalid skill file data');
+      const bytes = Buffer.from(file.dataBase64, 'base64');
+      if (bytes.length > (file.path === 'SKILL.md' ? 100_000 : 1024 * 1024) || (total += bytes.length) > 4 * 1024 * 1024) throw new WorkspaceError('Skill payload exceeds size limit');
+      hash.update(`${file.path}\0${bytes.length}\0`);
+      hash.update(bytes);
+      return { path: file.path, dataBase64: file.dataBase64 };
+    });
+    if (!paths.has('SKILL.md')) throw new WorkspaceError('Skill missing SKILL.md');
+    if (typeof skill.sha256 !== 'string' || hash.digest('hex') !== skill.sha256) throw new WorkspaceError('Skill digest mismatch');
+    return { id: skill.id, files, sha256: skill.sha256 };
+  });
+}
+
+export async function materializeJobSkills(runner: GitRunner, worktreePath: string, skills: readonly JobSkillMaterialization[]): Promise<void> {
+  // Stored jobs can be retried after a restart: revalidate before applying.
+  validateJobSkills(skills);
+  for (const skill of skills) {
+    const rel = `.opencode/skills/${skill.id}`;
+    const dir = join(worktreePath, rel);
+    const root = join(worktreePath, '.opencode');
+    const skillsDir = join(root, 'skills');
+    for (const parent of [root, skillsDir, dir]) {
+      const info = existsSync(parent) ? lstatSync(parent) : null;
+      if (info?.isSymbolicLink() || (info && !info.isDirectory())) throw new WorkspaceError(`Unsafe skill destination: ${parent}`);
+    }
+    // Exclude new files, and hide tracked replacements and stale tracked files
+    // from any safety-net `git add -A` or commit in this worktree only.
+    await excludePatterns(runner, worktreePath, [`/${rel}/`]);
+    const tracked = await mustGit(runner, ['ls-files', '-z', '--', rel], { cwd: worktreePath });
+    for (const path of tracked.split('\0').filter(Boolean)) {
+      await mustGit(runner, ['update-index', '--skip-worktree', '--', path], { cwd: worktreePath });
+    }
+    // Replacing the whole directory prevents stale reference files from the
+    // repository or a previous job snapshot from being offered to OpenCode.
+    if (existsSync(dir)) rmSync(dir, { recursive: true });
+    await mkdir(dir, { recursive: true });
+    for (const file of skill.files) {
+      const target = join(dir, file.path);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, Buffer.from(file.dataBase64, 'base64'));
+    }
+  }
 }
 
 /** Append the missing EXACT patterns to the worktree's git exclude

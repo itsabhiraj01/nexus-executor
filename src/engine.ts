@@ -37,6 +37,7 @@ import {
   execGit,
   listUnmergedPaths,
   materializeJobAgent,
+  materializeJobSkills,
   materializeJobAttachments,
   mergeJobBranch,
   prepareWorktree,
@@ -865,12 +866,17 @@ export class JobEngine {
   private async prepareSession(job: JobRow): Promise<ModelRef | null> {
     const { spec, worktreePath } = job;
     if (spec.agent) {
+      if (spec.agent.skills?.length) {
+        try { await materializeJobSkills(this.git, worktreePath, spec.agent.skills); }
+        catch (error) { throw Object.assign(new Error(String(error)), { code: 'workspace_setup_failed' }); }
+      }
       try { await materializeJobAgent(this.git, worktreePath, spec.agent); }
       catch (error) { throw Object.assign(new Error(String(error)), { code: 'workspace_setup_failed' }); }
       await appendJobEvent(this.pool, {
         jobId: job.id, eventType: EVENT.AGENT_APPLIED,
         summary: `Agent "${spec.agent.name}" materialized natively on the job worktree (${spec.agent.opencodeAgent}).`,
-        payload: { agent: spec.agent.opencodeAgent, name: spec.agent.name, mcp: spec.agent.mcp ? 'written' : 'none', tier: 'native' },
+        payload: { agent: spec.agent.opencodeAgent, name: spec.agent.name, mcp: spec.agent.mcp ? 'written' : 'none', tier: 'native',
+          skills: spec.agent.skills?.map(skill => ({ id: skill.id, sha256: skill.sha256 })) ?? [] },
       });
     }
     if (spec.modelPolicy && job.metadata.modelPolicyDir !== worktreePath) {
