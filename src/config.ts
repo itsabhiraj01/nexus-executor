@@ -119,6 +119,7 @@ export function executorCapabilities(config: Pick<ExecutorConfig, 'upgradeComman
     // worktree (`.opencode/agents/<name>.md` + MCP fragment, pinned on the
     // session) — remote runs get the persona's skills + MCP like local ones.
     nativeAgents: true,
+    livePermissions: true,
     ...(resolveUpgradeCommand(config) ? { selfUpgrade: true } : {}),
   };
 }

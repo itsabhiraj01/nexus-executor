@@ -1,6 +1,7 @@
 import type { Pool } from 'pg';
 import { readAuthConfig } from './auth.js';
 import { EXECUTOR_VERSION, executorCapabilities, type ExecutorConfig } from './config.js';
+import { updateJobPermissions, parsePermissionPolicy, PermissionPolicyError } from './permissions.js';
 import {
   EngineError,
   rowToJob,
@@ -294,6 +295,11 @@ export function validateJobBody(body: unknown): { spec?: JobSpecInput; error?: s
     }
   }
 
+  let permissionPolicy: JobSpecInput['permissionPolicy'];
+  if (input.permissionPolicy !== undefined) {
+    try { permissionPolicy = parsePermissionPolicy(input.permissionPolicy); }
+    catch (error) { return { error: error instanceof Error ? error.message : 'Invalid permission policy.' }; }
+  }
   return {
     spec: {
       jobId,
@@ -304,6 +310,7 @@ export function validateJobBody(body: unknown): { spec?: JobSpecInput; error?: s
       models,
       modelPolicy,
       agent,
+      ...(permissionPolicy ? { permissionPolicy } : {}),
       attachments,
       retry,
       ...(baseBranch !== undefined ? { baseBranch } : {}),
@@ -467,6 +474,15 @@ export async function opJobMessage(deps: RouteDeps, jobId: string, text: string)
   } catch (error) {
     const result = engineErrorResult(error);
     if (result) return result;
+    throw error;
+  }
+}
+
+export async function opJobPermissions(deps: RouteDeps, jobId: string, policy: unknown): Promise<OpResult> {
+  try {
+    return { status: 200, body: { ...await updateJobPermissions(deps.pool, deps.client, jobId, policy) } };
+  } catch (error) {
+    if (error instanceof PermissionPolicyError) return { status: error.status, body: { error: error.message } };
     throw error;
   }
 }
@@ -872,6 +888,11 @@ export async function handleGatewayOperation(
           return { ok: false, error: 'job.message payload must be {jobId, text 1..50000 chars}.', status: 400 };
         }
         return wrap(await opJobMessage(deps, jobId, text));
+      }
+      case 'job.permissions': {
+        const jobId = textArg(body.jobId, 200);
+        if (!jobId || Object.keys(body).some(key => !['jobId', 'policy'].includes(key))) return { ok: false, status: 400, error: 'Invalid job.permissions payload.' };
+        return wrap(await opJobPermissions(deps, jobId, body.policy));
       }
       default: {
         if ((ID_OPS as readonly string[]).includes(operation)) {

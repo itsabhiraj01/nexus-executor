@@ -10,7 +10,7 @@ import { JobEngine } from './engine.js';
 import { EXECUTOR_VERSION } from './config.js';
 import { claimPairing, PairingError } from './pairing.js';
 import { registerRoutes } from './routes.js';
-import { validateJobBody } from './ops.js';
+import { validateJobBody, handleGatewayOperation, type RouteDeps } from './ops.js';
 import type { TerminalRegistry } from './terminals.js';
 import { createUpgrader, type UpgradeSpawn } from './upgrade.js';
 import { testConfig, wipeJobs } from './testkit.js';
@@ -28,6 +28,7 @@ let pool: Pool;
 let app: FastifyInstance;
 let engine: JobEngine;
 let root: string;
+let deps: RouteDeps;
 
 /** Jobs-route suite never exercises terminal.* ops: an always-off stub. */
 function fakeRegistry(): TerminalRegistry {
@@ -69,7 +70,8 @@ beforeAll(async () => {
   const upgrader = createUpgrader({ config, stateFile: upgraderPaths.stateFile, logFile: upgraderPaths.logFile, spawnImpl });
   app = Fastify({ logger: false });
   app.addHook('preHandler', createAuthHook(pool));
-  registerRoutes(app, { pool, config, engine, client: null, startedAt: Date.now(), registry: fakeRegistry(), upgrader });
+  deps = { pool, config, engine, client: null, startedAt: Date.now(), registry: fakeRegistry(), upgrader };
+  registerRoutes(app, deps);
   await app.ready();
 });
 
@@ -164,6 +166,25 @@ describe('paired executor', () => {
     await writeAuthConfig(pool, {
       tokenHash: hashToken(HUB_TOKEN), hubUrl: 'http://hub.local', name: 'hub', pairedAt: new Date().toISOString(),
     });
+  });
+
+  it('routes initial and updated policies identically over authenticated direct and gateway transports', async () => {
+    const policy = { revision: 'one', generation: 1, rules: [{ action: '*', resource: '*', effect: 'deny' }] };
+    const created = await app.inject({ method: 'POST', url: '/api/v1/jobs', headers: auth(), payload: validJob({ jobId: 'permission-route', permissionPolicy: policy }) });
+    expect(created.statusCode).toBe(201);
+    expect((await pool.query("SELECT permission_policy FROM executor.jobs WHERE hub_job_id='permission-route'")).rows[0].permission_policy).toEqual(policy);
+    const url = '/api/v1/jobs/permission-route/permissions';
+    expect((await app.inject({ method: 'POST', url, payload: policy })).statusCode).toBe(401);
+    const direct = await app.inject({ method: 'POST', url, headers: auth(), payload: policy });
+    expect(direct.statusCode).toBe(200);
+    expect(direct.json()).toEqual({ revision: 'one', generation: 1, sessionId: null, applied: false });
+    expect(await handleGatewayOperation(deps, 'job.permissions', { jobId: 'permission-route', policy })).toEqual({ ok: true, result: direct.json() });
+    const newer = { ...policy, revision: 'two', generation: 2 };
+    expect(await handleGatewayOperation(deps, 'job.permissions', { jobId: 'permission-route', policy: newer })).toMatchObject({ ok: true, result: { generation: 2 } });
+    expect((await app.inject({ method: 'POST', url, headers: auth(), payload: policy })).statusCode).toBe(409);
+    expect(await handleGatewayOperation(deps, 'job.permissions', { jobId: 'permission-route', policy, sessionId: 'foreign' })).toMatchObject({ ok: false, status: 400 });
+    expect((await app.inject({ method: 'POST', url, headers: auth(), payload: { ...policy, rules: [{ action: '*', resource: '*', effect: 'invalid' }] } })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'GET', url: '/api/v1/status', headers: auth() })).json().capabilities.livePermissions).toBe(true);
   });
 
   it('rejects missing and wrong tokens, then serves status', async () => {

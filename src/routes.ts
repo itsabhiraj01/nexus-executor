@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify';
 import {
   healthPaired, jobSummary, MAX_MESSAGE_CHARS,
   opConfigPut, opCreateJob, opJobCancel, opJobEvents, opJobLog, opJobMerge,
-  opFsBrowse, opJobMessage, opJobRebase, opJobVerify, opModels, opRepoInspect, opShowJob, opStatus, opUpgrade, opWorkspaceSweep,
+  opFsBrowse, opJobMessage, opJobPermissions, opJobRebase, opJobVerify, opModels, opRepoInspect, opShowJob, opStatus, opUpgrade, opWorkspaceSweep,
   opTerminalCreate, opTerminalDetach, opTerminalInput, opTerminalKill, opTerminalList, opTerminalOutput, opTerminalResize,
   type OpResult, type RouteDeps,
 } from './ops.js';
@@ -81,6 +81,9 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
   app.post('/api/v1/jobs', { bodyLimit: 40 * 1024 * 1024, preHandler: limit(jobCreateLimiter) }, async (request, reply) => {
     send(reply, await opCreateJob(deps, request.body));
+  });
+  app.post<{ Params: { id: string } }>('/api/v1/jobs/:id/permissions', { preHandler: limit(actionLimiter) }, async (request, reply) => {
+    send(reply, await opJobPermissions(deps, request.params.id, request.body));
   });
 
   app.get<{ Querystring: { status?: string; limit?: string; updatedSince?: string } }>('/api/v1/jobs', async (request, reply) => {

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { Client, type Pool } from 'pg';
 import type { ExecutorConfig } from './config.js';
 import type { SqlExecutor } from './db.js';
+import { applyJobPermissions, parsePermissionPolicy, type RemotePermissionPolicy } from './permissions.js';
 import {
   OpenCodeError,
   agentErrorSummary,
@@ -110,6 +111,7 @@ export interface JobRetrySpec {
 
 /** The job spec exactly as `POST /api/v1/jobs` received it. */
 export interface JobSpecInput {
+  permissionPolicy?: RemotePermissionPolicy;
   jobId: string;
   title?: string;
   prompt: string;
@@ -544,9 +546,10 @@ export class JobEngine {
 
   /** Create the job row (idempotent on hub_job_id) and admit it. */
   async createJob(spec: JobSpecInput): Promise<{ job: JobRow; created: boolean }> {
+    const permissionPolicy = spec.permissionPolicy === undefined ? null : parsePermissionPolicy(spec.permissionPolicy);
     const inserted = await this.pool.query<DbJobRow>(`
-      INSERT INTO executor.jobs (hub_job_id, title, spec, prompt, verification_command, max_attempts)
-      VALUES ($1, $2, $3::jsonb, $4, $5, $6)
+      INSERT INTO executor.jobs (hub_job_id, title, spec, prompt, verification_command, max_attempts, permission_policy)
+      VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7::jsonb)
       ON CONFLICT (hub_job_id) DO NOTHING
       RETURNING *`, [
       spec.jobId,
@@ -555,6 +558,7 @@ export class JobEngine {
       spec.prompt,
       spec.verificationCommand ?? '',
       resolveMaxAttempts(spec, this.config),
+      permissionPolicy ? JSON.stringify(permissionPolicy) : null,
     ]);
     if (!inserted.rows[0]) {
       const existing = await getJobByHubId(this.pool, spec.jobId);
@@ -806,6 +810,7 @@ export class JobEngine {
 
   private async promptCurrent(job: JobRow, sessionId: string, text: string) {
     if (!await this.isCurrent(job)) throw new AttemptInterrupted('Job no longer owns this attempt');
+    await applyJobPermissions(this.pool, this.client, job.hubJobId, { sessionId, attempt: job.attemptCount });
     const sent = await this.client!.prompt(sessionId, text);
     if (!await this.isCurrent(job)) {
       // Covers cancellation racing the remote prompt request/response.
@@ -1203,6 +1208,7 @@ export class JobEngine {
   }
 
   private async pollOwned(job: JobRow): Promise<void> {
+    await applyJobPermissions(this.pool, this.client, job.hubJobId);
     if (job.status !== 'waiting_for_user' && job.startedAt && this.config.jobTimeoutMs > 0 &&
         this.now() - job.startedAt.getTime() >= this.config.jobTimeoutMs) {
       await this.failAttempt(job, 'execution_timeout', 'Job timed out: exceeded its execution deadline.');

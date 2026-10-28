@@ -24,6 +24,37 @@ import {
 } from './opencode.js';
 import { LaunchedJobEngine, countEvents, eventTypes, makeRepo, makeStubClient, testConfig, TEST_AUTHOR } from './testkit.js';
 import { commitJobChanges, execGit, listUnmergedPaths } from './workspace.js';
+import { updateJobPermissions } from './permissions.js';
+
+it('persists initial prompt-tier policy and applies it before first and replacement prompts', async () => {
+  const { engine, client, stub } = makeEngine({ retryMaxAttempts: 2, retryDelayMinutes: 0 });
+  const policy = { revision: 'initial', generation: 1, rules: [{ action: '*', resource: '*', effect: 'deny' as const }] };
+  const input = spec({ permissionPolicy: policy, retry: { maxAttempts: 2, delayMinutes: 0 } });
+  const { job } = await engine.createJob(input);
+  expect(job.status).toBe('running');
+  expect(stub.permissionPatches).toEqual([{ sessionId: job.opencodeSessionId, rules: policy.rules, promptCount: 0 }]);
+  const next = { ...policy, revision: 'changed', generation: 2 };
+  await updateJobPermissions(pool, client, input.jobId, next);
+  expect(stub.interrupts).toEqual([]);
+  await engine.failJob(job.id, 'agent_stalled', 'retry fixture');
+  await engine.admitQueued(); await engine.drain();
+  const replacement = (await getJobByHubId(pool, input.jobId))!;
+  expect(replacement.status).toBe('running');
+  expect(replacement.opencodeSessionId).not.toBe(job.opencodeSessionId);
+  expect(stub.permissionPatches.at(-1)).toEqual({ sessionId: replacement.opencodeSessionId, rules: next.rules, promptCount: 1 });
+  expect((await pool.query('SELECT permission_policy, permission_applied FROM executor.jobs WHERE id=$1', [job.id])).rows[0]).toMatchObject({ permission_policy: next, permission_applied: { revision: 'changed', generation: 2, sessionId: replacement.opencodeSessionId, applied: true } });
+  await engine.cancel(input.jobId);
+});
+
+it('never sends the first prompt when permission application fails', async () => {
+  const { engine, client, stub } = makeEngine();
+  const permissionPolicy = { revision: 'blocked', generation: 1, rules: [{ action: '*', resource: '*', effect: 'deny' as const }] };
+  vi.spyOn(client, 'setSessionPermissions').mockRejectedValue(new Error('PATCH unavailable'));
+  const { job } = await engine.createJob(spec({ permissionPolicy }));
+  expect(job.status).toBe('failed');
+  expect(stub.prompts).toEqual([]);
+  expect((await pool.query('SELECT permission_policy, permission_applied FROM executor.jobs WHERE id=$1', [job.id])).rows[0]).toEqual({ permission_policy: permissionPolicy, permission_applied: null });
+});
 
 let pool: Pool;
 let root: string;
@@ -1022,6 +1053,7 @@ describe('pipeline stages — rebaseFirst + job.rebase (spec §3.2/§4)', () => 
         return create(input);
       };
       const job = await runningJob(ctx, spec({ jobId: 'job-rb-conflict', rebaseFirst: true, prompt: 'Standing rules, memory, and skill instructions must survive initial repair.',
+        permissionPolicy: { revision: 'repair-policy', generation: 1, rules: [{ action: '*', resource: '*', effect: 'deny' }] },
         models: ['litellm/open-large'],
         modelPolicy: { agents: [], providers: ['litellm'], models: ['litellm/open-large'] },
         agent: { name: 'Repairer', opencodeAgent: 'repairer', markdown: 'Resolve conflicts safely.', mcp: null },
@@ -1031,6 +1063,7 @@ describe('pipeline stages — rebaseFirst + job.rebase (spec §3.2/§4)', () => 
       expect(ctx.stub.sessions[0]).toMatchObject({ agent: 'repairer', model: { providerID: 'litellm', modelID: 'open-large' } });
       expect(job.model).toBe('litellm/open-large');
       expect(ctx.stub.prompts).toHaveLength(1);
+      expect(ctx.stub.permissionPatches).toEqual([{ sessionId: job.opencodeSessionId, rules: [{ action: '*', resource: '*', effect: 'deny' }], promptCount: 0 }]);
       expect(ctx.stub.prompts[0]!.text).toContain('merge conflicts');
       expect(ctx.stub.prompts[0]!.text).toContain('README.md');
       expect(ctx.stub.prompts[0]!.text).toContain('Standing rules, memory, and skill instructions must survive initial repair.');

@@ -86,6 +86,8 @@ export function testConfig(workspaceRoot: string, overrides: Partial<ExecutorCon
 }
 
 export interface StubState {
+  sessionPermissions: Record<string, unknown>;
+  permissionPatches: Array<{ sessionId: string; rules: unknown; promptCount: number }>;
   sessions: Array<{ id: string; title: string; directory?: string; agent?: string | null; model?: ModelRef | null }>;
   prompts: Array<{ sessionId: string; text: string }>;
   interrupts: string[];
@@ -108,6 +110,7 @@ export interface StubState {
  */
 export function makeStubClient(): { client: OpenCodeClient; state: StubState } {
   const state: StubState = {
+    sessionPermissions: {}, permissionPatches: [],
     sessions: [], prompts: [], interrupts: [], modelSwitches: [], messages: {},
     models: [{ id: 'open-large', name: 'Open Large', providerID: 'litellm' }],
     permissionRequests: {}, permissionReplies: [],
@@ -117,6 +120,18 @@ export function makeStubClient(): { client: OpenCodeClient; state: StubState } {
   const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = String(input);
     const method = init?.method ?? 'GET';
+    const sessionMatch = /\/api\/session\/([^/]+)$/.exec(url);
+    if (sessionMatch && (method === 'PATCH' || method === 'GET')) {
+      const id = sessionMatch[1]!;
+      if (!state.messages[id]) return json({ error: 'unknown session' }, 404);
+      if (method === 'PATCH') {
+        const rules = JSON.parse(String(init?.body)).permissions;
+        state.sessionPermissions[id] = rules;
+        state.permissionPatches.push({ sessionId: id, rules, promptCount: state.prompts.length });
+        return new Response(null, { status: 204 });
+      }
+      return json({ id, permissions: state.sessionPermissions[id] });
+    }
     if (method === 'POST' && url.endsWith('/api/session')) {
       const body = JSON.parse(String(init!.body)) as {
         title?: string; location?: { directory?: string }; agent?: string; model?: { providerID: string; id: string };

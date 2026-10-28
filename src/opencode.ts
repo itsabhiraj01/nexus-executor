@@ -179,6 +179,13 @@ export function createOpenCodeClient(config: OpenCodeClientConfig) {
     return (text ? JSON.parse(text) : undefined) as T;
   }
   return {
+    async setSessionPermissions(sessionId: string, permissions: Array<{ action: string; resource: string; effect: 'allow' | 'deny' | 'ask' }>): Promise<void> {
+      await request(`/api/session/${encodeURIComponent(sessionId)}`, { method: 'PATCH', body: JSON.stringify({ permissions }) });
+    },
+    async getSessionPermissions(sessionId: string): Promise<unknown> {
+      const out = await request<{ data: { permissions?: unknown } }>(`/api/session/${encodeURIComponent(sessionId)}`);
+      return out.data.permissions;
+    },
     /**
      * Create a session. `directory` pins the session's project directory —
      * the OpenCode service otherwise derives it from its own working
