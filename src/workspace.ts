@@ -1,8 +1,8 @@
 import { execFile, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 /**
@@ -190,6 +190,59 @@ export async function prepareWorktree(
   await runner(['worktree', 'prune'], { cwd: config.repoRoot });
   await mustGit(runner, ['worktree', 'add', '-b', branch, path, baseSha], { cwd: config.repoRoot });
   return { branch, path, baseSha };
+}
+
+/** Share installed project dependencies without installing in a job worktree.
+ * node_modules, scopes and .bin remain real directories; only package/bin
+ * leaves are symlinks, so package-manager rename/unlink cannot mutate the
+ * source scope. Workspace links (in any scope, relative or absolute) point
+ * into this checkout, never the source checkout's code/dist.
+ * Re-entry fills missing links while preserving job-local dependencies.
+ */
+export function linkNodeModules(repoRoot: string, worktreePath: string): void {
+  const src = join(repoRoot, 'node_modules');
+  if (!existsSync(src)) return;
+  const repo = realpathSync(repoRoot);
+  const dst = join(worktreePath, 'node_modules');
+  const stat = (path: string) => {
+    try { return lstatSync(path); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  };
+  const directory = (path: string) => {
+    const existing = stat(path);
+    if (existing && (!existing.isDirectory() || existing.isSymbolicLink())) {
+      throw new WorkspaceError('Dependency container must be a real directory', path);
+    }
+    mkdirSync(path, { recursive: true });
+  };
+  const link = (from: string, to: string) => {
+    if (stat(to)) return;
+    const target = realpathSync(from);
+    const local = relative(repo, target);
+    const insideRepo = local !== '..' && !local.startsWith(`..${sep}`) && !isAbsolute(local);
+    const installed = local.split(sep).includes('node_modules');
+    const destination = insideRepo && !installed
+      ? relative(dirname(to), join(worktreePath, local))
+      : target;
+    symlinkSync(destination, to);
+  };
+  directory(dst);
+  for (const entry of readdirSync(src)) {
+    if (entry.startsWith('.') && entry !== '.bin') continue;
+    const from = join(src, entry);
+    const to = join(dst, entry);
+    if (entry === '.bin' || entry.startsWith('@')) {
+      directory(to);
+      for (const item of readdirSync(from)) {
+        if (!item.startsWith('.')) link(join(from, item), join(to, item));
+      }
+    } else {
+      link(from, to);
+    }
+  }
 }
 
 export interface JobCommit {

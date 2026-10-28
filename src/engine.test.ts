@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -127,6 +127,33 @@ async function runningJob(ctx: Ctx, input: JobSpecInput): Promise<JobRow> {
 }
 
 describe('launch', () => {
+  it('links project dependencies before verifyFirst on a reused stage worktree', async () => {
+    const repo = await makeRepo(join(root, 'dependency-repo'));
+    writeFileSync(join(repo, '.gitignore'), 'node_modules/\n');
+    await execGit(['add', '.gitignore'], { cwd: repo });
+    await execGit(['commit', '-m', 'ignore dependencies'], { cwd: repo, env: TEST_AUTHOR });
+    mkdirSync(join(repo, 'node_modules/project-dependency'), { recursive: true });
+    writeFileSync(join(repo, 'node_modules/project-dependency/index.js'), 'module.exports = "project dependency";');
+    await execGit(['branch', 'builder/stage-deps'], { cwd: repo });
+    const ctx = makeEngine();
+    const input = spec({ jobId: 'job-stage-deps', project: { localPath: repo }, baseBranch: 'builder/stage-deps', verifyFirst: true,
+      verificationCommand: `node -e "if(require('project-dependency') !== 'project dependency') process.exit(1)"` });
+    const waiting = new JobEngine({ pool, config, client: null, git: execGit });
+    const { job } = await waiting.createJob(input);
+    const preferred = join(config.workspaceRoot, 'worktrees', `stage-${job.id}`);
+    expect((await execGit(['worktree', 'add', preferred, input.baseBranch!], { cwd: repo })).code).toBe(0);
+    expect(existsSync(join(preferred, 'node_modules'))).toBe(false);
+    await ctx.engine.admitQueued();
+    const row = (await getJobByHubId(pool, input.jobId))!;
+    try {
+      expect(row.status, row.failureReason ?? undefined).toBe('succeeded');
+      expect(readFileSync(join(row.worktreePath, 'node_modules/project-dependency/index.js'), 'utf8')).toContain('project dependency');
+      expect(ctx.stub.sessions).toHaveLength(0);
+    } finally {
+      await ctx.engine.cancel(input.jobId);
+    }
+  });
+
   it('does not resurrect cancellation racing between admission eligibility and its write', async () => {
     const ctx = makeEngine();
     const engine = new JobEngine({ pool, config, client: ctx.client });
@@ -601,6 +628,42 @@ describe('merge', () => {
 });
 
 describe('in-job retries', () => {
+  it('persists workspace identity before linking fails and repairs dependencies on retry', async () => {
+    const repo = await makeRepo(join(root, 'broken-dependency-repo'));
+    writeFileSync(join(repo, '.gitignore'), 'node_modules/\n');
+    await execGit(['add', '.gitignore'], { cwd: repo });
+    await execGit(['commit', '-m', 'ignore dependencies'], { cwd: repo, env: TEST_AUTHOR });
+    mkdirSync(join(repo, 'node_modules/.bin'), { recursive: true });
+    symlinkSync('../tool/bin.js', join(repo, 'node_modules/.bin/tool'));
+    const ctx = makeEngine({ retryMaxAttempts: 2, retryDelayMinutes: 0 });
+    const input = spec({ project: { localPath: repo } });
+    await ctx.engine.createJob(input);
+    const failed = (await getJobByHubId(pool, input.jobId))!;
+    expect(failed.status).toBe('queued');
+    expect(failed.failureReason).toContain('ENOENT');
+    expect(failed.branch).toBeTruthy();
+    expect(failed.worktreePath).toBeTruthy();
+    expect(failed.metadata.repoRoot).toBe(repo);
+    expect(failed.metadata.baseSha).toMatch(/^[a-f0-9]{40}$/);
+    expect(ctx.stub.sessions).toHaveLength(0);
+    writeFileSync(join(failed.worktreePath, 'retained.txt'), 'keep this work');
+    mkdirSync(join(repo, 'node_modules/tool'), { recursive: true });
+    writeFileSync(join(repo, 'node_modules/tool/bin.js'), 'repaired tool');
+    await ctx.engine.admitQueued();
+    const retried = (await getJobByHubId(pool, input.jobId))!;
+    try {
+      expect(retried.status, retried.failureReason ?? undefined).toBe('running');
+      expect(retried.branch).toBe(failed.branch);
+      expect(retried.worktreePath).toBe(failed.worktreePath);
+      expect(retried.metadata.baseSha).toBe(failed.metadata.baseSha);
+      expect(readFileSync(join(retried.worktreePath, 'retained.txt'), 'utf8')).toBe('keep this work');
+      expect(readFileSync(join(retried.worktreePath, 'node_modules/.bin/tool'), 'utf8')).toBe('repaired tool');
+      expect((await eventTypes(pool, retried.id)).filter((type) => type === EVENT.WORKTREE_CREATED)).toHaveLength(1);
+    } finally {
+      await ctx.engine.cancel(input.jobId);
+    }
+  });
+
   function errored(id: string, error: Record<string, unknown>, created: number): OpenCodeMessage {
     return { id, type: 'assistant', finish: 'error', error, content: [], time: { created } };
   }

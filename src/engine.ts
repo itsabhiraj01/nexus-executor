@@ -36,6 +36,7 @@ import {
   completeWorktreeMerge,
   execGit,
   listUnmergedPaths,
+  linkNodeModules,
   materializeJobAgent,
   materializeJobAttachments,
   mergeJobBranch,
@@ -955,6 +956,11 @@ export class JobEngine {
           payload: { branch: prepared.branch, path: prepared.path, baseSha: prepared.baseSha, baseRef, repoRoot },
         });
       }
+
+      // Cover fresh stages and retry reuse/reattachment before verification
+      // or agents resolve ancestor executor deps. Persist workspace identity
+      // first so a broken source dependency cannot lose the retry's branch.
+      linkNodeModules(repoRoot, prepared.path);
 
       // Any fresh launch supersedes a rebase-repair state left by a
       // previous attempt (the retry re-attaches and replays the step).
