@@ -648,7 +648,7 @@ describe('merge', () => {
 
 describe('in-job retries', () => {
   it('persists workspace identity before linking fails and repairs dependencies on retry', async () => {
-    const repo = await makeRepo(join(root, 'broken-dependency-repo'));
+    const repo = await makeRepo(join(root, 'broken-dependency-repo-recovery'));
     writeFileSync(join(repo, '.gitignore'), 'node_modules/\n');
     await execGit(['add', '.gitignore'], { cwd: repo });
     await execGit(['commit', '-m', 'ignore dependencies'], { cwd: repo, env: TEST_AUTHOR });
