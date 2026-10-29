@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { appendFile, mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
@@ -607,20 +607,44 @@ export async function materializeJobAttachments(
 ): Promise<{ dir: string; files: MaterializedAttachment[] }> {
   if (!attachments.length) return { dir: '', files: [] };
   const dir = join(worktreePath, ATTACHMENTS_DIR);
-  await mkdir(dir, { recursive: true });
-  await excludeDirectory(runner, worktreePath, ATTACHMENTS_DIR);
+  const stat = (path: string) => {
+    try { return lstatSync(path); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  };
+  const directory = stat(dir);
+  if (directory && (!directory.isDirectory() || directory.isSymbolicLink())) {
+    throw new WorkspaceError('Unsafe attachment directory (must not be a symlink)', dir);
+  }
+  // Git excludes never hide tracked files. Reject the whole private namespace
+  // before writing even the first attachment, including on cached stage reuse.
+  const tracked = await mustGit(runner, ['ls-files', '-z', '--', ATTACHMENTS_DIR], { cwd: worktreePath });
+  if (tracked) throw new WorkspaceError('Attachment directory contains tracked paths', ATTACHMENTS_DIR);
   const taken = new Set<string>();
   const files: MaterializedAttachment[] = [];
   for (const attachment of attachments) {
     const name = sanitizeAttachmentName(attachment.name, taken);
     taken.add(name);
-    await writeFile(join(dir, name), attachment.data);
+    const existing = stat(join(dir, name));
+    if (existing && (!existing.isFile() || existing.isSymbolicLink())) {
+      throw new WorkspaceError('Unsafe attachment destination (must not be a symlink)', name);
+    }
     files.push({
       name,
       path: `${ATTACHMENTS_DIR}/${name}`,
       mimeType: attachment.mimeType,
       byteSize: attachment.data.length,
     });
+  }
+  // Preflight the entire batch and persist exclusion BEFORE sensitive writes.
+  await excludeDirectory(runner, worktreePath, ATTACHMENTS_DIR);
+  await mkdir(dir, { recursive: true });
+  for (const [index, attachment] of attachments.entries()) {
+    const handle = await open(join(dir, files[index]!.name), constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+    try { await handle.writeFile(attachment.data); }
+    finally { await handle.close(); }
   }
   return { dir: ATTACHMENTS_DIR, files };
 }
@@ -634,8 +658,8 @@ export async function materializeJobAttachments(
  * The path is resolved with `git rev-parse --git-path` (the authoritative
  * location): for a linked worktree that is the COMMON git dir, so the line
  * also covers the repo's main checkout and sibling worktrees. That is fine
- * — exclude patterns only affect UNTRACKED files, and no checkout carries a
- * tracked top-level `builder-input/`.
+ * — exclude patterns only affect UNTRACKED files. Materialization separately
+ * rejects tracked `builder-input` paths before writing private attachments.
  */
 async function excludeDirectory(runner: GitRunner, worktreePath: string, dir: string): Promise<void> {
   const resolved = await runner(['rev-parse', '--git-path', 'info/exclude'], { cwd: worktreePath });
