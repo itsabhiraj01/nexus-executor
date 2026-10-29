@@ -11,7 +11,7 @@ import {
 } from './engine.js';
 import { parseModelRef, type OpenCodeClient } from './opencode.js';
 import type { ExecutorPolicySlice } from './model-policy.js';
-import { readJobLog } from './workspace.js';
+import { readJobLog, validateJobSkills, type JobSkillMaterialization } from './workspace.js';
 import { browseFolders, inspectRepository } from './fs-discovery.js';
 import { TerminalCapError, TerminalTmuxError, type TerminalRegistry } from './terminals.js';
 import { TerminalStoreError } from './terminal-store.js';
@@ -207,7 +207,12 @@ export function validateJobBody(body: unknown): { spec?: JobSpecInput; error?: s
       if (JSON.stringify(raw.mcp).length > 65_536) return { error: 'agent.mcp must serialize to ≤ 64 KB.' };
       mcp = raw.mcp as Record<string, unknown>;
     }
-    agent = { name, opencodeAgent, markdown: raw.markdown, mcp };
+    let skills: JobSkillMaterialization[] | undefined;
+    if (raw.skills !== undefined) {
+      try { skills = validateJobSkills(raw.skills); }
+      catch (error) { return { error: `agent.skills: ${String(error)}` }; }
+    }
+    agent = { name, opencodeAgent, markdown: raw.markdown, mcp, ...(skills ? { skills } : {}) };
   }
 
   // The in-job retry budget the hub resolved (project → settings → env

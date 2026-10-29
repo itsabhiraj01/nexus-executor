@@ -890,6 +890,23 @@ describe('in-job retries', () => {
 });
 
 describe('native personas (model-policy era spec fields)', () => {
+  it('places a delivered skill before the native session is created', async () => {
+    const ctx = makeEngine();
+    const body = '# Hub reviewer\n';
+    const sha256 = (await import('node:crypto')).createHash('sha256')
+      .update(`SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest('hex');
+    const job = await runningJob(ctx, spec({
+      jobId: 'job-delivered-skill', agent: {
+        name: 'Reviewer', opencodeAgent: 'reviewer', markdown: 'Review the code.', mcp: null,
+        skills: [{ id: 'review', files: [{ path: 'SKILL.md', dataBase64: Buffer.from(body).toString('base64') }], sha256 }],
+      },
+    }));
+    expect(readFileSync(join(job.worktreePath, '.opencode/skills/review/SKILL.md'), 'utf8')).toBe(body);
+    expect(ctx.stub.sessions[0]).toMatchObject({ agent: 'reviewer', directory: job.worktreePath });
+    await execGit(['add', '-A'], { cwd: job.worktreePath });
+    expect((await execGit(['status', '--porcelain'], { cwd: job.worktreePath })).stdout.trim()).toBe('');
+    await ctx.engine.cancel(job.hubJobId);
+  });
   it('materializes a native persona (markdown + MCP) git-excluded and pins the session to it', async () => {
     const ctx = makeEngine();
     const job = await runningJob(ctx, spec({
