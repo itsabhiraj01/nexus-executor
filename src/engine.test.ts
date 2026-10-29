@@ -127,6 +127,25 @@ async function runningJob(ctx: Ctx, input: JobSpecInput): Promise<JobRow> {
 }
 
 describe('launch', () => {
+  it('repairs dependencies when recovering a persisted session without duplicating its prompt', async () => {
+    const repo = await makeRepo(join(root, 'persisted-dependency-repo'));
+    writeFileSync(join(repo, '.gitignore'), 'node_modules/\n');
+    mkdirSync(join(repo, 'node_modules/project-dependency'), { recursive: true });
+    writeFileSync(join(repo, 'node_modules/project-dependency/index.js'), 'module.exports = "project dependency";');
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({ project: { localPath: repo } }));
+    rmSync(join(job.worktreePath, 'node_modules'), { recursive: true });
+    await pool.query("UPDATE executor.jobs SET status = 'created' WHERE id = $1", [job.id]);
+    try {
+      await ctx.engine.launchJob((await getJobByHubId(pool, job.hubJobId))!);
+      expect(existsSync(join(job.worktreePath, 'node_modules/project-dependency/index.js'))).toBe(true);
+      expect(ctx.stub.sessions).toHaveLength(1);
+      expect(ctx.stub.prompts).toHaveLength(1);
+    } finally {
+      await ctx.engine.cancel(job.hubJobId);
+    }
+  });
+
   it('links project dependencies before verifyFirst on a reused stage worktree', async () => {
     const repo = await makeRepo(join(root, 'dependency-repo'));
     writeFileSync(join(repo, '.gitignore'), 'node_modules/\n');
@@ -1406,6 +1425,54 @@ describe('model fallback', () => {
 });
 
 describe('verification reclaim', () => {
+  it('fails dependency setup cleanly instead of leaving resumed verification wedged', async () => {
+    const repo = await makeRepo(join(root, 'verification-unsafe-dependency-repo'));
+    writeFileSync(join(repo, '.gitignore'), 'node_modules/\n');
+    mkdirSync(join(repo, 'node_modules'), { recursive: true });
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({ project: { localPath: repo }, verificationCommand: 'touch verifier-ran' }));
+    rmSync(join(job.worktreePath, 'node_modules'), { recursive: true });
+    symlinkSync(join(repo, 'node_modules'), join(job.worktreePath, 'node_modules'));
+    await pool.query("UPDATE executor.jobs SET status = 'verifying' WHERE id = $1", [job.id]);
+    const restarted = new JobEngine({ pool, config, client: ctx.client, git: execGit });
+    try {
+      await restarted.tick();
+      await restarted.drain();
+      const row = (await getJobByHubId(pool, job.hubJobId))!;
+      expect(row.status).toBe('failed');
+      expect(row.errorCode).toBe('session_setup_failed');
+      expect(row.failureReason).toContain('Dependency container must be a real directory');
+      expect(existsSync(join(job.worktreePath, 'verifier-ran'))).toBe(false);
+      expect(ctx.stub.prompts).toHaveLength(1);
+    } finally {
+      await restarted.cancel(job.hubJobId);
+    }
+  });
+
+  it.each(['running', 'verifying'])('repairs missing dependencies before verification from %s after restart', async (status) => {
+    const repo = await makeRepo(join(root, `verification-dependency-repo-${status}`));
+    writeFileSync(join(repo, '.gitignore'), 'node_modules/\n');
+    mkdirSync(join(repo, 'node_modules/project-dependency'), { recursive: true });
+    writeFileSync(join(repo, 'node_modules/project-dependency/index.js'), 'module.exports = "project dependency";');
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({ project: { localPath: repo },
+      verificationCommand: `node -e "if(require('project-dependency') !== 'project dependency') process.exit(1)"` }));
+    rmSync(join(job.worktreePath, 'node_modules'), { recursive: true });
+    ctx.stub.messages[job.opencodeSessionId!] = [done('dependency-done', 'Done.', Date.now())];
+    await pool.query('UPDATE executor.jobs SET status = $2 WHERE id = $1', [job.id, status]);
+    const restarted = new JobEngine({ pool, config, client: ctx.client, git: execGit });
+    try {
+      await restarted.tick();
+      await restarted.drain();
+      const row = (await getJobByHubId(pool, job.hubJobId))!;
+      expect(row.status, row.failureReason ?? undefined).toBe('succeeded');
+      expect(ctx.stub.prompts).toHaveLength(1);
+      expect(existsSync(join(job.worktreePath, 'node_modules/project-dependency/index.js'))).toBe(true);
+    } finally {
+      await restarted.cancel(job.hubJobId);
+    }
+  });
+
   it('re-adopts a detached verifying cycle after a restart (fresh engine, same row)', async () => {
     const ctx = makeEngine();
     const job = await runningJob(ctx, spec({ jobId: 'job-verify-reclaim', verificationCommand: 'echo ran >> verifier-count; sleep 0.1' }));

@@ -840,6 +840,15 @@ export class JobEngine {
   }
 
   private async runCommand(job: JobRow) {
+    // Restart/manual verification can bypass launch entirely. Repair links
+    // at the execution boundary as well, before Node sees ancestor deps.
+    try {
+      const repoRoot = typeof job.metadata.repoRoot === 'string' && job.metadata.repoRoot
+        ? job.metadata.repoRoot : await this.resolveRepoRoot(job.spec);
+      linkNodeModules(repoRoot, job.worktreePath);
+    } catch (error) {
+      throw Object.assign(new Error(error instanceof Error ? error.message : String(error)), { code: 'session_setup_failed' });
+    }
     const controller = new AbortController();
     this.commands.set(job.id, controller);
     // Also observe cancellations issued by another executor process. Never
@@ -899,13 +908,6 @@ export class JobEngine {
   }
 
   private async launchOwned(job: JobRow, owner: SqlExecutor): Promise<void> {
-    if (job.opencodeSessionId) {
-      // Never duplicate a session/prompt after an ambiguous dispatch crash.
-      // Poll the persisted session; the independent deadline bounds a session
-      // whose prompt did not reach OpenCode before the process died.
-      await this.pool.query("UPDATE executor.jobs SET status = 'running' WHERE id = $1 AND status = 'created' AND attempt_count = $2", [job.id, job.attemptCount]);
-      return;
-    }
     const fromStatus = job.status;
     const isRetry = job.attemptCount > 1;
     const retryState = (job.metadata.retryState ?? null) as { code?: string; reason?: string; committed?: boolean } | null;
@@ -913,6 +915,15 @@ export class JobEngine {
     let repoRoot: string | null = null;
     try {
       const spec = job.spec;
+      if (job.opencodeSessionId) {
+        // Never duplicate a session/prompt after an ambiguous dispatch crash,
+        // but older persisted workspaces still need dependency repair.
+        repoRoot = typeof job.metadata.repoRoot === 'string' && job.metadata.repoRoot
+          ? job.metadata.repoRoot : await this.resolveRepoRoot(spec);
+        linkNodeModules(repoRoot, job.worktreePath);
+        await this.pool.query("UPDATE executor.jobs SET status = 'running' WHERE id = $1 AND status = 'created' AND attempt_count = $2", [job.id, job.attemptCount]);
+        return;
+      }
       repoRoot = await this.resolveRepoRoot(spec);
       const baseRef = await resolveBaseRef(this.git, repoRoot, this.config.baseRef);
       if (!await this.isCurrent(job)) return;
@@ -994,7 +1005,7 @@ export class JobEngine {
           jobId: job.id, eventType: EVENT.VERIFICATION_STARTED,
           summary: `Running \`${job.verificationCommand}\``, payload: { command: job.verificationCommand },
         });
-        const result = await this.runCommand({ ...job, worktreePath: prepared.path });
+        const result = await this.runCommand({ ...job, worktreePath: prepared.path, metadata: { ...job.metadata, repoRoot } });
         if (!await this.isCurrent(job)) return;
         const verifyMeta = JSON.stringify({
           verification: { attempts, exitCode: result.code, outputTail: result.output.slice(-4000) },
@@ -1689,6 +1700,10 @@ export class JobEngine {
           { interrupt: false });
       }
     } catch (error) {
+      if ((error as { code?: string }).code === 'session_setup_failed') {
+        await this.failAttempt(job, 'session_setup_failed', error instanceof Error ? error.message : String(error), { interrupt: false });
+        return;
+      }
       if (!(error instanceof AttemptInterrupted)) throw error;
     } finally {
       await owner.end();

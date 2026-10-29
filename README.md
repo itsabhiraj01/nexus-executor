@@ -516,6 +516,15 @@ parks are exempt).
 
 ## Operations
 
+- **Project dependencies**: provision `node_modules` in the resolved project
+  checkout, not in executor job worktrees. Launches (including persisted-session
+  recovery) and every verification command fill missing package links from
+  that checkout. Workspace packages point into the job's own checkout;
+  dependency containers remain real directories. Restart-reclaimed verification
+  also repairs links without creating another session or prompt. The executor
+  never installs dependencies in worktrees; projects without an installed
+  `node_modules` are left unchanged. Unsafe dependency containers fail setup
+  rather than running against ancestor executor dependencies.
 - **Health**: `GET /health` (`db` is `down` with 503 when Postgres is
   unreachable). Logs are pino JSON on stdout (`LOG_LEVEL`).
 - **Worker errors** are logged, never fatal; the poll loop always continues.
