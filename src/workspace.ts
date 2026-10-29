@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
-import { appendFile, mkdir, open, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
@@ -46,6 +46,8 @@ export interface GitExecOptions {
   cwd?: string | null;
   env?: Record<string, string | undefined>;
   timeoutMs?: number;
+  /** Exact stdin bytes (UTF-8, including NUL-delimited paths), never a shell. */
+  input?: string;
 }
 
 export interface GitResult {
@@ -61,12 +63,19 @@ const execFileAsync = promisify(execFile);
 /** Real git runner: `git <args>` on the host, never throws. */
 export const execGit: GitRunner = async (args, options) => {
   try {
-    const { stdout, stderr } = await execFileAsync('git', args as string[], {
+    const command = execFileAsync('git', args as string[], {
       cwd: options?.cwd ?? undefined,
       timeout: options?.timeoutMs ?? 120_000,
       maxBuffer: 16 * 1024 * 1024,
       env: mergedEnv(options?.env),
     });
+    if (options?.input !== undefined) {
+      // A git invocation rejecting its arguments may close stdin early;
+      // surface its exit status rather than an unhandled stream EPIPE.
+      command.child.stdin?.on('error', () => {});
+      command.child.stdin?.end(options.input);
+    }
+    const { stdout, stderr } = await command;
     return { code: 0, stdout, stderr };
   } catch (error) {
     const err = error as { code?: unknown; stdout?: string; stderr?: string; message?: string };
@@ -631,6 +640,9 @@ export async function materializeJobAttachments(
     if (existing && (!existing.isFile() || existing.isSymbolicLink())) {
       throw new WorkspaceError('Unsafe attachment destination (must not be a symlink)', name);
     }
+    if (existing && existing.nlink !== 1) {
+      throw new WorkspaceError('Unsafe attachment destination (hardlink / multiple links)', name);
+    }
     files.push({
       name,
       path: `${ATTACHMENTS_DIR}/${name}`,
@@ -640,13 +652,48 @@ export async function materializeJobAttachments(
   }
   // Preflight the entire batch and persist exclusion BEFORE sensitive writes.
   await excludeDirectory(runner, worktreePath, ATTACHMENTS_DIR);
+  const temporary = files.map(() => `${ATTACHMENTS_DIR}/.attachment-${randomUUID()}.tmp`);
+  // info/exclude is lower priority than .gitignore, and an existing exclude
+  // line can itself be followed by a negation. Verify every final AND staging
+  // path, including on reuse, rather than trusting that an exclude was added.
+  await verifyAttachmentsIgnored(runner, worktreePath, [...files.map((file) => file.path), ...temporary]);
   await mkdir(dir, { recursive: true });
   for (const [index, attachment] of attachments.entries()) {
-    const handle = await open(join(dir, files[index]!.name), constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
-    try { await handle.writeFile(attachment.data); }
-    finally { await handle.close(); }
+    const staging = join(worktreePath, temporary[index]!);
+    // Never open/truncate a pre-existing destination inode. An exclusive new
+    // inode followed by same-directory rename cannot overwrite the contents of
+    // an outside hardlink, even if that link appeared after batch preflight.
+    const handle = await open(staging, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      try { await handle.writeFile(attachment.data); }
+      finally { await handle.close(); }
+      await rename(staging, join(dir, files[index]!.name));
+    } finally {
+      await unlink(staging).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; });
+    }
   }
   return { dir: ATTACHMENTS_DIR, files };
+}
+
+/** Verbose NUL records distinguish positive matches from explicit negations;
+ * exit 0 alone only proves that SOME path matched, not that all are ignored. */
+async function verifyAttachmentsIgnored(runner: GitRunner, worktreePath: string, paths: readonly string[]): Promise<void> {
+  const result = await runner(['check-ignore', '--verbose', '--non-matching', '-z', '--stdin'], {
+    cwd: worktreePath, input: `${paths.join('\0')}\0`,
+  });
+  if (result.code !== 0 && result.code !== 1) {
+    throw new WorkspaceError('Could not verify attachment git exclusions', result.stderr.trim() || 'git failed');
+  }
+  const records = result.stdout.split('\0');
+  if (records.pop() !== '' || records.length !== paths.length * 4) {
+    throw new WorkspaceError('Could not verify attachment git exclusions', 'incomplete git check-ignore response');
+  }
+  for (const [index, path] of paths.entries()) {
+    const [source, , pattern, matched] = records.slice(index * 4, index * 4 + 4);
+    if (matched !== path || !source || !pattern || pattern.startsWith('!')) {
+      throw new WorkspaceError('Attachment path is not git-ignored', path);
+    }
+  }
 }
 
 /**

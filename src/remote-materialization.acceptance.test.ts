@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { appendFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import Fastify from 'fastify';
 import type { Pool } from 'pg';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -271,6 +271,87 @@ describe.each<Transport>(['direct', 'gateway'])('%s engine materialization accep
       expect(job.errorCode).toBe('workspace_setup_failed');
       expect(job.failureReason).toMatch(/unsafe|symlink/i);
       expect(existsSync(join(path, 'builder-input/diagram.png'))).toBe(false);
+      expect(f.stub.sessions).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it('rejects a second attachment hardlinked to a tracked file before either attachment is written', async () => {
+    const f = await fixture(transport);
+    try {
+      writeFileSync(join(f.repo, 'secret.txt'), 'tracked secret fixture');
+      await execGit(['add', '-A'], { cwd: f.repo });
+      await execGit(['commit', '-m', 'tracked hardlink victim'], { cwd: f.repo, env: TEST_AUTHOR });
+      const path = await f.prepared();
+      mkdirSync(join(path, 'builder-input'));
+      const secret = join(path, 'secret.txt');
+      const destination = join(path, 'builder-input/diagram-2.png');
+      linkSync(secret, destination);
+      const before = statSync(secret);
+      const job = await f.launch();
+      expect(readFileSync(secret, 'utf8')).toBe('tracked secret fixture');
+      expect(readFileSync(destination, 'utf8')).toBe('tracked secret fixture');
+      const after = statSync(secret);
+      expect({ dev: after.dev, ino: after.ino, nlink: after.nlink }).toEqual({ dev: before.dev, ino: before.ino, nlink: before.nlink });
+      expect(existsSync(join(path, 'builder-input/diagram.png'))).toBe(false);
+      expect(job.status).toBe('failed');
+      expect(job.errorCode).toBe('workspace_setup_failed');
+      expect(job.failureReason).toMatch(/hardlink|multiple links/i);
+      expect(f.stub.sessions).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it('never truncates a tracked inode when a hardlink appears after destination preflight', async () => {
+    let path = '';
+    let inserted = false;
+    const git: GitRunner = async (args, options) => {
+      if (!inserted && args.join(' ') === 'rev-parse --git-path info/exclude') {
+        inserted = true;
+        linkSync(join(path, 'secret.txt'), join(path, 'builder-input/diagram-2.png'));
+      }
+      return execGit(args, options);
+    };
+    const f = await fixture(transport, git);
+    try {
+      writeFileSync(join(f.repo, 'secret.txt'), 'tracked race fixture');
+      await execGit(['add', '-A'], { cwd: f.repo });
+      await execGit(['commit', '-m', 'tracked race victim'], { cwd: f.repo, env: TEST_AUTHOR });
+      path = await f.prepared();
+      mkdirSync(join(path, 'builder-input'));
+      const before = statSync(join(path, 'secret.txt'));
+      const job = await f.launch();
+      expect(inserted).toBe(true);
+      expect(readFileSync(join(path, 'secret.txt'), 'utf8')).toBe('tracked race fixture');
+      expect(statSync(join(path, 'secret.txt')).ino).toBe(before.ino);
+      expect(job.status, job.failureReason ?? undefined).toBe('running');
+      expect(readFileSync(join(path, 'builder-input/diagram-2.png'))).toEqual(png);
+      expect(statSync(join(path, 'builder-input/diagram-2.png')).ino).not.toBe(before.ino);
+    } finally { await f.close(); }
+  });
+
+  it.each(['gitignore-new-exclude', 'gitignore-existing-exclude', 'existing-exclude-negation', 'partial-gitignore', 'staging-only-negation'])('fails the whole batch when %s overrides attachment exclusion', async (mode) => {
+    const f = await fixture(transport);
+    try {
+      const negations = '!builder-input/\n!builder-input/**\n';
+      if (mode !== 'existing-exclude-negation') {
+        const patterns = mode === 'partial-gitignore' ? '!builder-input/\nbuilder-input/*\n!builder-input/diagram-2.png\n'
+          : mode === 'staging-only-negation' ? '!builder-input/\nbuilder-input/*\n!builder-input/.attachment-*\n' : negations;
+        writeFileSync(join(f.repo, '.gitignore'), patterns);
+        await execGit(['add', '.gitignore'], { cwd: f.repo });
+        await execGit(['commit', '-m', 'attachment exclusion override'], { cwd: f.repo, env: TEST_AUTHOR });
+      }
+      const path = await f.prepared();
+      if (mode !== 'gitignore-new-exclude') {
+        const out = await execGit(['rev-parse', '--git-path', 'info/exclude'], { cwd: path });
+        expect(out.code).toBe(0);
+        appendFileSync(resolve(path, out.stdout.trim()), `\nbuilder-input/\n${mode === 'existing-exclude-negation' ? negations : ''}`);
+      }
+      const job = await f.launch();
+      expect(existsSync(join(path, 'builder-input/diagram.png'))).toBe(false);
+      expect(existsSync(join(path, 'builder-input/diagram-2.png'))).toBe(false);
+      if (existsSync(join(path, 'builder-input'))) expect(readdirSync(join(path, 'builder-input'))).toEqual([]);
+      expect(job.status).toBe('failed');
+      expect(job.errorCode).toBe('workspace_setup_failed');
+      expect(job.failureReason).toMatch(/not.*git.ignored/i);
       expect(f.stub.sessions).toEqual([]);
     } finally { await f.close(); }
   });
