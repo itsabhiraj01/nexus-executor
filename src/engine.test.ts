@@ -42,6 +42,22 @@ it('keeps pending permission waits durable across restart, messages and deadline
   await restarted.cancel(job.hubJobId);
 });
 
+it('does not hide a lost workspace behind a manual permission wait', async () => {
+  const { engine,stub } = makeEngine();
+  const { job } = await engine.createJob(spec({ manualApprovals:true }));
+  stub.permissionRequests[job.opencodeSessionId!] = [{ id:'missing-workspace',action:'shell',resources:['git status'] }];
+  await engine.pollJob(job);
+  await execGit(['worktree','remove','--force',job.worktreePath],{ cwd:repoRoot });
+  await engine.pollJob((await getJobByHubId(pool,job.hubJobId))!);
+  const lost = (await getJobByHubId(pool,job.hubJobId))!;
+  expect(lost.status).toBe('failed');
+  expect(lost.errorCode).toBe('workspace_missing');
+  expect(existsSync(job.worktreePath)).toBe(false);
+  expect(stub.permissionReplies).toEqual([]);
+  expect(stub.prompts).toHaveLength(1);
+  expect((await pool.query('SELECT state FROM executor.manual_approvals WHERE job_id=$1',[job.id])).rows[0].state).toBe('expired');
+});
+
 it('persists initial prompt-tier policy and applies it before first and replacement prompts', async () => {
   const { engine, client, stub } = makeEngine({ retryMaxAttempts: 2, retryDelayMinutes: 0 });
   const policy = { revision: 'initial', generation: 1, rules: [{ action: '*', resource: '*', effect: 'deny' as const }] };

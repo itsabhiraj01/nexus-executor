@@ -1264,6 +1264,12 @@ export class JobEngine {
     const refreshed = await getJobByHubId(this.pool,job.hubJobId);
     if (refreshed) job = refreshed;
     if (waiting) {
+      // Approval waiting suspends clocks, not the existing recovery verdict
+      // for a vanished workspace. Never keep a dead tool looking resumable.
+      if (job.worktreePath && !existsSync(job.worktreePath)) {
+        await this.failMissingWorkspace(job);
+        return;
+      }
       if (!wasWaiting) await appendJobEvent(this.pool,{ jobId:job.id,eventType:'PERMISSION_REQUESTED',summary:'Waiting for the run owner to decide a tool permission.',payload:{ attempt:job.attemptCount,sessionId:job.opencodeSessionId } });
       return;
     }
