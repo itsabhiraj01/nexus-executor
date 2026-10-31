@@ -36,6 +36,22 @@ One-way trust:
   to the repo's git exclude **before any file lands** — user files can never
   be committed, merged, or deployed.
 
+## Pipeline branch handoff
+
+Each stage attaches the existing pipeline branch in a fresh worktree. A terminal
+executor-owned predecessor (succeeded, failed or cancelled) can still contain
+edits, for example when cancellation interrupted an agent before its turn-end
+checkpoint. Handoff acquires the predecessor's operation lock, confirms its
+OpenCode session stopped, and checkpoints those edits on the same branch before
+detaching the old worktree. A `WORKTREE_HANDOFF_CHECKPOINTED` event records the
+commit and successor job. Git-excluded attachments and runtime files stay private.
+
+Active stages, an in-flight operation, dirty stages waiting for input, external
+worktrees, unresolved conflicts, unreachable OpenCode and failed commits still
+block handoff with an actionable reason. No reset, deletion or forced checkout is
+used. Retry the affected pipeline stage after correcting a blocking condition;
+do not delete its predecessor's files to make the branch appear clean.
+
 ## Prerequisites
 
 - **Node.js ≥ 22** and **git** on the executor machine.

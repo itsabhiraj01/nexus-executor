@@ -1107,6 +1107,122 @@ describe('pipeline stages — baseBranch (spec §4)', () => {
     expect(row.failureReason).toContain('rerun from an earlier pipeline stage');
     void job;
   });
+
+  it.each(['cancelled', 'failed', 'succeeded'])('checkpoints a %s predecessor without losing staged, unstaged or untracked work at handoff', async (status) => {
+    const ctx = makeEngine();
+    const first = await runningJob(ctx, spec({ attachments: [
+      { name: 'private.md', mimeType: 'text/markdown', dataBase64: Buffer.from('private attachment').toString('base64') },
+    ] }));
+    writeFileSync(join(first.worktreePath, 'README.md'), 'preserved cancelled edit\n');
+    writeFileSync(join(first.worktreePath, 'new-source.ts'), 'export const preserved = true;\n');
+    await execGit(['add', 'README.md'], { cwd: first.worktreePath });
+    writeFileSync(join(first.worktreePath, 'README.md'), 'preserved final edit\n');
+    await ctx.engine.cancel(first.hubJobId);
+    await pool.query('UPDATE executor.jobs SET status=$2 WHERE id=$1', [first.id, status]);
+    const second = await runningJob(ctx, spec({ baseBranch: first.branch }));
+    expect(readFileSync(join(second.worktreePath, 'README.md'), 'utf8')).toBe('preserved final edit\n');
+    expect(readFileSync(join(second.worktreePath, 'new-source.ts'), 'utf8')).toContain('preserved = true');
+    expect((await execGit(['status', '--porcelain'], { cwd: first.worktreePath })).stdout.trim()).toBe('');
+    expect((await execGit(['branch', '--show-current'], { cwd: first.worktreePath })).stdout.trim()).toBe('');
+    expect((await getJobByHubId(pool, first.hubJobId))!.metadata.supersededBy).toBe(second.id);
+    expect(second.metadata.baseSha).toBe((await execGit(['rev-parse', 'HEAD'], { cwd: second.worktreePath })).stdout.trim());
+    expect((await execGit(['ls-files'], { cwd: second.worktreePath })).stdout).not.toContain('builder-input');
+    expect(readFileSync(join(first.worktreePath, 'builder-input/private.md'), 'utf8')).toBe('private attachment');
+    expect((await eventTypes(pool, first.id)).filter(type => type === 'WORKTREE_HANDOFF_CHECKPOINTED')).toHaveLength(1);
+    await ctx.engine.cancel(second.hubJobId);
+  });
+
+  it('never checkpoints or detaches an active predecessor', async () => {
+    const ctx = makeEngine();
+    const first = await runningJob(ctx, spec());
+    writeFileSync(join(first.worktreePath, 'README.md'), 'active edits\n');
+    const before = (await execGit(['rev-parse', 'HEAD'], { cwd: first.worktreePath })).stdout;
+    const { job: second } = await ctx.engine.createJob(spec({ baseBranch: first.branch }));
+    expect(second.status).toBe('failed');
+    expect(second.errorCode).toBe('workspace_setup_failed');
+    expect((await execGit(['rev-parse', 'HEAD'], { cwd: first.worktreePath })).stdout).toBe(before);
+    expect((await execGit(['branch', '--show-current'], { cwd: first.worktreePath })).stdout.trim()).toBe(first.branch);
+    expect(readFileSync(join(first.worktreePath, 'README.md'), 'utf8')).toBe('active edits\n');
+    await ctx.engine.cancel(first.hubJobId);
+  });
+
+  it('refuses handoff when a terminal predecessor is still owned by an in-flight operation', async () => {
+    const ctx = makeEngine();
+    const first = await runningJob(ctx, spec());
+    await ctx.engine.cancel(first.hubJobId);
+    const owner = new Client(pool.options);
+    await owner.connect();
+    try {
+      await owner.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [first.id]);
+      const { job: second } = await ctx.engine.createJob(spec({ baseBranch: first.branch }));
+      expect(second.status).toBe('failed');
+      expect(second.failureReason).toMatch(/active|operation|busy/i);
+      expect((await execGit(['branch', '--show-current'], { cwd: first.worktreePath })).stdout.trim()).toBe(first.branch);
+    } finally { await owner.end(); }
+  });
+
+  it('preserves a dirty predecessor when OpenCode cannot confirm its session stopped', async () => {
+    const ctx = makeEngine();
+    const first = await runningJob(ctx, spec());
+    await ctx.engine.cancel(first.hubJobId);
+    writeFileSync(join(first.worktreePath, 'README.md'), 'must remain here\n');
+    vi.spyOn(ctx.client, 'interrupt').mockRejectedValue(new Error('executor cannot reach OpenCode'));
+    const { job: second } = await ctx.engine.createJob(spec({ baseBranch: first.branch }));
+    expect(second.status).toBe('failed');
+    expect(second.failureReason).toContain('Cannot safely checkpoint');
+    expect((await execGit(['branch', '--show-current'], { cwd: first.worktreePath })).stdout.trim()).toBe(first.branch);
+    expect(readFileSync(join(first.worktreePath, 'README.md'), 'utf8')).toBe('must remain here\n');
+    expect((await getJobByHubId(pool, first.hubJobId))!.metadata.supersededBy).toBeUndefined();
+  });
+
+  it('preserves unresolved merge conflicts and reports why the handoff checkpoint failed', async () => {
+    const ctx = makeEngine();
+    const first = await runningJob(ctx, spec());
+    await ctx.engine.cancel(first.hubJobId);
+    const blob = (await execGit(['rev-parse', 'HEAD:README.md'], { cwd: first.worktreePath })).stdout.trim();
+    await execGit(['update-index', '--cacheinfo', `100644,${blob},conflicted.txt`], { cwd: first.worktreePath });
+    // A real index conflict, not conflict-marker heuristics.
+    await execGit(['update-index', '--index-info'], { cwd: first.worktreePath, input: `0 ${'0'.repeat(40)}\tconflicted.txt\n100644 ${blob} 1\tconflicted.txt\n100644 ${blob} 2\tconflicted.txt\n` });
+    const { job: second } = await ctx.engine.createJob(spec({ baseBranch: first.branch }));
+    expect(second.status).toBe('failed');
+    expect(second.failureReason).toContain('Cannot safely checkpoint');
+    expect(await listUnmergedPaths(execGit, first.worktreePath)).toContain('conflicted.txt');
+    expect((await execGit(['branch', '--show-current'], { cwd: first.worktreePath })).stdout.trim()).toBe(first.branch);
+  });
+
+  it('can checkpoint a terminal stage when its old OpenCode session is already gone', async () => {
+    const ctx = makeEngine();
+    const first = await runningJob(ctx, spec());
+    await ctx.engine.cancel(first.hubJobId);
+    writeFileSync(join(first.worktreePath, 'README.md'), 'session vanished, work preserved\n');
+    vi.spyOn(ctx.client, 'interrupt').mockRejectedValue(new OpenCodeError('Session not found', 404));
+    const second = await runningJob(ctx, spec({ baseBranch: first.branch }));
+    expect(readFileSync(join(second.worktreePath, 'README.md'), 'utf8')).toContain('work preserved');
+    await ctx.engine.cancel(second.hubJobId);
+  });
+
+  it('leaves source edits and private attachments intact when the handoff commit fails', async () => {
+    const stubbed = makeStubClient();
+    const engine = new LaunchedJobEngine({ pool, config, client: stubbed.client,
+      git: async (args, options) => args[0] === 'commit' && args.includes('executor: checkpoint before stage handoff')
+        ? { code: 1, stdout: '', stderr: 'commit hook refused' } : execGit(args, options),
+    });
+    const { job: first } = await engine.createJob(spec({ attachments: [
+      { name: 'private.md', mimeType: 'text/markdown', dataBase64: Buffer.from('private').toString('base64') },
+    ] }));
+    await engine.cancel(first.hubJobId);
+    const before = (await execGit(['rev-parse', 'HEAD'], { cwd: first.worktreePath })).stdout;
+    writeFileSync(join(first.worktreePath, 'README.md'), 'do not discard\n');
+    const { job: second } = await engine.createJob(spec({ baseBranch: first.branch }));
+    expect(second.status).toBe('failed');
+    expect(second.failureReason).toContain('commit hook refused');
+    expect((await execGit(['rev-parse', 'HEAD'], { cwd: first.worktreePath })).stdout).toBe(before);
+    expect((await execGit(['branch', '--show-current'], { cwd: first.worktreePath })).stdout.trim()).toBe(first.branch);
+    expect(readFileSync(join(first.worktreePath, 'README.md'), 'utf8')).toBe('do not discard\n');
+    expect(readFileSync(join(first.worktreePath, 'builder-input/private.md'), 'utf8')).toBe('private');
+    expect((await execGit(['diff', '--cached', '--name-only'], { cwd: first.worktreePath })).stdout).not.toContain('builder-input');
+    expect((await getJobByHubId(pool, first.hubJobId))!.metadata.supersededBy).toBeUndefined();
+  });
 });
 
 describe('pipeline stages — parkOnTurnEnd (spec §4)', () => {

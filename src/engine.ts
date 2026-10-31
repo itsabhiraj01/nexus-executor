@@ -285,6 +285,7 @@ export const EVENT = {
   EXECUTION_STATUS_CHANGED: 'EXECUTION_STATUS_CHANGED',
   WORKTREE_CREATED: 'WORKTREE_CREATED',
   WORKTREE_CHECKPOINT_FAILED: 'WORKTREE_CHECKPOINT_FAILED',
+  WORKTREE_HANDOFF_CHECKPOINTED: 'WORKTREE_HANDOFF_CHECKPOINTED',
   WORKTREE_MERGED: 'WORKTREE_MERGED',
   WORKTREE_MERGE_FAILED: 'WORKTREE_MERGE_FAILED',
   WORKTREE_DEPLOYED: 'WORKTREE_DEPLOYED',
@@ -425,7 +426,8 @@ export async function appendJobEvent(db: SqlExecutor, input: {
         input.messageId ?? null,
         [EVENT.EXECUTION_SUCCEEDED, EVENT.EXECUTION_FAILED, EVENT.EXECUTION_CANCELLED,
           EVENT.WORKTREE_MERGED, EVENT.WORKTREE_MERGE_FAILED, EVENT.WORKTREE_DEPLOYED,
-          EVENT.WORKTREE_DEPLOY_FAILED, EVENT.WORKSPACE_CLEANED, EVENT.WORKSPACE_RETENTION_VIOLATION],
+          EVENT.WORKTREE_DEPLOY_FAILED, EVENT.WORKSPACE_CLEANED, EVENT.WORKSPACE_RETENTION_VIOLATION,
+          EVENT.WORKTREE_HANDOFF_CHECKPOINTED],
       ]);
       // Stale lifecycle work must not append after the terminal EOF marker.
       return Number(inserted.rows[0]?.sequence_number ?? 0);
@@ -703,9 +705,10 @@ export class JobEngine {
   }
 
   /** Attach an EXISTING stage branch in a fresh per-job location. A previous
-   * executor-owned, idle, clean worktree is retained detached. Missing branch
+   * executor-owned, idle worktree is retained detached. Terminal stages have
+   * their remaining changes checkpointed before release, never discarded. Missing branch
    * ⇒ workspace_setup_failed — a stage branch is sacred, never re-cut. */
-  private async attachNamedBranch(repoRoot: string, baseBranch: string, jobId: string): Promise<{ branch: string; path: string; baseSha: string }> {
+  private async attachNamedBranch(repoRoot: string, baseBranch: string, jobId: string, owner: SqlExecutor): Promise<{ branch: string; path: string; baseSha: string }> {
     const probe = await this.git(['rev-parse', '--verify', '--quiet', `${baseBranch}^{commit}`], { cwd: repoRoot });
     if (probe.code !== 0 || !probe.stdout.trim()) {
       throw Object.assign(
@@ -729,13 +732,48 @@ export class JobEngine {
           const path = /^worktree (.+)$/m.exec(block)?.[1];
           const branch = /^branch refs\/heads\/(.+)$/m.exec(block)?.[1];
           if (branch === baseBranch && path && existsSync(path)) {
-            const known = await this.pool.query('SELECT id FROM executor.jobs WHERE worktree_path = $1', [path]);
+            const known = await this.pool.query<{ id: string }>('SELECT id FROM executor.jobs WHERE worktree_path = $1 AND id <> $2 ORDER BY id', [path, jobId]);
             if (!known.rowCount) throw Object.assign(new Error('The branch is checked out outside an executor-owned stage.'), { code: 'workspace_setup_failed' });
+            // Share ownership with polling, launch, continuations and verification.
+            // A cancelled verification may still be exiting; terminal status alone
+            // does not prove that no process is writing to the worktree.
+            for (const previous of known.rows) {
+              const lock = await owner.query<{ locked: boolean }>('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [previous.id]);
+              if (!lock.rows[0]?.locked) throw Object.assign(new Error('The previous stage still has an active operation; retry after it finishes.'), { code: 'workspace_setup_failed' });
+            }
             const active = await this.pool.query(`SELECT id FROM executor.jobs WHERE worktree_path = $1
-              AND status IN ('created', 'running', 'verifying') AND id <> $2`, [path, jobId]);
-            const dirty = await this.git(['status', '--porcelain'], { cwd: path });
-            if (active.rowCount || dirty.code !== 0 || dirty.stdout.trim()) {
-              throw Object.assign(new Error('The previous stage is active or has uncommitted changes; finish it before handing off the branch.'), { code: 'workspace_setup_failed' });
+              AND status IN ('queued', 'created', 'running', 'verifying') AND id <> $2`, [path, jobId]);
+            if (active.rowCount) {
+              throw Object.assign(new Error('The previous stage is active; finish it before handing off the branch.'), { code: 'workspace_setup_failed' });
+            }
+            let dirty = await this.git(['status', '--porcelain'], { cwd: path });
+            if (dirty.code === 0 && dirty.stdout.trim()) {
+              const previous = (await this.pool.query<{ id: string; status: JobStatus; opencode_session_id: string | null }>(
+                'SELECT id, status, opencode_session_id FROM executor.jobs WHERE worktree_path = $1 ORDER BY created_at DESC LIMIT 1', [path])).rows[0]!;
+              if (!TERMINAL_STATUSES.includes(previous.status)) {
+                throw Object.assign(new Error('The previous stage has uncommitted changes and is waiting for input; finish it before handing off the branch.'), { code: 'workspace_setup_failed' });
+              }
+              try {
+                // Cancellation interrupts best-effort. Require a successful stop
+                // here before snapshotting; a vanished session (404) is also safe.
+                if (previous.opencode_session_id) {
+                  if (!this.client) throw new Error('OpenCode is unavailable');
+                  try { await this.client.interrupt(previous.opencode_session_id); }
+                  catch (error) { if (!(error instanceof OpenCodeError && error.status === 404)) throw error; }
+                }
+                const checkpoint = await commitJobChanges(this.git, { path, message: 'executor: checkpoint before stage handoff' });
+                await appendJobEvent(this.pool, {
+                  jobId: previous.id, eventType: EVENT.WORKTREE_HANDOFF_CHECKPOINTED,
+                  summary: 'Preserved remaining stage changes before handing off the branch.',
+                  payload: { nextJobId: jobId, branch: baseBranch, sha: checkpoint.sha },
+                });
+              } catch (error) {
+                throw Object.assign(new Error(`Cannot safely checkpoint the previous stage before handoff: ${error instanceof Error ? error.message : String(error)}`), { code: 'workspace_setup_failed' });
+              }
+              dirty = await this.git(['status', '--porcelain'], { cwd: path });
+            }
+            if (dirty.code !== 0 || dirty.stdout.trim()) {
+              throw Object.assign(new Error('The previous stage could not be made clean without discarding changes; inspect its worktree before handoff.'), { code: 'workspace_setup_failed' });
             }
             const detached = await this.git(['checkout', '--detach'], { cwd: path });
             if (detached.code !== 0) throw new Error(detached.stderr);
@@ -743,7 +781,9 @@ export class JobEngine {
             if (fresh.code !== 0) throw new Error(fresh.stderr);
             await this.pool.query(`UPDATE executor.jobs SET metadata = metadata || $2::jsonb
               WHERE worktree_path = $1 AND id <> $3`, [path, JSON.stringify({ supersededBy: jobId }), jobId]);
-            return { branch: baseBranch, path: preferred, baseSha: probe.stdout.trim() };
+            const tip = await this.git(['rev-parse', '--verify', `${baseBranch}^{commit}`], { cwd: repoRoot });
+            if (tip.code !== 0) throw new Error(tip.stderr);
+            return { branch: baseBranch, path: preferred, baseSha: tip.stdout.trim() };
           }
         }
       }
@@ -974,7 +1014,7 @@ export class JobEngine {
         prepared = spec.baseBranch
           // Pipeline stage: attach to the stage's named branch (spec §4) —
           // a branch is sacred, never silently re-cut.
-          ? await this.attachNamedBranch(repoRoot, spec.baseBranch, job.id)
+          ? await this.attachNamedBranch(repoRoot, spec.baseBranch, job.id, owner)
           : await prepareWorktree(
             this.git,
             { repoRoot, worktreeRoot: join(this.config.workspaceRoot, 'worktrees') },
