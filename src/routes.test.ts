@@ -13,7 +13,8 @@ import { registerRoutes } from './routes.js';
 import { validateJobBody, handleGatewayOperation, type RouteDeps } from './ops.js';
 import type { TerminalRegistry } from './terminals.js';
 import { createUpgrader, type UpgradeSpawn } from './upgrade.js';
-import { testConfig, wipeJobs } from './testkit.js';
+import { testConfig, wipeJobs, makeStubClient } from './testkit.js';
+import { reconcileManualApprovals } from './manual-approvals.js';
 
 /**
  * Route + auth contract tests against a REAL Fastify app (inject — no
@@ -166,6 +167,36 @@ describe('paired executor', () => {
     await writeAuthConfig(pool, {
       tokenHash: hashToken(HUB_TOKEN), hubUrl: 'http://hub.local', name: 'hub', pairedAt: new Date().toISOString(),
     });
+  });
+
+  it('lists durable pending requests and delivers once/reject identically over both authenticated transports', async () => {
+    const { client,state } = makeStubClient();
+    deps.client = client;
+    try {
+      for (const transport of ['direct','gateway']) {
+        const session = await client.createSession({ title:transport,directory:root });
+        await client.setSessionPermissions(session.id,[{ action:'bash',resource:'*',effect:'ask' }]);
+        const hubJobId = `manual-${transport}`;
+        const job = (await pool.query(`INSERT INTO executor.jobs (hub_job_id,spec,status,attempt_count,opencode_session_id,branch,worktree_path)
+          VALUES ($1,'{"manualApprovals":true}','running',1,$2,'job-test','/tmp/opencode/test') RETURNING id`,[hubJobId,session.id])).rows[0];
+        state.permissionRequests[session.id] = [{ id:'request',action:'bash',resources:['git status'] },...(transport === 'gateway' ? [{ id:'sibling',action:'bash',resources:['pwd'] }] : [])];
+        await reconcileManualApprovals(pool,client,job.id);
+        const snapshot = await app.inject({ method:'GET',url:`/api/v1/jobs/${hubJobId}`,headers:auth() });
+        expect(snapshot.json().manualApprovals.waiting).toBe(true);
+        const payload = { decisionId:`d-${transport}`,attempt:1,sessionId:session.id,requestId:'request',decision:transport === 'direct' ? 'once' : 'reject' };
+        expect((await app.inject({ method:'POST',url:`/api/v1/jobs/${hubJobId}/permission-decision`,payload })).statusCode).toBe(401);
+        const delivered = transport === 'direct'
+          ? (await app.inject({ method:'POST',url:`/api/v1/jobs/${hubJobId}/permission-decision`,headers:auth(),payload })).json()
+          : (await handleGatewayOperation(deps,'job.permissionDecision',{ jobId:hubJobId,...payload }) as { result:unknown }).result;
+        expect(delivered).toEqual({ decisionId:payload.decisionId,outcome:'delivered' });
+        const replay = await handleGatewayOperation(deps,'job.permissionDecision',{ jobId:hubJobId,...payload });
+        expect(replay).toMatchObject({ ok:true,result:delivered });
+        const after = await app.inject({ method:'GET',url:`/api/v1/jobs/${hubJobId}`,headers:auth() });
+        expect(after.json().manualApprovals.waiting).toBe(false);
+        if (transport === 'gateway') expect(after.json().manualApprovals.resolved).toContainEqual({ id:'sibling',outcome:'expired' });
+      }
+      expect(state.permissionReplies).toHaveLength(2);
+    } finally { deps.client = null; }
   });
 
   it('routes initial and updated policies identically over authenticated direct and gateway transports', async () => {

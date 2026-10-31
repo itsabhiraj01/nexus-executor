@@ -5,6 +5,7 @@ import { Client, type Pool } from 'pg';
 import type { ExecutorConfig } from './config.js';
 import type { SqlExecutor } from './db.js';
 import { applyJobPermissions, parsePermissionPolicy, type RemotePermissionPolicy } from './permissions.js';
+import { activeElapsed, reconcileManualApprovals } from './manual-approvals.js';
 import {
   OpenCodeError,
   agentErrorSummary,
@@ -26,6 +27,7 @@ import {
   type OpenCodeMessage,
   type OpenCodeMessageError,
   type OpenCodePermissionRequest,
+  type OpenCodeToolPart,
 } from './opencode.js';
 import {
   isModelPolicyDenial, registerModelPolicy, ModelPolicyError, type ExecutorModelPolicy,
@@ -113,6 +115,7 @@ export interface JobRetrySpec {
 
 /** The job spec exactly as `POST /api/v1/jobs` received it. */
 export interface JobSpecInput {
+  manualApprovals?: boolean;
   permissionPolicy?: RemotePermissionPolicy;
   jobId: string;
   title?: string;
@@ -832,10 +835,13 @@ export class JobEngine {
       this.track((async () => {
         const current = await getJobByHubId(this.pool, job.hubJobId);
         if (current && current.attemptCount === job.attemptCount && ['created', 'running', 'verifying'].includes(current.status)) {
+          if (await reconcileManualApprovals(this.pool,this.client,current.id)) return;
+          const refreshed = (await getJobByHubId(this.pool,job.hubJobId))!;
+          if (activeElapsed(refreshed,this.now()) < this.config.jobTimeoutMs) { this.armDeadline(refreshed); return; }
           await this.failJob(job.id, 'execution_timeout', 'Job timed out: exceeded its execution deadline.', { interrupt: true, expectedAttempt: job.attemptCount });
         }
       })());
-    }, Math.max(1, this.config.jobTimeoutMs - (this.now() - job.startedAt.getTime())));
+    }, Math.max(1, this.config.jobTimeoutMs - activeElapsed(job,this.now())));
     timer.unref();
     this.deadlines.set(job.id, { attempt: job.attemptCount, timer });
   }
@@ -1212,6 +1218,9 @@ export class JobEngine {
         [String(this.config.jobTimeoutMs)]);
       for (const raw of stuck) {
         const job = rowToJob(raw);
+        if (await reconcileManualApprovals(this.pool,this.client,job.id)) continue;
+        const refreshed = (await getJobByHubId(this.pool,job.hubJobId))!;
+        if (activeElapsed(refreshed,this.now()) < this.config.jobTimeoutMs) continue;
         await this.interruptSession(job);
         await this.failAttempt(job, 'execution_timeout',
           `Job timed out after ${Math.round(this.config.jobTimeoutMs / 60_000)} minutes.`);
@@ -1232,8 +1241,18 @@ export class JobEngine {
 
   private async pollOwned(job: JobRow): Promise<void> {
     await applyJobPermissions(this.pool, this.client, job.hubJobId);
+    // Persist waits BEFORE deadlines, message folding, plan gates or watchdogs.
+    const wasWaiting = typeof job.metadata.permissionWaitStartedAt === 'number';
+    const waiting = await reconcileManualApprovals(this.pool,this.client,job.id);
+    const refreshed = await getJobByHubId(this.pool,job.hubJobId);
+    if (refreshed) job = refreshed;
+    if (waiting) {
+      if (!wasWaiting) await appendJobEvent(this.pool,{ jobId:job.id,eventType:'PERMISSION_REQUESTED',summary:'Waiting for the run owner to decide a tool permission.',payload:{ attempt:job.attemptCount,sessionId:job.opencodeSessionId } });
+      return;
+    }
+    this.armDeadline(job);
     if (job.status !== 'waiting_for_user' && job.startedAt && this.config.jobTimeoutMs > 0 &&
-        this.now() - job.startedAt.getTime() >= this.config.jobTimeoutMs) {
+        activeElapsed(job,this.now()) >= this.config.jobTimeoutMs) {
       await this.failAttempt(job, 'execution_timeout', 'Job timed out: exceeded its execution deadline.');
       return;
     }
@@ -1451,13 +1470,22 @@ export class JobEngine {
       // When something was rejected the tool state just changed under this
       // tick's message snapshot — judge health on the NEXT tick, never fail
       // the run on the stale view of a turn we just unstuck.
-      if (await this.rejectPendingPermissions(job) > 0) return;
-      const stalled = detectStall(messages, {
+      if (!job.spec.manualApprovals && await this.rejectPendingPermissions(job) > 0) return;
+      const resumedAt = Number(job.metadata.permissionResumedAt ?? 0);
+      const healthMessages = resumedAt > 0 ? messages.map(message => ({ ...message,
+        time:{ ...message.time,created:Math.max(message.time?.created ?? 0,resumedAt) },
+        content:message.content?.map(part => {
+          if (part.type !== 'tool') return part;
+          const tool = part as OpenCodeToolPart;
+          return { ...tool,time:{ ...tool.time,ran:Math.max(tool.time?.ran ?? message.time?.created ?? 0,resumedAt) } };
+        }),
+      })) : messages;
+      const stalled = detectStall(healthMessages, {
         now, toolStallMs: this.config.toolStallMs, silenceStallMs: this.config.silenceStallMs,
       });
       const progress = stalled
         ? { store: readToolFingerprints(meta), stalled: null }
-        : evaluateToolProgress(collectToolProgress(messages), readToolFingerprints(meta), {
+        : evaluateToolProgress(collectToolProgress(healthMessages), readToolFingerprints(meta), {
           now, toolProgressMs: this.config.toolProgressMs,
         });
       await this.mergeMetadata(job.id, { toolFingerprints: progress.store });
@@ -1467,7 +1495,7 @@ export class JobEngine {
         await this.failAttempt(job, 'agent_stalled', stallFailureReason(found.summary, interrupted), { interrupt: false });
         return;
       }
-      if (this.config.jobTimeoutMs > 0 && job.startedAt && now - job.startedAt.getTime() >= this.config.jobTimeoutMs) {
+      if (this.config.jobTimeoutMs > 0 && job.startedAt && activeElapsed(job,now) >= this.config.jobTimeoutMs) {
         await this.interruptSession(job);
         await this.failAttempt(job, 'execution_timeout',
           `Job timed out after ${Math.round(this.config.jobTimeoutMs / 60_000)} minutes.`, { interrupt: false });
@@ -1737,6 +1765,7 @@ export class JobEngine {
           AND ($5::int IS NULL OR attempt_count = $5) RETURNING *`,
       [jobId, status, summary, code, expectedAttempt ?? null]);
       const job = result.rows[0] ? rowToJob(result.rows[0]) : null;
+      if (job) await db.query(`UPDATE executor.manual_approvals SET state=$2,updated_at=now() WHERE job_id=$1 AND state IN ('pending','decision_recorded')`,[jobId,status === 'cancelled' ? 'cancelled' : 'expired']);
       if (job) await appendJobEvent(db, {
         jobId, eventType: status === 'succeeded' ? EVENT.EXECUTION_SUCCEEDED : status === 'failed' ? EVENT.EXECUTION_FAILED : EVENT.EXECUTION_CANCELLED,
         summary: summary || `Job ${status}.`,
@@ -1812,7 +1841,7 @@ export class JobEngine {
             WHERE id = $1 AND NOT status = ANY($7::text[]) AND attempt_count < max_attempts AND attempt_count = $8
             RETURNING *`, [
             jobId, nextAttempt, String(delayMinutes), code, reason.slice(0, 4000),
-            JSON.stringify({ retryState: { code, reason: reason.slice(0, 500), committed } }),
+            JSON.stringify({ retryState: { code, reason: reason.slice(0, 500), committed },permissionWaitStartedAt:null,permissionWaitMs:0,permissionResumedAt:0 }),
             TERMINAL_STATUSES,
             job.attemptCount,
           ]);
@@ -1911,6 +1940,7 @@ export class JobEngine {
     if (!job.opencodeSessionId || !this.client) {
       throw new EngineError(409, 'This job has no active OpenCode session.');
     }
+    if (await reconcileManualApprovals(this.pool,this.client,job.id)) throw new EngineError(409,'Waiting for permission; decide the original request instead of sending a resume prompt.');
     try {
       await this.promptCurrent(job, job.opencodeSessionId, text);
     } catch (error) {

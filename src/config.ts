@@ -120,6 +120,7 @@ export function executorCapabilities(config: Pick<ExecutorConfig, 'upgradeComman
     // session) — remote runs get the persona's skills + MCP like local ones.
     nativeAgents: true,
     livePermissions: true,
+    manualApprovals: true,
     jobSkills: true,
     ...(resolveUpgradeCommand(config) ? { selfUpgrade: true } : {}),
   };

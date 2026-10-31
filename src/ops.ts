@@ -2,6 +2,7 @@ import type { Pool } from 'pg';
 import { readAuthConfig } from './auth.js';
 import { EXECUTOR_VERSION, executorCapabilities, type ExecutorConfig } from './config.js';
 import { updateJobPermissions, parsePermissionPolicy, PermissionPolicyError } from './permissions.js';
+import { decidePermission, manualApprovalSnapshot } from './manual-approvals.js';
 import {
   EngineError,
   rowToJob,
@@ -301,6 +302,7 @@ export function validateJobBody(body: unknown): { spec?: JobSpecInput; error?: s
   }
 
   let permissionPolicy: JobSpecInput['permissionPolicy'];
+  if (input.manualApprovals !== undefined && typeof input.manualApprovals !== 'boolean') return { error:'manualApprovals must be boolean.' };
   if (input.permissionPolicy !== undefined) {
     try { permissionPolicy = parsePermissionPolicy(input.permissionPolicy); }
     catch (error) { return { error: error instanceof Error ? error.message : 'Invalid permission policy.' }; }
@@ -316,6 +318,7 @@ export function validateJobBody(body: unknown): { spec?: JobSpecInput; error?: s
       modelPolicy,
       agent,
       ...(permissionPolicy ? { permissionPolicy } : {}),
+      ...(input.manualApprovals === true ? { manualApprovals:true } : {}),
       attachments,
       retry,
       ...(baseBranch !== undefined ? { baseBranch } : {}),
@@ -457,6 +460,8 @@ export async function opShowJob(deps: RouteDeps, hubJobId: string): Promise<OpRe
     status: 200,
     body: {
       ...jobSummary(job),
+      // Capability-gated dispatch ensures only upgraded routes see this field.
+      ...(job.spec.manualApprovals ? { manualApprovals: await manualApprovalSnapshot(deps.pool,job.id) } : {}),
       branch: job.branch,
       worktreePath: job.worktreePath,
       opencodeSessionId: job.opencodeSessionId,
@@ -470,6 +475,14 @@ export async function opShowJob(deps: RouteDeps, hubJobId: string): Promise<OpRe
       eventCount: countRows[0]?.n ?? 0,
     },
   };
+}
+
+export async function opPermissionDecision(deps: RouteDeps, jobId: string, input: unknown): Promise<OpResult> {
+  try { return { status:200,body:await decidePermission(deps.pool,deps.client,jobId,input) }; }
+  catch (error) {
+    if (error instanceof PermissionPolicyError) return { status:error.status,body:{ error:error.message } };
+    throw error;
+  }
 }
 
 export async function opJobMessage(deps: RouteDeps, jobId: string, text: string): Promise<OpResult> {
@@ -898,6 +911,11 @@ export async function handleGatewayOperation(
         const jobId = textArg(body.jobId, 200);
         if (!jobId || Object.keys(body).some(key => !['jobId', 'policy'].includes(key))) return { ok: false, status: 400, error: 'Invalid job.permissions payload.' };
         return wrap(await opJobPermissions(deps, jobId, body.policy));
+      }
+      case 'job.permissionDecision': {
+        const { jobId,...decision } = body;
+        if (!textArg(jobId,200)) return { ok:false,status:400,error:'Invalid jobId.' };
+        return wrap(await opPermissionDecision(deps,jobId as string,decision));
       }
       default: {
         if ((ID_OPS as readonly string[]).includes(operation)) {
