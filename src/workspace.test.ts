@@ -7,12 +7,66 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { execGit, linkNodeModules, prepareWorktree } from './workspace.js';
 
-it('fresh worktrees resolve project Fastify before ancestor executor Fastify', async () => {
+it('links only leaves, remaps workspace packages, and repairs partial dependency trees without overwriting local packages', () => {
+  const root = mkdtempSync('/tmp/opencode/executor-links-');
+  const repo = join(root, 'repo');
+  const worktree = join(root, 'worktree');
+  const put = (file: string, text = '{}') => {
+    mkdirSync(join(file, '..'), { recursive: true });
+    writeFileSync(file, text);
+  };
+  try {
+    put(join(repo, 'node_modules/@vendor/package/index.js'), 'module.exports = "vendor";');
+    put(join(repo, 'node_modules/tool/bin.js'), 'tool');
+    mkdirSync(join(repo, 'node_modules/.bin'));
+    symlinkSync('../tool/bin.js', join(repo, 'node_modules/.bin/tool'));
+    for (const name of ['@nexus/local', '@other/local', 'unscoped']) {
+      put(join(repo, 'packages', name, 'index.js'), 'module.exports = "source";');
+      put(join(worktree, 'packages', name, 'index.js'), 'module.exports = "worktree";');
+      mkdirSync(join(repo, 'node_modules', name, '..'), { recursive: true });
+      const from = join(repo, 'packages', name);
+      const to = join(repo, 'node_modules', name);
+      symlinkSync(name === '@nexus/local' ? relative(dirname(to), from) : from, to);
+    }
+    put(join(worktree, 'node_modules/local-only/index.js'), 'local');
+    linkNodeModules(repo, worktree);
+    for (const container of ['', '@vendor', '@nexus', '@other', '.bin']) {
+      expect(lstatSync(join(worktree, 'node_modules', container)).isSymbolicLink()).toBe(false);
+    }
+    const require = createRequire(join(worktree, 'probe.cjs'));
+    for (const name of ['@nexus/local', '@other/local', 'unscoped']) expect(require(name)).toBe('worktree');
+    expect(realpathSync(join(worktree, 'node_modules/.bin/tool'))).toBe(join(repo, 'node_modules/tool/bin.js'));
+    // Simulate npm's rename/unlink at the leaf, not an install in either repo.
+    rmSync(join(worktree, 'node_modules/@vendor/package'));
+    expect(readFileSync(join(repo, 'node_modules/@vendor/package/index.js'), 'utf8')).toContain('vendor');
+    linkNodeModules(repo, worktree);
+    expect(require('@vendor/package')).toBe('vendor');
+    expect(readFileSync(join(worktree, 'node_modules/local-only/index.js'), 'utf8')).toBe('local');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('does not write through a pre-existing scope symlink', () => {
+  const root = mkdtempSync('/tmp/opencode/executor-scope-');
+  try {
+    const repo = join(root, 'repo');
+    const worktree = join(root, 'worktree');
+    mkdirSync(join(repo, 'node_modules/@vendor/package'), { recursive: true });
+    mkdirSync(join(worktree, 'node_modules'), { recursive: true });
+    symlinkSync(join(repo, 'node_modules/@vendor'), join(worktree, 'node_modules/@vendor'));
+    expect(() => linkNodeModules(repo, worktree)).toThrow('Dependency container must be a real directory');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('fresh worktrees resolve project dependencies before ancestor executor dependencies', async () => {
   const root = mkdtempSync('/tmp/opencode/executor-dependencies-');
   const repoRoot = join(root, 'project');
   const executor = join(root, 'executor');
   const put = (file: string, text: string) => {
-    mkdirSync(dirname(file), { recursive: true });
+    mkdirSync(join(file, '..'), { recursive: true });
     writeFileSync(file, text);
   };
   try {

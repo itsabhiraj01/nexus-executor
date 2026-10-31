@@ -320,7 +320,7 @@ describe('paired executor', () => {
     expect(list).toHaveLength(2);
     expect(list[0]).toMatchObject({ seq: 1, source: 'executor', type: 'EXECUTION_STATUS_CHANGED' });
     expect(list[1]).toMatchObject({ seq: 2, type: 'EXECUTION_CANCELLED' });
-    expect(list[0].payload).toEqual({});
+    expect(list[0].payload).toEqual({ status: 'queued', reason: 'opencode_unavailable' });
 
     const since = await app.inject({ method: 'GET', url: '/api/v1/jobs/job-events/events?sinceSeq=1', headers: auth() });
     expect(since.json().events).toHaveLength(1);

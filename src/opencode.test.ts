@@ -10,6 +10,7 @@ import {
   fallbackPrompt,
   isModelFallbackError,
   lastAssistant,
+  currentTurnResult,
   messageComplete,
   messageToEvents,
   normalizeModels,
@@ -22,6 +23,44 @@ import {
 function assistant(id: string, parts: OpenCodeMessage['content'], extra: Partial<OpenCodeMessage> = {}): OpenCodeMessage {
   return { id, type: 'assistant', content: parts, finish: 'stop', time: { created: Date.now() }, ...extra };
 }
+
+describe('current turn outcomes', () => {
+  const prompt: OpenCodeMessage = { id: 'prompt', type: 'user', time: { created: 100 } };
+  const idle: OpenCodeMessage = { id: 'idle', type: 'idle', time: { created: 200 }, outcome: 'failed', error: { type: 'provider.no-route', message: 'Missing gateway endpoint configuration' } };
+  it('normalizes a newest-first failed idle with its original error', () => {
+    const result = currentTurnResult([idle, prompt]);
+    expect(result?.id).toBe('idle');
+    expect(result && turnErrored(result)).toBe(true);
+    expect(result?.error).toEqual(idle.error);
+    expect(messageToEvents(idle)[0]?.payload.error).toEqual(idle.error);
+  });
+  it('fences outcomes before the latest prompt regardless of transport order', () => {
+    const newer: OpenCodeMessage = { id: 'new', type: 'user', time: { created: 300 } };
+    expect(currentTurnResult([newer, idle, prompt])).toBeNull();
+    expect(currentTurnResult([prompt, idle, newer])).toBeNull();
+  });
+  it('does not turn successful idle without assistant output into completed work', () => {
+    expect(currentTurnResult([{ ...idle, outcome: 'succeeded', error: null }, prompt])).toBeNull();
+  });
+  it('uses chronological V2 IDs to fence an old failure when timestamps tie', () => {
+    const old = { ...idle, id: 'msg_000001', time: { created: 200 } };
+    const newer = { ...prompt, id: 'msg_000002', time: { created: 200 } };
+    expect(currentTurnResult([newer, old])).toBeNull();
+    expect(currentTurnResult([old, newer])).toBeNull();
+  });
+  it('recognizes the current failure sharing its prompt timestamp', () => {
+    const currentPrompt = { ...prompt, id: 'msg_000001', time: { created: 200 } };
+    const currentIdle = { ...idle, id: 'msg_000002', time: { created: 200 } };
+    expect(currentTurnResult([currentIdle, currentPrompt])?.error).toEqual(idle.error);
+    expect(currentTurnResult([currentPrompt, currentIdle])?.error).toEqual(idle.error);
+  });
+  it('keeps chronological array semantics for timestamp-less legacy fixtures', () => {
+    const legacyPrompt = { ...prompt, id: 'z-prompt', time: undefined };
+    const legacyIdle = { ...idle, id: 'a-idle', time: undefined };
+    expect(currentTurnResult([legacyPrompt, legacyIdle])?.error).toEqual(idle.error);
+    expect(currentTurnResult([legacyIdle, legacyPrompt])).toBeNull();
+  });
+});
 
 describe('model fallback eligibility', () => {
   it.each([401, 403])('accepts provider HTTP %s in structured and string form', (status) => {

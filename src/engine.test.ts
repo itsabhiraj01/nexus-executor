@@ -1,7 +1,8 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createRequire } from 'node:module';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Client, type Pool } from 'pg';
 import type { ExecutorConfig } from './config.js';
 import { createPool, runModuleMigrations, defaultMigrationsDir } from './db.js';
@@ -68,6 +69,11 @@ beforeAll(async () => {
   await runModuleMigrations(pool, 'executor', 'executor', defaultMigrationsDir());
   root = mkdtempSync(join(tmpdir(), 'nexus-exec-engine-'));
   repoRoot = await makeRepo(join(root, 'repo'));
+  writeFileSync(join(repoRoot, '.gitignore'), 'node_modules/\n');
+  await execGit(['add', '.gitignore'], { cwd: repoRoot });
+  await execGit(['commit', '-m', 'ignore dependencies'], { cwd: repoRoot, env: TEST_AUTHOR });
+  mkdirSync(join(repoRoot, 'node_modules/project-dependency'), { recursive: true });
+  writeFileSync(join(repoRoot, 'node_modules/project-dependency/index.js'), 'module.exports = "project dependency";');
   // Several jobs are alive per describe; 4 slots keep a mid-test failure
   // from starving the rest (worker.test.ts owns the capacity assertions).
   config = testConfig(join(root, 'workspaces'), { maxParallelJobs: 4 });
@@ -122,8 +128,13 @@ async function runningJob(ctx: Ctx, input: JobSpecInput): Promise<JobRow> {
   const launched = (await getJobByHubId(pool, input.jobId))!;
   expect(launched.status, launched.failureReason ?? undefined).toBe('running');
   expect(launched.opencodeSessionId).toBeTruthy();
+  if (input.project?.localPath === repoRoot) expectProjectDependency(launched);
   void job;
   return launched;
+}
+
+function expectProjectDependency(job: JobRow) {
+  expect(createRequire(join(job.worktreePath, 'probe.cjs'))('project-dependency')).toBe('project dependency');
 }
 
 describe('launch', () => {
@@ -715,9 +726,12 @@ describe('in-job retries', () => {
 
     // Admission relaunches it (no backoff): SAME branch, fresh session,
     // the original prompt behind the continuation preamble.
+    // A pre-fix worktree may exist without dependencies; reuse repairs it.
+    rmSync(join(firstPath, 'node_modules'), { recursive: true, force: true });
     await ctx.engine.admitQueued();
     row = (await getJobByHubId(pool, 'job-retry-1'))!;
     expect(row.status).toBe('running');
+    expectProjectDependency(row);
     expect(row.branch).toBe(firstBranch);
     expect(row.worktreePath).toBe(firstPath);
     expect(row.opencodeSessionId).not.toBe(firstSession);
@@ -756,10 +770,49 @@ describe('in-job retries', () => {
     await ctx.engine.admitQueued();
     const row = (await getJobByHubId(pool, 'job-retry-gone'))!;
     expect(row.status).toBe('running');
+    expectProjectDependency(row);
     expect(row.branch).toBe(firstBranch);
     // The branch's committed work is back in the re-attached worktree.
     expect(readFileSync(join(row.worktreePath, 'keep.txt'), 'utf8')).toBe('keep me\n');
     await ctx.engine.cancel('job-retry-gone');
+  });
+
+  it('persists workspace identity before dependency linking fails and retries on the recorded worktree', async () => {
+    const repo = await makeRepo(join(root, 'broken-dependency-repo'));
+    writeFileSync(join(repo, '.gitignore'), 'node_modules/\n');
+    await execGit(['add', '.gitignore'], { cwd: repo });
+    await execGit(['commit', '-m', 'ignore dependencies'], { cwd: repo, env: TEST_AUTHOR });
+    mkdirSync(join(repo, 'node_modules/.bin'), { recursive: true });
+    symlinkSync('../tool/bin.js', join(repo, 'node_modules/.bin/tool'));
+    const ctx = makeEngine({ retryMaxAttempts: 2, retryDelayMinutes: 0 });
+    const input = spec({ jobId: 'job-dependency-link-retry', project: { localPath: repo } });
+    await ctx.engine.createJob(input);
+    const failed = (await getJobByHubId(pool, input.jobId))!;
+    expect(failed.status).toBe('queued');
+    expect(failed.failureReason).toContain('ENOENT');
+    expect(failed.attemptCount).toBe(2);
+    expect(failed.branch).toBeTruthy();
+    expect(failed.worktreePath).toBeTruthy();
+    expect(failed.metadata.repoRoot).toBe(repo);
+    expect(failed.metadata.baseSha).toMatch(/^[a-f0-9]{40}$/);
+    expect(existsSync(failed.worktreePath)).toBe(true);
+    expect(ctx.stub.sessions).toHaveLength(0);
+    writeFileSync(join(failed.worktreePath, 'retained.txt'), 'keep this work');
+
+    // Repair the installed source dependency; retry must not cut the branch again.
+    mkdirSync(join(repo, 'node_modules/tool'), { recursive: true });
+    writeFileSync(join(repo, 'node_modules/tool/bin.js'), 'repaired tool');
+    await ctx.engine.admitQueued();
+    const retried = (await getJobByHubId(pool, input.jobId))!;
+    expect(retried.status, retried.failureReason ?? undefined).toBe('running');
+    expect(retried.branch).toBe(failed.branch);
+    expect(retried.worktreePath).toBe(failed.worktreePath);
+    expect(retried.metadata.baseSha).toBe(failed.metadata.baseSha);
+    expect(readFileSync(join(retried.worktreePath, 'retained.txt'), 'utf8')).toBe('keep this work');
+    expect(readFileSync(join(retried.worktreePath, 'node_modules/.bin/tool'), 'utf8')).toBe('repaired tool');
+    expect(ctx.stub.sessions).toHaveLength(1);
+    expect((await eventTypes(pool, retried.id)).filter((type) => type === EVENT.WORKTREE_CREATED)).toHaveLength(1);
+    await ctx.engine.cancel(input.jobId);
   });
 
   it('a first-attempt setup failure keeps the workspace — the retry resumes the SAME branch', async () => {
@@ -943,6 +996,24 @@ describe('native personas (model-policy era spec fields)', () => {
 });
 
 describe('pipeline stages — baseBranch (spec §4)', () => {
+  it('links dependencies before verifyFirst in a reused named-stage location', async () => {
+    const ctx = makeEngine();
+    await execGit(['branch', 'builder/stage-reused-deps'], { cwd: repoRoot });
+    const input = spec({ jobId: 'job-stage-reused-deps', baseBranch: 'builder/stage-reused-deps', verifyFirst: true,
+      verificationCommand: `node -e "if(require('project-dependency') !== 'project dependency') process.exit(1)"` });
+    // Queue without launching so a crash-left stage location can be prepared.
+    const waiting = new JobEngine({ pool, config, client: null, git: execGit });
+    const { job } = await waiting.createJob(input);
+    const preferred = join(config.workspaceRoot, 'worktrees', `stage-${job.id}`);
+    expect((await execGit(['worktree', 'add', preferred, input.baseBranch!], { cwd: repoRoot })).code).toBe(0);
+    expect(existsSync(join(preferred, 'node_modules'))).toBe(false);
+    await ctx.engine.admitQueued();
+    const row = (await getJobByHubId(pool, input.jobId))!;
+    expect(row.status, row.failureReason ?? undefined).toBe('succeeded');
+    expectProjectDependency(row);
+    expect(ctx.stub.sessions).toHaveLength(0);
+  });
+
   it('keeps injected policy and MCP out of tracked project config and later stages', async () => {
     const repo = await makeRepo(join(root, 'tracked-config-repo'));
     const original = '{"default_agent":"build"}\n';
@@ -1328,6 +1399,240 @@ describe('workspace retention', () => {
     await pool.query(`UPDATE executor.jobs SET finished_at = NOW() - interval '30 days' WHERE hub_job_id = 'job-sweep-fresh'`);
     expect(await off.engine.listStaleWorkspaces()).toEqual([]);
     expect(existsSync(job.worktreePath)).toBe(true);
+  });
+});
+
+describe('idle-only recovery', () => {
+  afterEach(async () => {
+    const { rows } = await pool.query<{ hub_job_id: string }>("SELECT hub_job_id FROM executor.jobs WHERE status NOT IN ('failed', 'succeeded', 'cancelled')");
+    const ctx = makeEngine();
+    for (const row of rows) await ctx.engine.cancel(row.hub_job_id);
+  });
+  const failedIdle = (id = 'idle-1', created = 200, error = { type: 'provider.no-route', message: 'Missing gateway endpoint configuration' }): OpenCodeMessage =>
+    ({ id, type: 'idle', time: { created }, outcome: 'failed', error });
+  const user = (id = 'prompt-1', created = 100): OpenCodeMessage => ({ id, type: 'user', time: { created } });
+
+  it('fails an idle-only provider initialization error once, without verification or retry', async () => {
+    const ctx = makeEngine({ retryMaxAttempts: 4 });
+    const job = await runningJob(ctx, spec({ verificationCommand: 'true', models: ['a/one', 'b/two'] }));
+    ctx.stub.messages[job.opencodeSessionId!] = [failedIdle(), user()];
+    await ctx.engine.pollJob(job);
+    const row = (await getJobByHubId(pool, job.hubJobId))!;
+    expect(row.status).toBe('failed');
+    expect(row.failureReason).toContain('Missing gateway endpoint configuration');
+    expect(row.failureReason).toContain('provider.no-route');
+    await ctx.engine.pollJob(job); // stale caller as well as repeated worker polls
+    await ctx.engine.tick();
+    await ctx.engine.drain();
+    const types = await eventTypes(pool, job.id);
+    expect(types.filter((type) => type === EVENT.EXECUTION_FAILED)).toHaveLength(1);
+    expect(types).not.toContain(EVENT.VERIFICATION_STARTED);
+    expect(types).not.toContain(EVENT.AUTO_RETRY_SCHEDULED);
+    expect(ctx.stub.modelSwitches).toHaveLength(0);
+    const { rows } = await pool.query('SELECT payload FROM executor.job_events WHERE job_id = $1 AND event_type = $2', [job.id, EVENT.AGENT_IDLE]);
+    expect(rows[0].payload.error).toEqual(failedIdle().error);
+  });
+
+  it('ignores an old failure after a newer user continuation, then completes the new turn', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec());
+    ctx.stub.messages[job.opencodeSessionId!] = [user('new-prompt', 300), failedIdle(), user()];
+    await ctx.engine.pollJob(job);
+    expect((await getJobByHubId(pool, job.hubJobId))!.status).toBe('running');
+    ctx.stub.messages[job.opencodeSessionId!].unshift(done('new-answer', 'Finished.', 400));
+    await ctx.engine.pollJob((await getJobByHubId(pool, job.hubJobId))!);
+    expect((await getJobByHubId(pool, job.hubJobId))!.status).toBe('succeeded');
+  });
+
+  it('walks only the configured fallback once while pending, then fails an exhausted idle-only turn', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({ models: ['a/one', 'b/two'] }));
+    const error = { type: 'provider.rate_limit', message: 'Rate limit reached' };
+    ctx.stub.messages[job.opencodeSessionId!] = [failedIdle('limit-1', 200, error), user()];
+    await ctx.engine.pollJob(job);
+    await ctx.engine.pollJob((await getJobByHubId(pool, job.hubJobId))!);
+    expect((await getJobByHubId(pool, job.hubJobId))!.status).toBe('running');
+    expect(ctx.stub.modelSwitches).toEqual([{ sessionId: job.opencodeSessionId, model: { providerID: 'b', modelID: 'two' } }]);
+    ctx.stub.messages[job.opencodeSessionId!] = [failedIdle('limit-2', 400, error), user('fallback-prompt', 300), failedIdle('limit-1', 200, error), user()];
+    await ctx.engine.pollJob((await getJobByHubId(pool, job.hubJobId))!);
+    expect((await getJobByHubId(pool, job.hubJobId))!.status).toBe('failed');
+    expect(ctx.stub.modelSwitches).toHaveLength(1);
+  });
+
+  it('does not resurrect a cancellation racing an idle failure fetch', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec());
+    ctx.client.getMessages = async () => {
+      await ctx.engine.cancel(job.hubJobId);
+      return [failedIdle(), user()];
+    };
+    await ctx.engine.pollJob(job);
+    expect((await getJobByHubId(pool, job.hubJobId))!.status).toBe('cancelled');
+    expect(await eventTypes(pool, job.id)).not.toContain(EVENT.EXECUTION_FAILED);
+  });
+
+  it('serializes a continuation behind a poll holding an old failed-idle snapshot', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec());
+    let fetched!: () => void;
+    let release!: () => void;
+    const snapshotReady = new Promise<void>((resolve) => { fetched = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    ctx.client.getMessages = async () => {
+      const snapshot = [failedIdle(), user()];
+      fetched();
+      await gate;
+      return snapshot;
+    };
+    const polling = ctx.engine.pollJob(job);
+    await snapshotReady;
+    // A different engine models the hub request arriving in another process.
+    const sender = new JobEngine({ pool, config, client: ctx.client });
+    let settled = false;
+    const sending = sender.sendMessage(job.hubJobId, 'New continuation').then(
+      (value) => ({ value, error: null }),
+      (error: unknown) => ({ value: null, error }),
+    ).finally(() => { settled = true; });
+    try {
+      await expect.poll(async () => {
+        if (settled) return 'dispatched';
+        const waiting = await pool.query(`SELECT 1 FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event = 'advisory'
+            AND query LIKE '%pg_advisory_lock(hashtextextended%'`);
+        return waiting.rowCount ? 'serialized' : 'pending';
+      }).toBe('serialized');
+      expect(ctx.stub.prompts).toHaveLength(1);
+    } finally {
+      release();
+      await polling;
+      const result = await sending;
+      expect(result.error).toMatchObject({ statusCode: 409 });
+    }
+    expect((await getJobByHubId(pool, job.hubJobId))!.status).toBe('failed');
+    expect(ctx.stub.prompts).toHaveLength(1); // no healthy new turn was accepted then killed
+  });
+
+  it('fails a missing waiting workspace even when its session now returns 404', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec());
+    ctx.stub.messages[job.opencodeSessionId!] = [done('question', 'Which option?', 200)];
+    await ctx.engine.pollJob(job);
+    await execGit(['worktree', 'remove', '--force', job.worktreePath], { cwd: repoRoot });
+    const fetch = vi.fn(async () => { throw new OpenCodeError('forgotten', 404); });
+    ctx.client.getMessages = fetch;
+    await ctx.engine.pollJob((await getJobByHubId(pool, job.hubJobId))!);
+    const row = (await getJobByHubId(pool, job.hubJobId))!;
+    expect(row.status).toBe('failed');
+    expect(row.errorCode).toBe('workspace_missing');
+    expect(row.failureReason).toContain(job.worktreePath);
+    expect(fetch).not.toHaveBeenCalled();
+    await ctx.engine.tick();
+    expect((await eventTypes(pool, job.id)).filter((type) => type === EVENT.EXECUTION_FAILED)).toHaveLength(1);
+  });
+
+  it('records capacity waiting once, releases the failed slot and heals a sessionless created row once', async () => {
+    const ctx = makeEngine({ maxParallelJobs: 1 });
+    const first = await runningJob(ctx, spec());
+    const accepted = await ctx.engine.createJob(spec());
+    expect(accepted.job.status).toBe('queued');
+    // Also heal queue rows accepted by older versions with no timeline.
+    await pool.query('DELETE FROM executor.job_events WHERE job_id = $1', [accepted.job.id]);
+    await ctx.engine.admitQueued();
+    const events = await eventTypes(pool, accepted.job.id);
+    expect(events).toContain(EVENT.EXECUTION_STATUS_CHANGED);
+    const { rows } = await pool.query('SELECT payload FROM executor.job_events WHERE job_id = $1', [accepted.job.id]);
+    expect(rows[0].payload.reason).toBe('capacity');
+    await ctx.engine.admitQueued();
+    expect(await eventTypes(pool, accepted.job.id)).toEqual(events);
+    ctx.stub.messages[first.opencodeSessionId!] = [failedIdle(), user()];
+    await ctx.engine.tick();
+    await ctx.engine.tick();
+    await ctx.engine.drain();
+    expect((await getJobByHubId(pool, accepted.job.hubJobId))!.status).toBe('running');
+    await ctx.engine.cancel(accepted.job.hubJobId);
+    // Production acceptance leaves a durable created row; a fresh engine owns recovery.
+    const engine = new JobEngine({ pool, config: { ...config, maxParallelJobs: 1 }, client: ctx.client });
+    const crashed = await engine.createJob(spec());
+    expect(crashed.job.opencodeSessionId).toBeNull();
+    const restarted = new JobEngine({ pool, config: { ...config, maxParallelJobs: 1 }, client: ctx.client });
+    const before = ctx.stub.sessions.length;
+    await restarted.tick();
+    await restarted.drain();
+    await restarted.tick();
+    await restarted.drain();
+    expect(ctx.stub.sessions).toHaveLength(before + 1);
+    await restarted.cancel(crashed.job.hubJobId);
+  });
+
+  it('does not requeue a created launch already owned by another process when local launch capacity is full', async () => {
+    const ctx = makeEngine();
+    const engine = new JobEngine({ pool, config: { ...config, maxParallelJobs: 1 }, client: ctx.client });
+    const first = await engine.createJob(spec());
+    const owned = await engine.createJob(spec());
+    await pool.query('UPDATE executor.jobs SET started_at = NOW() WHERE id = $1', [owned.job.id]);
+    const ownedRow = (await getJobByHubId(pool, owned.job.hubJobId))!;
+    // Hold this engine's launch before it finishes opening its connection.
+    const connect = Client.prototype.connect;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const spy = vi.spyOn(Client.prototype, 'connect').mockImplementation(async function (this: Client) {
+      await gate;
+      return connect.call(this);
+    } as any);
+    const launching = engine.launchJob(first.job);
+    try {
+      await engine.launchJob(ownedRow);
+      expect((await getJobByHubId(pool, owned.job.hubJobId))!.status).toBe('created');
+    } finally {
+      release();
+      await launching;
+      spy.mockRestore();
+      await engine.cancel(first.job.hubJobId);
+      await engine.cancel(owned.job.hubJobId);
+    }
+  });
+
+  it('persists missing waiting-workspace failure without repeating checkpoints or blocking admission', async () => {
+    const ctx = makeEngine({ maxParallelJobs: 1 });
+    const waiting = await runningJob(ctx, spec());
+    ctx.stub.messages[waiting.opencodeSessionId!] = [done('question', 'Which option?', 200)];
+    await ctx.engine.pollJob(waiting);
+    await execGit(['worktree', 'remove', '--force', waiting.worktreePath], { cwd: repoRoot });
+    const git = vi.fn(execGit);
+    const errors: unknown[] = [];
+    const engine = new JobEngine({ pool, config: { ...config, maxParallelJobs: 1 }, client: ctx.client, git, onError: (error) => errors.push(error) });
+    const queued = await engine.createJob(spec());
+    await engine.tick();
+    await engine.drain();
+    const row = (await getJobByHubId(pool, waiting.hubJobId))!;
+    expect(row.status).toBe('failed');
+    expect(row.errorCode).toBe('workspace_missing');
+    expect(row.failureReason).toContain(waiting.worktreePath);
+    expect(row.failureReason).toContain(waiting.id);
+    expect((await getJobByHubId(pool, queued.job.hubJobId))!.status).toBe('running');
+    await engine.tick();
+    expect(git.mock.calls.filter(([, options]) => options.cwd === waiting.worktreePath)).toHaveLength(0);
+    expect((await eventTypes(pool, waiting.id)).filter((type) => type === EVENT.EXECUTION_FAILED)).toHaveLength(1);
+    expect(errors).toHaveLength(0);
+    await engine.cancel(queued.job.hubJobId);
+  });
+
+  it('checkpoints a completed waiting turn once and persists transient git errors with job context', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec());
+    ctx.stub.messages[job.opencodeSessionId!] = [done('question', 'Which option?', 200)];
+    const git = vi.fn(execGit).mockRejectedValue(new Error('temporary git lock'));
+    const errors: unknown[] = [];
+    const engine = new JobEngine({ pool, config, client: ctx.client, git, onError: (error) => errors.push(error) });
+    await engine.pollJob(job);
+    await engine.pollJob((await getJobByHubId(pool, job.hubJobId))!);
+    expect(git).toHaveBeenCalledTimes(1);
+    expect((await getJobByHubId(pool, job.hubJobId))!.status).toBe('waiting_for_user');
+    expect(errors[0]).toMatchObject({ jobId: job.id, operation: 'checkpoint', workspacePath: job.worktreePath });
+    const { rows } = await pool.query("SELECT payload FROM executor.job_events WHERE job_id = $1 AND event_type = 'WORKTREE_CHECKPOINT_FAILED'", [job.id]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].payload).toMatchObject({ jobId: job.id, operation: 'checkpoint', workspacePath: job.worktreePath });
+    await engine.cancel(job.hubJobId);
   });
 });
 

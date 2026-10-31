@@ -338,7 +338,7 @@ export function messageToEvents(message: OpenCodeMessage): NormalizedEvent[] {
       eventType: 'AGENT_IDLE',
       source: 'opencode',
       summary: `Agent went idle (${message.outcome ?? 'unknown'})`,
-      payload: { outcome: message.outcome ?? null },
+      payload: { outcome: message.outcome ?? null, ...(message.error != null ? { error: message.error } : {}) },
       opencodeMessageId: message.id,
     }];
   }
@@ -534,6 +534,33 @@ export function lastAssistant(messages: readonly OpenCodeMessage[]): OpenCodeMes
     }
   }
   return best;
+}
+
+/** V2 IDs are chronologically sortable, breaking millisecond timestamp ties.
+ * Without timestamps preserve the legacy chronological fixture array order. */
+export function compareMessageOrder(a: OpenCodeMessage, b: OpenCodeMessage): number {
+  const byTime = (a.time?.created ?? 0) - (b.time?.created ?? 0);
+  if (byTime || a.time?.created === undefined || b.time?.created === undefined) return byTime;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/** Current turn only: a newer user prompt fences all earlier outcomes. V2
+ * transports newest-first with timestamps; timestamp-less legacy fixtures
+ * retain chronological array order. A successful idle alone is NOT work. */
+export function currentTurnResult(messages: readonly OpenCodeMessage[]): OpenCodeMessage | null {
+  const ordered = [...messages].sort(compareMessageOrder);
+  let result: OpenCodeMessage | null = null;
+  for (const message of ordered) {
+    if (message.type === 'user') result = null;
+    else if (message.type === 'assistant') result = message;
+    else if (message.type === 'idle' && message.outcome === 'failed') {
+      // Adapt to the existing assistant failure/retry path, retaining identity
+      // and error details so duplicate polls and fallback fences still apply.
+      result = { ...message, type: 'assistant', finish: 'error', content: [],
+        error: message.error ?? { message: 'OpenCode turn failed without an error detail' } };
+    }
+  }
+  return result;
 }
 
 export interface StallCheckOptions {

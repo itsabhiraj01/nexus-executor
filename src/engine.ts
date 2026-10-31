@@ -10,6 +10,8 @@ import {
   agentErrorSummary,
   asksUserForInput,
   collectToolProgress,
+  compareMessageOrder,
+  currentTurnResult,
   detectStall,
   evaluateToolProgress,
   fallbackPrompt,
@@ -279,6 +281,7 @@ export const EVENT = {
   EXECUTION_CANCELLED: 'EXECUTION_CANCELLED',
   EXECUTION_STATUS_CHANGED: 'EXECUTION_STATUS_CHANGED',
   WORKTREE_CREATED: 'WORKTREE_CREATED',
+  WORKTREE_CHECKPOINT_FAILED: 'WORKTREE_CHECKPOINT_FAILED',
   WORKTREE_MERGED: 'WORKTREE_MERGED',
   WORKTREE_MERGE_FAILED: 'WORKTREE_MERGE_FAILED',
   WORKTREE_DEPLOYED: 'WORKTREE_DEPLOYED',
@@ -576,16 +579,16 @@ export class JobEngine {
     return { job, created: true };
   }
 
-  private async queueJob(job: JobRow, summary: string): Promise<void> {
+  private async queueJob(job: JobRow, summary: string, reason = 'opencode_unavailable'): Promise<void> {
     const { rowCount } = await this.pool.query(
       `UPDATE executor.jobs SET status = 'queued', started_at = NULL, version = version + 1, updated_at = NOW()
-       WHERE id = $1 AND status = 'created'`, [job.id]);
+       WHERE id = $1 AND status = 'created' AND (NOT $2::boolean OR started_at IS NULL)`, [job.id, reason === 'capacity']);
     if (rowCount) {
       const deadline = this.deadlines.get(job.id);
       if (deadline) clearTimeout(deadline.timer);
       this.deadlines.delete(job.id);
       await appendJobEvent(this.pool, {
-        jobId: job.id, eventType: EVENT.EXECUTION_STATUS_CHANGED, summary,
+        jobId: job.id, eventType: EVENT.EXECUTION_STATUS_CHANGED, summary, payload: { status: 'queued', reason },
       });
     }
   }
@@ -759,7 +762,11 @@ export class JobEngine {
    * only deleted by the hub's explicit merge op.
    */
   async launchJob(job: JobRow): Promise<void> {
-    if (!this.client || this.launchingJobs.has(job.id) || this.launchingJobs.size >= this.config.maxParallelJobs) return;
+    if (!this.client || this.launchingJobs.has(job.id)) return;
+    if (this.launchingJobs.size >= this.config.maxParallelJobs) {
+      await this.queueJob(job, 'Waiting for executor launch capacity.', 'capacity');
+      return;
+    }
     this.launchingJobs.add(job.id);
     // Dedicated connections keep long launches from exhausting the query pool.
     const owner = new Client(this.pool.options);
@@ -785,6 +792,14 @@ export class JobEngine {
         WHERE id <> $1 AND (status IN ('running', 'verifying') OR (status = 'created' AND started_at IS NOT NULL))`, [job.id]);
       if (count.rows[0]!.n >= this.config.maxParallelJobs) {
         await owner.query("UPDATE executor.jobs SET status = 'queued', started_at = NULL WHERE id = $1", [job.id]);
+        const visible = await owner.query(`SELECT 1 FROM executor.job_events
+          WHERE job_id = $1 AND event_type = $2 AND payload->>'reason' = 'capacity' LIMIT 1`,
+        [job.id, EVENT.EXECUTION_STATUS_CHANGED]);
+        if (!visible.rowCount) await appendJobEvent(owner, {
+          jobId: job.id, eventType: EVENT.EXECUTION_STATUS_CHANGED,
+          summary: 'Waiting for executor capacity.',
+          payload: { status: 'queued', reason: 'capacity', maxParallelJobs: this.config.maxParallelJobs },
+        });
         await owner.query('COMMIT');
         return;
       }
@@ -938,7 +953,7 @@ export class JobEngine {
         if (common.code !== 0) throw new Error(common.stderr);
         const lock = await owner.query<{ locked: boolean }>('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [`branch:${common.stdout.trim()}:${spec.baseBranch}`]);
         if (!lock.rows[0]!.locked) {
-          await this.queueJob(job, 'Waiting for the previous stage to finish launch.');
+          await this.queueJob(job, 'Waiting for the previous stage to finish launch.', 'branch_busy');
           return;
         }
       }
@@ -974,9 +989,10 @@ export class JobEngine {
         });
       }
 
-      // Cover fresh stages and retry reuse/reattachment before verification
-      // or agents resolve ancestor executor deps. Persist workspace identity
-      // first so a broken source dependency cannot lose the retry's branch.
+      // Also covers retry reuse/reattachment and every named-stage path,
+      // before verifyFirst or an agent can resolve ancestor executor deps.
+      // Keep this AFTER persisting workspace identity: a broken installed
+      // dependency must leave retries able to resume the existing branch.
       linkNodeModules(repoRoot, prepared.path);
 
       // Any fresh launch supersedes a rebase-repair state left by a
@@ -1185,7 +1201,7 @@ export class JobEngine {
       ORDER BY updated_at ASC LIMIT 50`);
     for (const raw of rows) {
       const job = rowToJob(raw);
-      await this.pollJob(job).catch((error) => this.onError(error));
+      await this.pollJob(job).catch((error) => this.onError(this.jobError(job, 'poll', error)));
     }
     // `verifying` jobs run detached — a restart loses the detached promise
     // but never the row. Re-adopt every verifying job whose cycle is not
@@ -1226,7 +1242,8 @@ export class JobEngine {
       await owner.connect();
       const lock = await owner.query<{ locked: boolean }>('SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked', [job.id]);
       if (!lock.rows[0]!.locked || !await this.isCurrent(job)) return;
-      await this.pollOwned(job);
+      const current = await getJobByHubId(owner, job.hubJobId);
+      if (current && ['running', 'waiting_for_user'].includes(current.status)) await this.pollOwned(current);
     } finally { await owner.end(); }
   }
 
@@ -1237,11 +1254,21 @@ export class JobEngine {
       await this.failAttempt(job, 'execution_timeout', 'Job timed out: exceeded its execution deadline.');
       return;
     }
+    // Parked jobs have no deadline. A lost workspace must not be hidden by a
+    // forgotten/unreachable session (especially a messages 404).
+    if (job.status === 'waiting_for_user' && job.worktreePath && !existsSync(job.worktreePath)) {
+      await this.failMissingWorkspace(job);
+      return;
+    }
     if (!this.client || !job.opencodeSessionId) return;
     let messages: OpenCodeMessage[];
     try {
       messages = await this.client.getMessages(job.opencodeSessionId);
     } catch (error) {
+      if (job.worktreePath && !existsSync(job.worktreePath)) {
+        await this.failMissingWorkspace(job);
+        return;
+      }
       // A session the service 404s is not this worker's to poll — after a
       // restart the service may simply have forgotten it. The job timeout
       // still bounds the row.
@@ -1275,20 +1302,10 @@ export class JobEngine {
       }
     }
 
-    const last = lastAssistant(messages);
+    const last = currentTurnResult(messages);
     const complete = last ? messageComplete(last) : false;
     const meta = job.metadata;
     const now = this.now();
-
-    // Safety net: every completed turn checkpoints the worktree onto the
-    // job's branch before anything else reads the outcome.
-    if (complete && job.worktreePath) {
-      try {
-        await commitJobChanges(this.git, { path: job.worktreePath, message: 'executor: checkpoint after agent turn' });
-      } catch (error) {
-        this.onError(error);
-      }
-    }
 
     if (complete && last && job.status === 'running') {
       if (turnErrored(last)) {
@@ -1296,12 +1313,15 @@ export class JobEngine {
         // continuation prompt is in flight but the errored message is still
         // the newest assistant row — re-polled, it must NOT fail the job.
         // (The hub gets this from its intermediate agent_finished state.)
-        if (job.metadata.lastFallbackMessageId === last.id) return;
+        const user = [...messages].filter((message) => message.type === 'user')
+          .sort(compareMessageOrder).at(-1);
+        if (job.metadata.lastFallbackMessageId === last.id ||
+            (user && job.metadata.lastFallbackUserMessageId === user.id)) return;
         // Usage-limit and provider 401/403 errors walk the agent's chain IN the session —
         // the conversation carries the whole task, the next model continues.
         // Only an exhausted chain (or an ineligible error) fails the job.
-        const fell = await this.maybeModelFallback(job, last).catch((error) => {
-          this.onError(error);
+        const fell = await this.maybeModelFallback(job, last, user?.id).catch((error) => {
+          this.onError(this.jobError(job, 'model_fallback', error));
           return false;
         });
         if (fell) return;
@@ -1327,6 +1347,34 @@ export class JobEngine {
         await this.failAttempt(job, 'agent_error', agentErrorSummary(last.error ?? { message: last.finish ?? 'unknown error' }), { interrupt: false });
         return;
       }
+    }
+
+    // Workspace loss is a durable, non-retryable verdict, not a git spawn
+    // failure. Check even previously processed waiting turns; never recreate
+    // a branch or claim its uncommitted contents were saved. Provider failure
+    // handling above must not depend on this optional checkpoint succeeding.
+    if (job.worktreePath && !existsSync(job.worktreePath)) {
+      await this.failMissingWorkspace(job);
+      return;
+    }
+    if (complete && last && job.worktreePath && meta.lastCheckpointMessageId !== last.id) {
+      try {
+        await commitJobChanges(this.git, { path: job.worktreePath, message: 'executor: checkpoint after agent turn' });
+      } catch (error) {
+        const contextual = this.jobError(job, 'checkpoint', error);
+        this.onError(contextual);
+        await appendJobEvent(this.pool, {
+          jobId: job.id, eventType: EVENT.WORKTREE_CHECKPOINT_FAILED,
+          summary: contextual.message,
+          payload: { jobId: job.id, operation: 'checkpoint', workspacePath: job.worktreePath, error: String(error) },
+        });
+      }
+      // Record the attempt, not a fictitious successful checkpoint. Transient
+      // git errors stay visible without retrying every parked poll.
+      await this.mergeMetadata(job.id, { lastCheckpointMessageId: last.id });
+    }
+
+    if (complete && last && job.status === 'running') {
       if (asksUserForInput(last)) {
         if (last.id !== meta.lastAskedMessageId) {
           const text = finalAssistantText(last);
@@ -1484,7 +1532,7 @@ export class JobEngine {
    * worker's next poll then fails the job, where the in-job retry budget
    * applies). Mirrors the hub's fallbackForModelLimit.
    */
-  private async maybeModelFallback(job: JobRow, message: OpenCodeMessage): Promise<boolean> {
+  private async maybeModelFallback(job: JobRow, message: OpenCodeMessage, userMessageId?: string): Promise<boolean> {
     if (!this.client || !job.opencodeSessionId) return false;
     const error: OpenCodeMessageError = message.error ?? { message: message.finish ?? '' };
     if (!isModelFallbackError(error)) return false;
@@ -1509,6 +1557,7 @@ export class JobEngine {
     await this.mergeMetadata(job.id, {
       modelIndex: modelIndex + 1,
       lastFallbackMessageId: message.id,
+      lastFallbackUserMessageId: userMessageId ?? null,
     });
     await this.pool.query(
       `UPDATE executor.jobs SET model = $2, updated_at = NOW() WHERE id = $1`, [job.id, nextName]);
@@ -1523,6 +1572,17 @@ export class JobEngine {
       payload: { text: prompt, promptMessageId: sent.id },
     });
     return true;
+  }
+
+  private jobError(job: JobRow, operation: string, cause: unknown): Error & { jobId: string; operation: string; workspacePath: string } {
+    return Object.assign(new Error(`Job ${job.id} ${operation} (${job.worktreePath}): ${String(cause)}`, { cause }), {
+      jobId: job.id, operation, workspacePath: job.worktreePath,
+    });
+  }
+
+  private async failMissingWorkspace(job: JobRow): Promise<void> {
+    await this.failAttempt(job, 'workspace_missing',
+      `Job ${job.id}: checkpoint cannot use missing workspace ${job.worktreePath}. Restore the workspace/branch and retry, or cancel the job; uncommitted work cannot be checkpointed.`);
   }
 
   /* ── Verification ──────────────────────────────────────────────────── */
@@ -1902,6 +1962,22 @@ export class JobEngine {
 
   /** Send a message into the job's SAME session (resume semantics). */
   async sendMessage(hubJobId: string, text: string): Promise<JobRow> {
+    const job = await getJobByHubId(this.pool, hubJobId);
+    if (!job) throw new EngineError(404, `Unknown job ${hubJobId}.`);
+    // Share polling/launch/verification ownership across processes. Otherwise
+    // an in-flight messages fetch can fail or interrupt a continuation that
+    // was accepted after that fetch's snapshot. Use a dedicated connection,
+    // and re-read eligibility AFTER acquiring the lock; no pool row lock is
+    // held during remote I/O and no owned path recursively calls this method.
+    const owner = new Client(this.pool.options);
+    try {
+      await owner.connect();
+      await owner.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [job.id]);
+      return await this.sendMessageOwned(hubJobId, text);
+    } finally { await owner.end(); }
+  }
+
+  private async sendMessageOwned(hubJobId: string, text: string): Promise<JobRow> {
     const job = await getJobByHubId(this.pool, hubJobId);
     if (!job) throw new EngineError(404, `Unknown job ${hubJobId}.`);
     if (job.metadata.supersededBy) throw new EngineError(409, 'This stage handed its branch to a newer stage.');
