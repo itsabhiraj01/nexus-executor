@@ -186,8 +186,8 @@ export function makeStubClient(): { client: OpenCodeClient; state: StubState } {
       if (!pending.some((request) => request.id === requestId)) return json({ error: 'not found' }, 404);
       const body = JSON.parse(String(init!.body)) as { decision: OpenCodePermissionDecision; message?: string };
       state.permissionReplies.push({ sessionId, requestId, decision: body.decision, message: body.message });
-      // Mirrors the real service: one reply settles EVERY pending request.
-      state.permissionRequests[sessionId] = [];
+      // V2 reject clears siblings; once answers only the original tool request.
+      state.permissionRequests[sessionId] = body.decision === 'reject' ? [] : pending.filter(request => request.id !== requestId);
       return new Response(null, { status: 204 });
     }
     if (method === 'GET' && /\/api\/model/.test(url)) {

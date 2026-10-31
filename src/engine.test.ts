@@ -27,6 +27,21 @@ import { LaunchedJobEngine, countEvents, eventTypes, makeRepo, makeStubClient, t
 import { commitJobChanges, execGit, listUnmergedPaths } from './workspace.js';
 import { updateJobPermissions } from './permissions.js';
 
+it('keeps pending permission waits durable across restart, messages and deadline sweeps', async () => {
+  const { engine, client, stub } = makeEngine({ jobTimeoutMs: 100_000, toolStallMs: 1, silenceStallMs: 1 });
+  const { job } = await engine.createJob(spec({ manualApprovals:true }));
+  stub.permissionRequests[job.opencodeSessionId!] = [{ id: 'manual', action: 'bash', resources: ['git status'] }];
+  await engine.pollJob(job);
+  expect(stub.permissionReplies).toEqual([]);
+  expect((await getJobByHubId(pool,job.hubJobId))!.metadata.permissionWaitStartedAt).toEqual(expect.any(Number));
+  await pool.query("UPDATE executor.jobs SET started_at=now()-interval '1 day' WHERE id=$1", [job.id]);
+  const restarted = new LaunchedJobEngine({ pool, config: { ...config, jobTimeoutMs: 1 }, client, git: execGit });
+  await restarted.tick();
+  expect((await getJobByHubId(pool,job.hubJobId))!.status).toBe('running');
+  await expect(restarted.sendMessage(job.hubJobId,'resume')).rejects.toMatchObject({ statusCode:409 });
+  await restarted.cancel(job.hubJobId);
+});
+
 it('persists initial prompt-tier policy and applies it before first and replacement prompts', async () => {
   const { engine, client, stub } = makeEngine({ retryMaxAttempts: 2, retryDelayMinutes: 0 });
   const policy = { revision: 'initial', generation: 1, rules: [{ action: '*', resource: '*', effect: 'deny' as const }] };

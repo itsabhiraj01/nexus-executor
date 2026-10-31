@@ -3,6 +3,8 @@ import {
   healthPaired, jobSummary, MAX_MESSAGE_CHARS,
   opConfigPut, opCreateJob, opJobCancel, opJobEvents, opJobLog, opJobMerge,
   opFsBrowse, opJobMessage, opJobPermissions, opJobRebase, opJobVerify, opModels, opRepoInspect, opShowJob, opStatus, opUpgrade, opWorkspaceSweep,
+  opPermissionDecision,
+  opPendingApprovals,
   opTerminalCreate, opTerminalDetach, opTerminalInput, opTerminalKill, opTerminalList, opTerminalOutput, opTerminalResize,
   type OpResult, type RouteDeps,
 } from './ops.js';
@@ -50,6 +52,13 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       await reply.code(429).send({ error: `Rate limit exceeded — retry in ${hit.retryAfterSeconds}s.` });
     }
   };
+
+  app.post<{ Params:{ id:string } }>('/api/v1/jobs/:id/permission-decision', { preHandler:limit(actionLimiter) }, async (request,reply) => {
+    send(reply,await opPermissionDecision(deps,request.params.id,request.body));
+  });
+  app.get<{ Params:{ id:string } }>('/api/v1/jobs/:id/approvals', { preHandler:limit(actionLimiter) }, async (request,reply) => {
+    send(reply,await opPendingApprovals(deps,request.params.id));
+  });
 
   app.get('/health', async (_request, reply) => {
     const health = await healthPaired(deps);

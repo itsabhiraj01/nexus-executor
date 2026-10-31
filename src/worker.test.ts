@@ -150,12 +150,14 @@ describe('stall + timeout guards', () => {
     await engine.cancel('job-progress');
   });
 
-  it('auto-rejects a pending permission approval and defers stall judgment to the next tick', async () => {
+  it('keeps absent-flag legacy custom ask jobs auto-rejecting and defers stall judgment to the next tick', async () => {
     await wipeJobs(pool);
     // Every threshold would kill the zero-output tool on sight — proving
     // the drain (not luck) is what keeps the run alive this tick.
     const { engine, state } = stubEngine({ toolStallMs: 1, silenceStallMs: 1, toolProgressMs: 1 });
-    const job = (await engine.createJob(jobSpec('job-perm-ask'))).job;
+    const legacySpec = { ...jobSpec('job-perm-ask'),permissionPolicy:{ revision:'legacy-ask',generation:1,rules:[{ action:'shell',resource:'*',effect:'ask' as const }] } };
+    expect(legacySpec).not.toHaveProperty('manualApprovals');
+    const job = (await engine.createJob(legacySpec)).job;
     const row = (await getJobByHubId(pool, 'job-perm-ask'))!;
     const startedAgo = Date.now() - 10_000;
     // The Planner failure shape: a `git …` tool marked running with zero
