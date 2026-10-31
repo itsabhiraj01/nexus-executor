@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import type { Pool } from 'pg';
 import { createPool, defaultMigrationsDir, runModuleMigrations } from './db.js';
 import { makeStubClient } from './testkit.js';
-import { reconcileManualApprovals, decidePermission, manualApprovalSnapshot, activeElapsed } from './manual-approvals.js';
+import { reconcileManualApprovals, decidePermission, manualApprovalSnapshot, freshManualApprovalSnapshot, activeElapsed } from './manual-approvals.js';
 
 let pool: Pool;
 beforeAll(async () => {
@@ -28,6 +28,9 @@ it('persists waiting before publication, delivers the original request once and 
   expect(await decidePermission(pool, client, 'approval', decision)).toEqual({ decisionId: 'decision1', outcome: 'delivered' });
   expect(state.permissionReplies).toHaveLength(1);
   expect((await manualApprovalSnapshot(pool, row.id)).waiting).toBe(false);
+  await pool.query("UPDATE executor.jobs SET status='succeeded' WHERE id=$1",[row.id]);
+  expect(await decidePermission(pool,client,'approval',decision)).toEqual({ decisionId:'decision1',outcome:'delivered' });
+  expect(state.permissionReplies).toHaveLength(1);
   await expect(decidePermission(pool, client, 'approval', { ...decision, attempt: 2 })).rejects.toMatchObject({ status: 409 });
 });
 
@@ -80,7 +83,38 @@ it('retains a recorded decision through runtime outage and retries only its orig
   expect((await manualApprovalSnapshot(pool,row.id)).requests).toEqual([{ id:'other',action:'shell',resources:['git status'] }]);
   await pool.query("UPDATE executor.jobs SET status='cancelled' WHERE id=$1",[row.id]);
   expect((await manualApprovalSnapshot(pool,row.id)).resolved).toContainEqual({ id:'other',outcome:'cancelled' });
-  await expect(decidePermission(pool,client,'offline',decision)).rejects.toMatchObject({ status:409 });
+  expect(await decidePermission(pool,client,'offline',decision)).toEqual({ decisionId:'offline-d',outcome:'delivered' });
+});
+
+it('fresh preflight never advertises externally answered requests or cached state during runtime outage', async () => {
+  const { client,state } = makeStubClient();
+  const session = await client.createSession({ title:'preflight',directory:'/tmp/opencode' });
+  const row = (await pool.query(`INSERT INTO executor.jobs (hub_job_id,spec,status,opencode_session_id,attempt_count)
+    VALUES ('preflight','{"manualApprovals":true}','running',$1,1) RETURNING *`,[session.id])).rows[0];
+  state.permissionRequests[session.id] = [{ id:'preflight-r',action:'shell',resources:['pwd'] }];
+  await reconcileManualApprovals(pool,client,row.id);
+  state.permissionRequests[session.id] = [];
+  expect((await freshManualApprovalSnapshot(pool,client,'preflight')).requests).toEqual([]);
+  const outage = vi.spyOn(client,'listPermissionRequests').mockRejectedValueOnce(new Error('offline'));
+  await expect(freshManualApprovalSnapshot(pool,client,'preflight')).rejects.toMatchObject({ status:502 });
+  outage.mockRestore();
+});
+
+it('commits the delivered receipt even if post-reply runtime readback goes offline', async () => {
+  const { client,state } = makeStubClient();
+  const session = await client.createSession({ title:'readback',directory:'/tmp/opencode' });
+  await client.setSessionPermissions(session.id,[{ action:'shell',resource:'*',effect:'ask' }]);
+  const row = (await pool.query(`INSERT INTO executor.jobs (hub_job_id,spec,status,opencode_session_id,attempt_count)
+    VALUES ('readback','{"manualApprovals":true}','running',$1,1) RETURNING *`,[session.id])).rows[0];
+  state.permissionRequests[session.id] = [{ id:'readback-r',action:'shell',resources:['pwd'] }];
+  await reconcileManualApprovals(pool,client,row.id);
+  const listing = vi.spyOn(client,'listPermissionRequests').mockResolvedValueOnce(state.permissionRequests[session.id]!).mockRejectedValueOnce(new Error('offline after reply'));
+  const decision = { decisionId:'readback-d',attempt:1,sessionId:session.id,requestId:'readback-r',decision:'once' as const };
+  expect(await decidePermission(pool,client,'readback',decision)).toEqual({ decisionId:'readback-d',outcome:'delivered' });
+  listing.mockRestore();
+  await pool.query("UPDATE executor.jobs SET status='succeeded' WHERE id=$1",[row.id]);
+  expect(await decidePermission(pool,client,'readback',decision)).toEqual({ decisionId:'readback-d',outcome:'delivered' });
+  expect(state.permissionReplies).toHaveLength(1);
 });
 
 it('excludes persisted permission waiting from active time without changing original start timestamps', () => {

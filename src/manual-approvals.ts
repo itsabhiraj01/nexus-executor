@@ -141,23 +141,42 @@ export async function manualApprovalSnapshot(pool: Pool, jobId: string): Promise
   });
 }
 
+/** Template-learning preflight: cached job detail is not evidence of a live ask. */
+export async function freshManualApprovalSnapshot(pool:Pool,client:OpenCodeClient|null,hubJobId:string):Promise<ManualApprovalSnapshot> {
+  const jobId = await locked(pool,hubJobId,true,async (db,job) => {
+    if (!client) throw new PermissionPolicyError(502,'Runtime unavailable; pending permissions cannot be verified.');
+    try { await reconcileLocked(db,client,job); }
+    catch (error) {
+      if (error instanceof PermissionPolicyError) throw error;
+      throw new PermissionPolicyError(502,'Runtime unavailable; pending permissions cannot be verified.');
+    }
+    return job.id;
+  });
+  return manualApprovalSnapshot(pool,jobId);
+}
+
 export async function decidePermission(pool: Pool, client: OpenCodeClient | null, hubJobId: string, input: unknown): Promise<{ decisionId: string; outcome: 'delivered' | 'expired' }> {
   const value = parsePermissionDecision(input);
   // Commit decision before transport. Replays use durable identity, not the gateway's process cache.
-  await locked(pool, hubJobId, true, async (db,job) => {
-    if (terminal(job) || job.attempt_count !== value.attempt || job.opencode_session_id !== value.sessionId) throw new PermissionPolicyError(409,'Permission attempt/session changed.');
+  const delivered = await locked(pool, hubJobId, true, async (db,job) => {
     const row = (await db.query(`SELECT * FROM executor.manual_approvals WHERE job_id=$1 AND attempt=$2 AND session_id=$3 AND request_id=$4`, [job.id,value.attempt,value.sessionId,value.requestId])).rows[0];
+    if (row?.state === 'delivered' && row.decision_id === value.decisionId && row.decision === value.decision) return true;
+    if (terminal(job) || job.attempt_count !== value.attempt || job.opencode_session_id !== value.sessionId) throw new PermissionPolicyError(409,'Permission attempt/session changed.');
     if (!row || ['expired','cancelled'].includes(row.state)) throw new PermissionPolicyError(409,'Permission request expired.');
     if (row.decision_id && (row.decision_id !== value.decisionId || row.decision !== value.decision)) throw new PermissionPolicyError(409,'Conflicting permission decision.');
     const used = (await db.query('SELECT job_id,attempt,session_id,request_id FROM executor.manual_approvals WHERE decision_id=$1',[value.decisionId])).rows[0];
     if (used && (used.job_id !== job.id || used.attempt !== value.attempt || used.session_id !== value.sessionId || used.request_id !== value.requestId)) throw new PermissionPolicyError(409,'Decision ID already belongs to another request.');
     await db.query(`UPDATE executor.manual_approvals SET decision_id=$5,decision=$6,state=CASE WHEN state='pending' THEN 'decision_recorded' ELSE state END,updated_at=now()
       WHERE job_id=$1 AND attempt=$2 AND session_id=$3 AND request_id=$4`, [job.id,value.attempt,value.sessionId,value.requestId,value.decisionId,value.decision]);
+    return false;
   });
-  return locked(pool, hubJobId, true, async (db,job) => {
-    if (terminal(job) || job.attempt_count !== value.attempt || job.opencode_session_id !== value.sessionId) throw new PermissionPolicyError(409,'Permission attempt/session changed.');
+  if (delivered) return { decisionId:value.decisionId,outcome:'delivered' };
+  let reconciledJobId = '';
+  const result = await locked(pool, hubJobId, true, async (db,job):Promise<{ decisionId:string;outcome:'delivered'|'expired' }> => {
+    reconciledJobId = job.id;
     const row = (await db.query('SELECT * FROM executor.manual_approvals WHERE decision_id=$1', [value.decisionId])).rows[0];
-    if (row?.state === 'delivered') return { decisionId:value.decisionId,outcome:'delivered' };
+    if (row?.state === 'delivered' && row.job_id === job.id && row.attempt === value.attempt && row.session_id === value.sessionId && row.request_id === value.requestId && row.decision === value.decision) return { decisionId:value.decisionId,outcome:'delivered' };
+    if (terminal(job) || job.attempt_count !== value.attempt || job.opencode_session_id !== value.sessionId) throw new PermissionPolicyError(409,'Permission attempt/session changed.');
     if (!client) throw new PermissionPolicyError(503,'OpenCode unavailable; decision is recorded.');
     let requests:OpenCodePermissionRequest[];
     try { requests = await client.listPermissionRequests(value.sessionId); }
@@ -177,10 +196,12 @@ export async function decidePermission(pool: Pool, client: OpenCodeClient | null
     }
     await client.replyPermission(value.sessionId,value.requestId,value.decision,value.decision === 'reject' ? 'The run owner rejected this permission request.' : undefined);
     await db.query("UPDATE executor.manual_approvals SET state='delivered',updated_at=now() WHERE decision_id=$1", [value.decisionId]);
-    // Reject may clear siblings. Reconcile all, rather than leave phantom waits.
-    await reconcileLocked(db,client,job);
     return { decisionId:value.decisionId,outcome:'delivered' };
   });
+  // Commit the receipt BEFORE sibling readback. A transient readback failure
+  // must never erase proof that the original runtime reply succeeded.
+  if (result.outcome === 'delivered') await reconcileManualApprovals(pool,client,reconciledJobId).catch(() => {});
+  return result;
 }
 
 export function activeElapsed(job: { startedAt: Date | null; metadata: Record<string,unknown> }, now: number): number {

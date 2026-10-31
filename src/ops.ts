@@ -2,7 +2,7 @@ import type { Pool } from 'pg';
 import { readAuthConfig } from './auth.js';
 import { EXECUTOR_VERSION, executorCapabilities, type ExecutorConfig } from './config.js';
 import { updateJobPermissions, parsePermissionPolicy, PermissionPolicyError } from './permissions.js';
-import { decidePermission, manualApprovalSnapshot } from './manual-approvals.js';
+import { decidePermission, manualApprovalSnapshot, freshManualApprovalSnapshot } from './manual-approvals.js';
 import {
   EngineError,
   rowToJob,
@@ -485,6 +485,14 @@ export async function opPermissionDecision(deps: RouteDeps, jobId: string, input
   }
 }
 
+export async function opPendingApprovals(deps:RouteDeps,jobId:string):Promise<OpResult> {
+  try { return { status:200,body:{ ...await freshManualApprovalSnapshot(deps.pool,deps.client,jobId) } }; }
+  catch (error) {
+    if (error instanceof PermissionPolicyError) return { status:error.status,body:{ error:error.message } };
+    throw error;
+  }
+}
+
 export async function opJobMessage(deps: RouteDeps, jobId: string, text: string): Promise<OpResult> {
   try {
     await deps.engine.sendMessage(jobId, text);
@@ -916,6 +924,10 @@ export async function handleGatewayOperation(
         const { jobId,...decision } = body;
         if (!textArg(jobId,200)) return { ok:false,status:400,error:'Invalid jobId.' };
         return wrap(await opPermissionDecision(deps,jobId as string,decision));
+      }
+      case 'job.approvals': {
+        if (Object.keys(body).some(key => key !== 'jobId') || !textArg(body.jobId,200)) return { ok:false,status:400,error:'Invalid job.approvals payload.' };
+        return wrap(await opPendingApprovals(deps,body.jobId as string));
       }
       default: {
         if ((ID_OPS as readonly string[]).includes(operation)) {

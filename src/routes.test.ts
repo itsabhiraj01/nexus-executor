@@ -183,6 +183,10 @@ describe('paired executor', () => {
         await reconcileManualApprovals(pool,client,job.id);
         const snapshot = await app.inject({ method:'GET',url:`/api/v1/jobs/${hubJobId}`,headers:auth() });
         expect(snapshot.json().manualApprovals.waiting).toBe(true);
+        const fresh = transport === 'direct'
+          ? (await app.inject({ method:'GET',url:`/api/v1/jobs/${hubJobId}/approvals`,headers:auth() })).json()
+          : (await handleGatewayOperation(deps,'job.approvals',{ jobId:hubJobId }) as { result:unknown }).result;
+        expect(fresh).toEqual(snapshot.json().manualApprovals);
         const payload = { decisionId:`d-${transport}`,attempt:1,sessionId:session.id,requestId:'request',decision:transport === 'direct' ? 'once' : 'reject' };
         expect((await app.inject({ method:'POST',url:`/api/v1/jobs/${hubJobId}/permission-decision`,payload })).statusCode).toBe(401);
         const delivered = transport === 'direct'
