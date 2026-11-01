@@ -1893,6 +1893,116 @@ describe('model fallback', () => {
   });
 });
 
+describe('durable pipeline results', () => {
+  const footer = (status: string, reason?: string) => `NEXUS_STAGE_RESULT:${JSON.stringify({ status, ...(reason ? { reason } : {}), summary: 'Resolve the missing prerequisite.' })}`;
+
+  it.each([
+    ['code', footer('blocked', 'input'), 'pipeline_input_required', ''],
+    ['code:2', footer('incomplete', 'implementation'), 'pipeline_implementation_incomplete', 'touch verifier-ran; exit 1'],
+    ['test', footer('blocked', 'permission'), 'pipeline_permission_required', 'touch verifier-ran'],
+    ['test:3', footer('incomplete', 'verification'), 'pipeline_verification_incomplete', 'touch verifier-ran; exit 1'],
+    ['test', 'NEXUS_STAGE_RESULT:{broken', 'invalid_pipeline_result', 'touch verifier-ran'],
+    ['test', `${footer('complete')}\n${footer('complete')}`, 'invalid_pipeline_result', 'touch verifier-ran'],
+    ['code', `${footer('complete')}\nTrailing prose`, 'invalid_pipeline_result', ''],
+    ['test', footer('complete', 'input'), 'invalid_pipeline_result', 'touch verifier-ran'],
+  ])('stops %s result %s before commands or repair', async (stage, output, errorCode, command) => {
+    const ctx = makeEngine({ retryMaxAttempts: 4 });
+    const job = await runningJob(ctx, spec({ jobId: `${randomStageId()}:${stage}`, verificationCommand: command, manualApprovals: true }));
+    ctx.stub.messages[job.opencodeSessionId!] = [done('final-result', output, 200)];
+    await ctx.engine.pollJob(job);
+    await ctx.engine.drain();
+    const row = (await getJobByHubId(pool, job.hubJobId))!;
+    expect(row.status).toBe('failed');
+    expect(row.errorCode).toBe(errorCode);
+    expect(row.summary).toBe(output);
+    expect(row.metadata.finalResultMessageId).toBe('final-result');
+    expect(row.attemptCount).toBe(1);
+    expect(row.verificationAttemptCount).toBe(0);
+    expect(existsSync(join(job.worktreePath, 'verifier-ran'))).toBe(false);
+    expect(ctx.stub.prompts).toHaveLength(1);
+    const events = await eventTypes(pool, job.id);
+    expect(events).not.toContain(EVENT.VERIFICATION_STARTED);
+    expect(events).not.toContain(EVENT.REPAIR_REQUESTED);
+    expect(events).not.toContain(EVENT.AUTO_RETRY_SCHEDULED);
+  });
+
+  it.each(['Legacy completed work.', footer('complete')])('keeps %s across verification and reboot without refetching', async (output) => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({ jobId: `${randomStageId()}:test:2`, verificationCommand: 'echo ran >> verifier-count' }));
+    const fetch = vi.spyOn(ctx.client, 'getMessages')
+      .mockResolvedValueOnce([done('durable-final', output, 200)])
+      .mockRejectedValue(new Error('messages service unavailable'));
+    await ctx.engine.pollJob(job);
+    await ctx.engine.drain();
+    let row = (await getJobByHubId(pool, job.hubJobId))!;
+    expect(row.status).toBe('succeeded');
+    expect(row.summary).toBe(output);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    // Re-adopt the persisted verifying state as after a lost detached cycle.
+    await pool.query("UPDATE executor.jobs SET status = 'verifying' WHERE id = $1", [job.id]);
+    const restarted = new JobEngine({ pool, config, client: ctx.client, git: execGit });
+    await restarted.tick();
+    await restarted.drain();
+    row = (await getJobByHubId(pool, job.hubJobId))!;
+    expect(row.status).toBe('succeeded');
+    expect(row.summary).toBe(output);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(readFileSync(join(row.worktreePath, 'verifier-count'), 'utf8')).toBe('ran\nran\n');
+  });
+
+  it('persists the final result before detached verification starts and recovers it after a crash', async () => {
+    const ctx = makeEngine();
+    const job = await runningJob(ctx, spec({ jobId: `${randomStageId()}:test`, verificationCommand: 'touch verifier-ran' }));
+    const output = footer('complete');
+    ctx.stub.messages[job.opencodeSessionId!] = [done('pre-crash-final', output, 200)];
+    // Lose the detached task at its dispatch boundary, leaving real poll state.
+    const dispatch = vi.spyOn(ctx.engine as unknown as { runVerification(job: JobRow): Promise<void> }, 'runVerification').mockResolvedValue();
+    await ctx.engine.pollJob(job);
+    await ctx.engine.drain();
+    const persisted = (await getJobByHubId(pool, job.hubJobId))!;
+    expect(persisted.status).toBe('verifying');
+    expect(persisted.summary).toBe(output);
+    expect(persisted.metadata.finalResultMessageId).toBe('pre-crash-final');
+    expect(persisted.verificationAttemptCount).toBe(0);
+    expect(existsSync(join(job.worktreePath, 'verifier-ran'))).toBe(false);
+    expect(dispatch).toHaveBeenCalledOnce();
+    dispatch.mockRestore();
+    const fetch = vi.spyOn(ctx.client, 'getMessages').mockRejectedValue(new Error('session disappeared after restart'));
+    const restarted = new JobEngine({ pool, config, client: ctx.client, git: execGit });
+    await restarted.tick();
+    await restarted.drain();
+    const recovered = (await getJobByHubId(pool, job.hubJobId))!;
+    expect(recovered.status).toBe('succeeded');
+    expect(recovered.summary).toBe(output);
+    expect(existsSync(join(job.worktreePath, 'verifier-ran'))).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(['unavailable', 'missing', 'blocked', 'durable-blocked'])('fails closed on %s recovered stage output before verification', async (mode) => {
+    const ctx = makeEngine({ retryMaxAttempts: 4 });
+    const job = await runningJob(ctx, spec({ jobId: `${randomStageId()}:test`, verificationCommand: 'touch verifier-ran; exit 1' }));
+    const output = footer('blocked', 'input');
+    await pool.query(`UPDATE executor.jobs SET status = 'verifying', summary = $2, metadata = metadata || $3::jsonb WHERE id = $1`,
+      [job.id, mode === 'durable-blocked' ? output : '', JSON.stringify(mode === 'durable-blocked' ? { finalResultMessageId: 'saved' } : {})]);
+    const fetch = vi.spyOn(ctx.client, 'getMessages');
+    if (mode === 'unavailable' || mode === 'durable-blocked') fetch.mockRejectedValue(new Error('offline'));
+    else fetch.mockResolvedValue(mode === 'missing' ? [] : [done('recovered', output, 200)]);
+    const restarted = new JobEngine({ pool, config, client: ctx.client, git: execGit });
+    await restarted.tick();
+    await restarted.drain();
+    const row = (await getJobByHubId(pool, job.hubJobId))!;
+    expect(row.status).toBe('failed');
+    expect(row.errorCode).toBe(mode.includes('blocked') ? 'pipeline_input_required' : 'pipeline_result_unavailable');
+    expect(row.verificationAttemptCount).toBe(0);
+    expect(row.attemptCount).toBe(1);
+    expect(existsSync(join(row.worktreePath, 'verifier-ran'))).toBe(false);
+    expect(ctx.stub.prompts).toHaveLength(1);
+    if (mode === 'durable-blocked') expect(fetch).not.toHaveBeenCalled();
+  });
+
+  function randomStageId() { return `stage-${Math.random().toString(36).slice(2)}`; }
+});
+
 describe('verification reclaim', () => {
   it('fails dependency setup cleanly instead of leaving resumed verification wedged', async () => {
     const repo = await makeRepo(join(root, 'verification-unsafe-dependency-repo'));

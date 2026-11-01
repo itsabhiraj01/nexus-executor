@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { Client, type Pool } from 'pg';
 import type { ExecutorConfig } from './config.js';
 import type { SqlExecutor } from './db.js';
+import { requiresStageResult, stageBlocker } from './pipeline-result.js';
 import { applyJobPermissions, parsePermissionPolicy, type RemotePermissionPolicy } from './permissions.js';
 import { activeElapsed, reconcileManualApprovals } from './manual-approvals.js';
 import {
@@ -18,7 +19,6 @@ import {
   fallbackPrompt,
   finalAssistantText,
   isModelFallbackError,
-  lastAssistant,
   messageComplete,
   messageToEvents,
   parseModelRef,
@@ -1440,6 +1440,11 @@ export class JobEngine {
     }
 
     if (complete && last && job.status === 'running') {
+      // The result is part of the stage verdict, not a cosmetic summary. Save
+      // it before any verification/repair dispatch so reboot never needs a
+      // second messages fetch to decide whether this turn was blocked.
+      if (!await this.persistFinalResult(job, last)) return;
+      if (await this.failStageBlocker(job)) return;
       if (asksUserForInput(last)) {
         if (last.id !== meta.lastAskedMessageId) {
           const text = finalAssistantText(last);
@@ -1773,6 +1778,27 @@ export class JobEngine {
       : { status: 'up_to_date' };
   }
 
+  private async persistFinalResult(job: JobRow, message: OpenCodeMessage): Promise<boolean> {
+    const summary = finalAssistantText(message);
+    const metadata = { finalResultMessageId: message.id };
+    const { rowCount } = await this.pool.query(
+      `UPDATE executor.jobs SET summary = $2, metadata = metadata || $3::jsonb, updated_at = NOW()
+       WHERE id = $1 AND status IN ('running', 'verifying') AND attempt_count = $4`,
+      [job.id, summary, JSON.stringify(metadata), job.attemptCount]);
+    if (!rowCount) return false;
+    job.summary = summary;
+    job.metadata = { ...job.metadata, ...metadata };
+    return true;
+  }
+
+  private async failStageBlocker(job: JobRow): Promise<boolean> {
+    if (!requiresStageResult(job.hubJobId)) return false;
+    const blocker = stageBlocker(job.summary);
+    if (!blocker) return false;
+    await this.failAttempt(job, blocker.errorCode, blocker.reason, { interrupt: false });
+    return true;
+  }
+
   private async runVerification(job: JobRow): Promise<void> {
     if (this.verifyingJobs.has(job.id)) return;
     this.verifyingJobs.add(job.id);
@@ -1784,6 +1810,22 @@ export class JobEngine {
       await owner.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [job.id]);
       const current = await getJobByHubId(owner, job.hubJobId);
       if (!current || current.status !== 'verifying' || current.attemptCount !== job.attemptCount) return;
+      job = current;
+      // Upgrade recovery for pre-fix verifying rows only. Missing/unavailable
+      // output is not evidence of legacy unstructured completion.
+      if (requiresStageResult(job.hubJobId) && typeof job.metadata.finalResultMessageId !== 'string') {
+        try {
+          const messages = await this.client!.getMessages(job.opencodeSessionId!);
+          const assistant = currentTurnResult(messages);
+          if (!assistant || !messageComplete(assistant) || turnErrored(assistant)) throw new Error('No completed assistant result is available');
+          if (!await this.persistFinalResult(job, assistant)) return;
+        } catch (error) {
+          await this.failAttempt(job, 'pipeline_result_unavailable',
+            `Cannot verify this stage without its final assistant result. Restore session access and rerun the stage: ${String(error)}`, { interrupt: false });
+          return;
+        }
+      }
+      if (await this.failStageBlocker(job)) return;
       const attempts = job.verificationAttemptCount + 1;
       const result = await this.runCommand(job);
       if (!await this.isCurrent(job)) return;
@@ -1799,13 +1841,7 @@ export class JobEngine {
         await this.pool.query(
           `UPDATE executor.jobs SET verification_attempt_count = $2, metadata = metadata || $3::jsonb, updated_at = NOW()
            WHERE id = $1 AND status = 'verifying' AND attempt_count = $4`, [job.id, attempts, meta, job.attemptCount]);
-        let summary = '';
-        try {
-          const fresh = await this.client!.getMessages(job.opencodeSessionId!);
-          const assistant = lastAssistant(fresh);
-          summary = assistant ? finalAssistantText(assistant) : '';
-        } catch { /* the summary is cosmetic */ }
-        await this.succeedJob(job, summary);
+        await this.succeedJob(job, job.summary);
         return;
       }
       await appendJobEvent(this.pool, {
